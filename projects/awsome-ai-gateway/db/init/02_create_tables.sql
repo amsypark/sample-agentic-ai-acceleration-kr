@@ -231,11 +231,11 @@ ALTER TABLE model.model_aliases ADD COLUMN IF NOT EXISTS allowed_clients TEXT[];
 CREATE TABLE IF NOT EXISTS model.model_pricings (
     id                                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     model_alias                         VARCHAR(128)  NOT NULL REFERENCES model.model_aliases(alias),
-    input_price_per_1k_tokens           NUMERIC(10,6) NOT NULL,
-    output_price_per_1k_tokens          NUMERIC(10,6) NOT NULL,
-    cache_creation_5m_price_per_1k_tokens NUMERIC(10,6) NOT NULL DEFAULT 0,
-    cache_creation_1h_price_per_1k_tokens NUMERIC(10,6) NOT NULL DEFAULT 0,
-    cache_read_price_per_1k_tokens      NUMERIC(10,6) NOT NULL DEFAULT 0,
+    input_price_per_1k_tokens           NUMERIC(12,8) NOT NULL,
+    output_price_per_1k_tokens          NUMERIC(12,8) NOT NULL,
+    cache_creation_5m_price_per_1k_tokens NUMERIC(12,8) NOT NULL DEFAULT 0,
+    cache_creation_1h_price_per_1k_tokens NUMERIC(12,8) NOT NULL DEFAULT 0,
+    cache_read_price_per_1k_tokens      NUMERIC(12,8) NOT NULL DEFAULT 0,
     effective_from                      TIMESTAMPTZ   NOT NULL,
     effective_until                     TIMESTAMPTZ,
     created_by                          UUID          NOT NULL REFERENCES auth.users(id)
@@ -661,11 +661,11 @@ ALTER TABLE budget.budget_configs
 -- 배수(long=short×2)가 아니라 명시 요율 컬럼을 두는 이유는 AWS Price List 자동연동 때문이다
 -- (Price List 는 달러 요율을 준다). 컬럼은 전부 NULLABLE(NULL='이 버킷 long 미설정').
 ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_threshold_tokens INTEGER;
-ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_input_price_per_1k_tokens NUMERIC(10,6);
-ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_output_price_per_1k_tokens NUMERIC(10,6);
-ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_cache_creation_5m_price_per_1k_tokens NUMERIC(10,6);
-ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_cache_creation_1h_price_per_1k_tokens NUMERIC(10,6);
-ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_cache_read_price_per_1k_tokens NUMERIC(10,6);
+ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_input_price_per_1k_tokens NUMERIC(12,8);
+ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_output_price_per_1k_tokens NUMERIC(12,8);
+ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_cache_creation_5m_price_per_1k_tokens NUMERIC(12,8);
+ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_cache_creation_1h_price_per_1k_tokens NUMERIC(12,8);
+ALTER TABLE model.model_pricings ADD COLUMN IF NOT EXISTS long_context_cache_read_price_per_1k_tokens NUMERIC(12,8);
 
 -- 값-가드 시딩: 열린 gpt-5.6 행의 현재 short 요율에 카드 배수(in×2·out×1.5·cache×2)를 곱해
 -- long 을 채운다. alias 이름/plane 무관하게 pub 의 실제 short 요율을 추적한다.
