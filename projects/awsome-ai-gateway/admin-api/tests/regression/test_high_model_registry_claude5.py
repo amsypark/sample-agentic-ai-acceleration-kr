@@ -31,6 +31,8 @@ import ast
 import os
 from pathlib import Path
 
+from decimal import Decimal
+
 import pytest
 
 PROOF_DSN = os.environ.get("PROOF_DSN")
@@ -321,8 +323,12 @@ async def test_live_registry_state_after_migrations():
             #    Sonnet 5 에는 **닫힌 잠정 행과 열린 정정 행이 둘 다** 존재한다. 필터가
             #    없으면 dict 컴프리헨션이 마지막으로 읽힌 행을 남겨서, 단정하는 값이
             #    행 순서(플래너 마음)에 달린다 — 통과/실패가 무작위가 된다.
+            # ⚠️ Decimal 로 담는다 — str() 로 담으면 단가 열의 **소수 자릿수**에 결합된다.
+            #    0040 이 NUMERIC(10,6) → (12,8) 로 확대한 뒤 같은 값이
+            #    "0.002000" → "0.00200000" 으로 바뀌어 이 단정이 깨졌다. 공시가는
+            #    자릿수가 아니라 **값** 불변식이므로 Decimal 로 비교한다.
             rows = dict(
-                (r[0], (str(r[1]), str(r[2])))
+                (r[0], (Decimal(r[1]), Decimal(r[2])))
                 for r in (
                     await conn.execute(
                         text(
@@ -356,7 +362,7 @@ async def test_live_registry_state_after_migrations():
             #    ⚠️ 0030 의 감시 항목: Bedrock 이 2026-08-31 이후 1P 를 따라 $3.00/$15.00
             #       으로 올리면 새 effective_from 행이 추가된다. 그때는 0030 과 같은
             #       패턴으로 마이그레이션을 넣고 **이 줄도 함께** 갱신할 것.
-            SONNET_5_PUBLISHED = ("0.002000", "0.010000")
+            SONNET_5_PUBLISHED = (Decimal("0.002"), Decimal("0.010"))
             if "claude-sonnet-5" in rows:
                 assert rows["claude-sonnet-5"] == SONNET_5_PUBLISHED, (
                     f"Sonnet 5 열린 단가가 공시가 {SONNET_5_PUBLISHED} 와 다르다: "
