@@ -290,20 +290,35 @@ async def test_migrated_row_bills_long_through_the_orm():
         await engine.dispose()
 
 
+# AWS 가 long-context 요율을 **게시한** 모델만 티어를 가진다(마이그레이션 0038·0041).
+#   openai.gpt-5.6-*            272K  (0038)
+#   openai.gpt-6-* / gpt-6.1-*  272K  (0041)
+#   anthropic.claude-haiku-5-5  100K  (0041 — Anthropic 모델 중 처음으로 long SKU 가 있다)
+# 그 밖의 Claude(4.x, 5, Opus/Sonnet 5.5)는 1M 컨텍스트를 표준 요율로 청구한다(Price List 에 long
+# SKU 0건). 거기에 티어가 켜지면 긴 요청이 과대청구된다 — 그게 이 대조군이 막는 것이다.
+_PUBLISHED_LONG_TIER = (
+    "%openai.gpt-5.6-%",
+    "%openai.gpt-6-%",
+    "%openai.gpt-6.1-%",
+    "%anthropic.claude-haiku-5-5%",
+)
+
+
 @_pg
-async def test_no_claude_row_is_tiered_in_the_migrated_db():
-    """⚠️ 대조군(실 PG). LIKE 패턴이 Claude 까지 티어를 켜면 1M 요청이 2배 과대청구된다."""
+async def test_only_published_long_tier_models_are_tiered_in_the_migrated_db():
+    """⚠️ 대조군(실 PG). 패턴이 다른 Claude 까지 티어를 켜면 1M 요청이 과대청구된다."""
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
 
     engine = create_async_engine(PROOF_DSN)
     try:
         async with engine.connect() as c:
-            n = (await c.execute(text(
-                "SELECT count(*) FROM model.model_pricings p "
+            rows = (await c.execute(text(
+                "SELECT a.alias, a.provider_model_id FROM model.model_pricings p "
                 "JOIN model.model_aliases a ON a.alias=p.model_alias "
                 "WHERE p.effective_until IS NULL AND p.long_context_threshold_tokens IS NOT NULL "
-                "AND a.provider_model_id NOT LIKE '%openai.gpt-5.6-%'"))).scalar_one()
-        assert n == 0, f"{n}개 비-gpt56 행에 티어가 켜졌다"
+                "AND NOT (a.provider_model_id LIKE ANY (:patterns))"),
+                {"patterns": list(_PUBLISHED_LONG_TIER)})).fetchall()
+        assert not rows, f"long 요율이 게시되지 않은 모델에 티어가 켜졌다: {rows}"
     finally:
         await engine.dispose()
