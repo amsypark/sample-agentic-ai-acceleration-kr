@@ -98,6 +98,8 @@ alias 를 해석하고(Redis 300s 캐시) `status='INACTIVE'` 로만 차단합�
 - codex 의 기본 모델은 `0028` 에서 `codex-gpt`(5.5) → **`codex-gpt-5.6-terra`** 로 전환됩니다.
   적용 후 `routing_profile:codex` Redis 캐시를 지우거나 TTL(300s) 을 기다려야 반영됩니다.
 - **Fable 5 는 의도적으로 미등록**입니다 — ap-northeast-2 에 inference profile 이 없습니다.
+- bedrock-runtime 의 OpenAI 호환 엔드포인트(`gpt-5.6-*`, `gpt-6*`)는 IAM 이 `project/default` 리소스도
+  허용해야 합니다. 없으면 모델 ARN 이 다 허용돼 있어도 401 입니다(`bedrock_allowed_model_arns` 주석 참고).
 - GPT-6 Astra · 6.1 Sol 의 `service_tier: "ultrafast"`(Standard 의 6배)는 게이트웨이가 400 으로 거절합니다.
   단가가 Standard 만 등록돼 있어 통과시키면 청구와 예산 차감이 어긋나기 때문입니다
   (`gateway-proxy/src/app/services/service_tier_gate.py`).

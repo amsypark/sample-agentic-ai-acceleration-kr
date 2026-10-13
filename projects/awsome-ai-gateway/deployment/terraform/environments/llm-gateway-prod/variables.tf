@@ -277,6 +277,14 @@ variable "bedrock_allowed_model_arns" {
     "arn:aws:bedrock:*:*:inference-profile/us.openai.gpt-6.1-*",
     "arn:aws:bedrock:*:*:inference-profile/global.openai.gpt-6-*",
     "arn:aws:bedrock:*:*:inference-profile/global.openai.gpt-6.1-*",
+    # ⚠️ OpenAI 호환 엔드포인트(/openai/v1/*)는 InvokeModel 을 **project 리소스에도** 검사한다.
+    # 실측(2026-10-14, us-east-2, 파드 IRSA): 이 줄이 없으면 gpt-5.6-* 까지 401
+    #   "not authorized to perform: bedrock:InvokeModel on resource:
+    #    arn:aws:bedrock:us-east-2:<acct>:project/default"
+    # 같은 정책 버전으로 2026-09-09 까지는 200 이었다(dev usage_logs 마지막 성공) — 그 뒤 AWS 가 추가한 검사다.
+    # Claude(InvokeModel API)와 Mantle 은 이 검사를 받지 않는다(같은 날 실측).
+    # 게이트웨이는 project 를 지정하지 않으므로 default 만 허용한다.
+    "arn:aws:bedrock:*:*:project/default",
   ]
 }
 

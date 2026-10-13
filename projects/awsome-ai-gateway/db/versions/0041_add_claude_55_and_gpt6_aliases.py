@@ -114,8 +114,15 @@ DB 행만으로는 호출되지 않는다(0027 의 Claude 5 AccessDenied 사고)
     foundation-model/openai.gpt-6-*,   openai.gpt-6.1-*
     inference-profile/us.openai.gpt-6-*,     us.openai.gpt-6.1-*
     inference-profile/global.openai.gpt-6-*, global.openai.gpt-6.1-*
+    project/default                                   ← OpenAI 호환 엔드포인트 전용
 
 (deployment/terraform/environments/llm-gateway-{dev,prod}/variables.tf)
+
+⚠️ ``project/default`` 는 이 리비전 이전부터 필요했다. 같은 날 파드 IRSA 로 실측하니 이 줄이
+   없는 정책에서 0032 의 ``gpt-5.6-*`` 까지 401 이었다("not authorized to perform:
+   bedrock:InvokeModel on resource: ...:project/default"). 같은 정책 버전으로 2026-09-09
+   까지는 200 이었으므로(dev usage_logs) 그 뒤 AWS 가 추가한 검사다. Claude 의 InvokeModel
+   API 와 Mantle 은 이 검사를 받지 않는다.
 
 ## Fable 5 / 5.1 은 여전히 미등록
 

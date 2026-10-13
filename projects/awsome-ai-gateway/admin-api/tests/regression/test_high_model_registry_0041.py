@@ -260,6 +260,9 @@ def test_iam_allows_every_0041_model_on_both_resources(tf):
         for r in _GPT_US_REGIONS:
             fm = f"arn:aws:bedrock:{r}::foundation-model/openai.{alias}"
             assert _allowed(fm, pats), f"{tf.parent.name}: {fm} 가 막힌다"
+    # OpenAI 호환 엔드포인트는 project 리소스도 검사한다(실측: 없으면 gpt-5.6 까지 401).
+    project = "arn:aws:bedrock:us-east-2:123456789012:project/default"
+    assert _allowed(project, pats), f"{tf.parent.name}: {project} 가 없다 → runtime 평면 전부 401"
 
 
 @pytest.mark.parametrize("tf", _TF_ENVS, ids=lambda p: p.parent.name)

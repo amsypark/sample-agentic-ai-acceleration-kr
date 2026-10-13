@@ -76,6 +76,9 @@ annotated as such in the chart).
 - Migration `0028` switches the codex default from `codex-gpt` (5.5) to **`codex-gpt-5.6-terra`**.
   Flush the `routing_profile:codex` Redis key (or wait out the 300s TTL) for it to take effect.
 - **Fable 5 is deliberately not registered** — no inference profile in ap-northeast-2.
+- The OpenAI-compatible bedrock-runtime endpoint (`gpt-5.6-*`, `gpt-6*`) also needs IAM to allow the
+  `project/default` resource; without it every call is a 401 even when the model ARNs are allowed
+  (see the `bedrock_allowed_model_arns` comment).
 - `service_tier: "ultrafast"` (6x Standard) on GPT-6 Astra / 6.1 Sol is refused by the gateway with a 400:
   only Standard rates are registered, so letting it through would bill more than the budget deducts
   (`gateway-proxy/src/app/services/service_tier_gate.py`).
