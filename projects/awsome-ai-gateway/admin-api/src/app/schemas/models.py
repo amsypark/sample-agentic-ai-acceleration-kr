@@ -11,17 +11,19 @@ from app.core.clients import validate_clients
 from app.schemas.common import ApiFormatEnum, ProviderEnum
 
 # 단가 상한 — DB 컬럼에서 유도한 값이지 임의로 고른 숫자가 아니다.
-#   app/models/model.py:100~109  → Numeric(10, 6)
-#   db/init/02_create_tables.sql:222~226 → NUMERIC(10,6)  (0003_rename_cache_5m.py:34~38 도 동일)
-# NUMERIC(10,6) = 전체 10자리 중 소수 6자리 ⇒ 정수부는 4자리뿐이므로 최대값이 9999.999999 다.
+#   app/models/model.py  → Numeric(12, 8)
+#   db/init/02_create_tables.sql → NUMERIC(12,8)  (마이그레이션 0040 이 (10,6) 에서 넓혔다)
+# NUMERIC(12,8) = 전체 12자리 중 소수 8자리 ⇒ 정수부는 여전히 4자리이므로 최대값이 9999.99999999 다.
+# 소수 8자리인 이유는 7자리 요율이 실제로 있기 때문이다(Haiku 5.5 `us.` 5분 캐시 쓰기 0.0001375/1K).
+# decimal_places 가 DB scale 보다 작으면 API 가 DB 가 받을 수 있는 값을 422 로 거부한다.
 # 상한이 없으면 pydantic 은 통과시키고 asyncpg 가 INSERT 시점에 NumericValueOutOfRange 를
 # 던져 그냥 500 이 된다(입력 오류인데 서버 장애처럼 보이고, 어느 필드가 문제인지도 안 나온다).
-# ⚠️ 기존 decimal_places=6 **만으로는** 정수부를 전혀 제한하지 못한다(소수 자리 수만 본다).
-#    max_digits=10 을 더하는 방법도 있다 — pydantic 2.13.2 실측으로는 max_digits-decimal_places
+# ⚠️ 기존 decimal_places=8 **만으로는** 정수부를 전혀 제한하지 못한다(소수 자리 수만 본다).
+#    max_digits=12 를 더하는 방법도 있다 — pydantic 2.13.2 실측으로는 max_digits-decimal_places
 #    를 정수부 상한(4자리)으로 환산해 같은 결과를 낸다(decimal_whole_digits 에러). 그래도 여기서는
 #    le 를 쓴다: pyproject 가 pydantic>=2.0.0 만 요구하므로 그 파생 규칙에 기대지 않고
 #    DB 최대값을 그대로 적는 편이 버전에 무관하고 에러 메시지도 사람이 읽을 수 있다.
-MAX_PRICE_PER_1K = Decimal("9999.999999")
+MAX_PRICE_PER_1K = Decimal("9999.99999999")
 
 
 def _validate_long_context_consistency(obj):
@@ -83,7 +85,7 @@ def _validate_long_context_consistency(obj):
 # ModelCreateRequest·PricingRequest 가 공유하는 6개 필드. web_search 와 달리 기본값이 None
 # 이다 — long 티어는 모델별이라 보편 기본값이 없고, None = "티어 없음"(단일 요율)이 안전한
 # 기본이다. GPT-5.6 처럼 티어가 있는 모델에만 채운다. le=MAX_PRICE_PER_1K 는 short 필드와
-# 같은 이유(NUMERIC(10,6) 오버플로 → 500).
+# 같은 이유(NUMERIC(12,8) 오버플로 → 500).
 
 
 # ── Requests ──
@@ -105,34 +107,34 @@ class ModelCreateRequest(BaseModel):
     api_format: ApiFormatEnum
     description: str | None = None
     display_name: str | None = Field(default=None, max_length=128)
-    input_price_per_1k_tokens: Decimal = Field(ge=0, le=MAX_PRICE_PER_1K, decimal_places=6)
-    output_price_per_1k_tokens: Decimal = Field(ge=0, le=MAX_PRICE_PER_1K, decimal_places=6)
+    input_price_per_1k_tokens: Decimal = Field(ge=0, le=MAX_PRICE_PER_1K, decimal_places=8)
+    output_price_per_1k_tokens: Decimal = Field(ge=0, le=MAX_PRICE_PER_1K, decimal_places=8)
     cache_creation_5m_price_per_1k_tokens: Decimal = Field(
-        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     cache_creation_1h_price_per_1k_tokens: Decimal = Field(
-        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     cache_read_price_per_1k_tokens: Decimal = Field(
-        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
 
     # long-context 티어 (0038) — 등록 시 바로 티어 있는 모델을 만들 수 있게 parity 로 둔다.
     long_context_threshold_tokens: int | None = Field(default=None, ge=1)
     long_context_input_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     long_context_output_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     long_context_cache_creation_5m_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     long_context_cache_creation_1h_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     long_context_cache_read_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
 
     #: 이 모델을 쓸 수 있는 앱 허용목록. **3-상태**(models/model.py 주석 참조):
@@ -202,41 +204,41 @@ class PricingRequest(BaseModel):
     #    보내면 200, 기록된 행은 5m=0 · 1h=0, 직전 행은 이미 닫힘.
     #    ⇒ "extra 키는 무해한 오타" 라는 이전 판단은 이 스키마에서 반증됐다.
     #
-    # le=MAX_PRICE_PER_1K: ModelCreateRequest 와 같은 이유(NUMERIC(10,6) 오버플로 → 500).
+    # le=MAX_PRICE_PER_1K: ModelCreateRequest 와 같은 이유(NUMERIC(12,8) 오버플로 → 500).
     # ⚠️ 이 스키마는 사용자 입력 외에 model_service.sync_aws_pricing 도 만들어 쓴다.
     #    AWS Price List 값이 비정상이면 DB 쓰기 전에 여기서 걸린다(더 이른 실패가 낫다).
     #    sync 는 선언된 필드만 kwargs 로 넘기므로 forbid 의 영향을 받지 않는다.
     model_config = ConfigDict(extra="forbid")
 
-    input_price_per_1k_tokens: Decimal = Field(ge=0, le=MAX_PRICE_PER_1K, decimal_places=6)
-    output_price_per_1k_tokens: Decimal = Field(ge=0, le=MAX_PRICE_PER_1K, decimal_places=6)
+    input_price_per_1k_tokens: Decimal = Field(ge=0, le=MAX_PRICE_PER_1K, decimal_places=8)
+    output_price_per_1k_tokens: Decimal = Field(ge=0, le=MAX_PRICE_PER_1K, decimal_places=8)
     cache_creation_5m_price_per_1k_tokens: Decimal = Field(
-        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     cache_creation_1h_price_per_1k_tokens: Decimal = Field(
-        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     cache_read_price_per_1k_tokens: Decimal = Field(
-        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=Decimal("0"), ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     # long-context 티어 (0038). set_pricing 은 **생략(model_fields_set 에 없음)** 을 "이전 행
     # 승계", **명시적 None** 을 "티어 제거" 로 구별한다 — short 단가만 고치는 PUT 이 272K
     # 티어를 조용히 지우지 않게 한다(model_service.py set_pricing 의 _keep).
     long_context_threshold_tokens: int | None = Field(default=None, ge=1)
     long_context_input_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     long_context_output_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     long_context_cache_creation_5m_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     long_context_cache_creation_1h_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     long_context_cache_read_price_per_1k_tokens: Decimal | None = Field(
-        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=6
+        default=None, ge=0, le=MAX_PRICE_PER_1K, decimal_places=8
     )
     effective_from: datetime
 

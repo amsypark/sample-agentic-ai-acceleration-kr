@@ -99,10 +99,13 @@ def test_threshold_constant_is_272000():
     assert LONG_CONTEXT_THRESHOLD_TOKENS == 272_000
 
 
-def test_per_1k_quantized_to_6dp_so_sync_never_422s():
-    """per-1M/1000 이 6자리를 넘으면 6dp 로 반올림 — PricingRequest(decimal_places=6) 통과 보장.
+def test_per_1k_quantized_to_storage_scale_so_sync_never_422s():
+    """per-1M/1000 을 저장 형식(NUMERIC(12,8), PricingRequest decimal_places=8)에 맞춘다.
 
-    $0.5551/1M → /1000 = 0.0005551 (7dp) → ROUND_HALF_UP 6dp → 0.000555 (nonzero, 반올림 증명).
+    $0.5551/1M → /1000 = 0.0005551 (7dp). 저장 형식이 소수 8자리이므로 **그대로 보존**된다.
+    ⚠️ 이 테스트는 예전에 0.000555(6dp)를 단정했다 — 저장 형식에 맞춘다는 의도는 같지만, 그때는
+       형식 자체가 6자리여서 정밀도 손실을 정답으로 고정하고 있었다. 마이그레이션 0040 이 열을
+       넓힌 뒤로는 손실 없이 저장할 수 있으므로 단정을 바꾼다.
     """
     page = {"PriceList": [
         _sku("USE1-openai.gpt-5.6-mini-mantle-input-tokens-standard", "0.5551000000", region="us-east-1"),
@@ -114,8 +117,8 @@ def test_per_1k_quantized_to_6dp_so_sync_never_422s():
     with patch("app.services.aws_price_list.boto3.client", return_value=client):
         out = fetch_bedrock_prices("us-east-1")
     val = out["openai.gpt-5.6-mini"].short["input"]
-    assert val == Decimal("0.000555")
-    assert val.as_tuple().exponent == -6  # 저장형식(NUMERIC 10,6)과 정확히 일치
+    assert val == Decimal("0.0005551")
+    assert val.as_tuple().exponent == -8  # 저장형식(NUMERIC 12,8)과 정확히 일치
 
 
 # ── 단위 파싱은 substring 이 아니라 수량 파싱 (1000000 오독 방지) ──
@@ -164,3 +167,25 @@ def test_long_tier_enabled_requires_input_and_output():
                                short={}, long={"cache_read": Decimal("0.0004")})
     assert long_tier_enabled(cache_only) is False
     assert long_tier_enabled(AwsModelPrice("x", "us-east-1", "mantle", short={}, long={})) is False
+
+
+# ---------------------------------------------------------------------------
+# 7자리 단가가 동기화에서 깎이지 않는다 (마이그레이션 0040 과 한 쌍)
+# ---------------------------------------------------------------------------
+# 0040 이 단가 열을 NUMERIC(12,8) 로 넓혔다. 여기 양자화가 6자리로 남아 있으면 DB 에 닿기
+# 전에 앱이 먼저 반올림해 0040 이 무의미해진다. Haiku 5.5 의 `us.` 5분 캐시 쓰기
+# $0.1375/1M 이 실제 사례다(per-1K 로 0.0001375, 소수 7자리).
+
+
+def test_seven_decimal_rate_survives_quantization():
+    val = _price_per_1k("1M tokens", "0.1375")
+    assert val == Decimal("0.0001375")
+    # 6자리 반올림이었다면 0.000138 이 된다 — 그 값이 아님을 직접 단정한다.
+    assert val != Decimal("0.000138")
+
+
+def test_quantization_is_eight_decimals():
+    # 8자리까지는 그대로, 9자리째는 ROUND_HALF_UP.
+    assert _price_per_1k("1M tokens", "0.01") == Decimal("0.00001")
+    assert _price_per_1k("1M tokens", "0.000015") == Decimal("0.00000002")  # 0.000000015 → 반올림
+    assert _price_per_1k("1M tokens", "0.1375").as_tuple().exponent == -8

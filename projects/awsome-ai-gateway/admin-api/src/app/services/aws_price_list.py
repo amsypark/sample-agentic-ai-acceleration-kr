@@ -84,15 +84,19 @@ class AwsModelPrice:
     long: dict[str, Decimal] = field(default_factory=dict)
 
 
-# 우리 단가 컬럼은 NUMERIC(10,6) 이고 PricingRequest 도 decimal_places=6 이다. per-1M 을
-# 1000 으로 나누면 6자리를 넘는 값이 나올 수 있고(예: $0.00007725/1M → 0.00000007725),
-# 그대로 PricingRequest 에 넣으면 422, DB 에 넣으면 절삭된다. 파서에서 6자리로 반올림해
-# 저장 형식과 정확히 맞춘다(cost 계산과 같은 ROUND_HALF_UP).
-_PER_1K_QUANT = Decimal("0.000001")
+# 우리 단가 컬럼은 NUMERIC(12,8) 이고 PricingRequest 도 decimal_places=8 이다(마이그레이션 0040).
+# per-1M 을 1000 으로 나누면 소수 자릿수가 늘어나므로(예: Haiku 5.5 의 `us.` 5분 캐시 쓰기
+# $0.1375/1M → 0.0001375/1K, 7자리) 파서에서 저장 형식과 같은 8자리로 반올림한다
+# (cost 계산과 같은 ROUND_HALF_UP).
+# ⚠️ 예전에는 0.000001(6자리)로 반올림했다. 0040 이 열을 넓힌 뒤에도 이 값이 남아 있으면
+#    DB 에 닿기 전에 앱이 먼저 0.0001375 → 0.000138 로 깎아(+0.36%) 0040 이 무의미해진다.
+# 8자리보다 작은 단가(예: $0.00007725/1M → 0.00000007725/1K)는 여전히 반올림된다 — LLM 토큰
+# 단가에서 $0.01/1M 미만은 관측되지 않았지만, 나오면 열을 더 넓혀야 한다.
+_PER_1K_QUANT = Decimal("0.00000001")
 
 
 def _price_per_1k(unit: str, usd: str) -> Decimal:
-    """priceDimension → per-1k Decimal(6dp).
+    """priceDimension → per-1k Decimal(8dp).
 
     ★ 단위 문자열의 **토큰 수량을 파싱**한다 — substring 포함검사(`"1000" in u`)를 쓰지 않는다.
       substring 방식은 `"1000000 tokens"`(콤마·'M' 없는 bare per-1M)를 "1000 포함" 으로 오독해
