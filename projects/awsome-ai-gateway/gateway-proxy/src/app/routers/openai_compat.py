@@ -21,6 +21,7 @@ from app.services.body_log_records import (
 )
 from app.services.fallback_loop import release_reservations
 from app.services.router_service import ModelInactiveError, RouterService
+from app.services.service_tier_gate import reject_unpriced_service_tier
 from app.services.streaming import openai_sse_stream
 
 logger = structlog.get_logger(__name__)
@@ -218,6 +219,13 @@ async def _handle_openai(request: Request, path: str):
                     }
                 },
             )
+
+    # Unpriced service_tier → 400 before anything is reserved (services/service_tier_gate.py).
+    rejected = reject_unpriced_service_tier(
+        req_data, model_config.provider, alias=model_config.alias, request_id=request_id
+    )
+    if rejected is not None:
+        return rejected
 
     # Pre-reserve RPM + TPM (3-scope: USER/TEAM/GLOBAL)
     if auth_context:
@@ -637,6 +645,13 @@ async def _handle_responses(request: Request):
                 content={"error": {"type": "invalid_request_error",
                                     "message": f"Your account does not have access to model '{model_config.alias}'. Contact your administrator to request access."}},
             )
+
+    # Unpriced service_tier → 400 before anything is reserved (services/service_tier_gate.py).
+    rejected = reject_unpriced_service_tier(
+        req_data, model_config.provider, alias=model_config.alias, request_id=request_id
+    )
+    if rejected is not None:
+        return rejected
 
     # Pre-reserve RPM + TPM (USER/TEAM/GLOBAL) — same enforcement as chat path.
     if auth_context:

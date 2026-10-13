@@ -65,14 +65,23 @@ annotated as such in the chart).
 
 | Family | Alias | Backend entrypoint | Registered by |
 |--------|-------|--------------------|---------------|
+| Claude 5.5 | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | `global.anthropic.claude-{opus,sonnet,haiku}-5-5` | migration `0041` |
 | Claude 5 | `claude-opus-5`, `claude-sonnet-5` | `global.anthropic.claude-{opus,sonnet}-5` | migration `0027` |
 | Claude 4.x | `claude-opus-4-*`, `claude-sonnet-4-*`, `claude-haiku-4-5` | `global.anthropic.claude-*` | baseline–`0004` |
+| GPT-6 / 6.1 | `gpt-6-{astra,sol,luna}`, `gpt-6.1-sol` | `us.openai.gpt-6*` (bedrock-runtime, us-east-2) | migration `0041` |
+| GPT-5.6 | `gpt-5.6-{sol,terra,luna}` | `us.openai.gpt-5.6-*` (bedrock-runtime, us-east-2) | migration `0032` |
 | GPT-5.6 (codex) | `codex-gpt-5.6-{sol,terra,luna}` | `openai.gpt-5.6-*` (Mantle, us-east-2) | migration `0025` |
 | GPT-5.5 (codex) | `codex-gpt` | `openai.gpt-5.5` (Mantle, us-east-2) | migration `0017` |
 
 - Migration `0028` switches the codex default from `codex-gpt` (5.5) to **`codex-gpt-5.6-terra`**.
   Flush the `routing_profile:codex` Redis key (or wait out the 300s TTL) for it to take effect.
 - **Fable 5 is deliberately not registered** — no inference profile in ap-northeast-2.
+- The OpenAI-compatible bedrock-runtime endpoint (`gpt-5.6-*`, `gpt-6*`) also needs IAM to allow the
+  `project/default` resource; without it every call is a 401 even when the model ARNs are allowed
+  (see the `bedrock_allowed_model_arns` comment).
+- `service_tier: "ultrafast"` (6x Standard) on GPT-6 Astra / 6.1 Sol is refused by the gateway with a 400:
+  only Standard rates are registered, so letting it through would bill more than the budget deducts
+  (`gateway-proxy/src/app/services/service_tier_gate.py`).
 - ⚠️ **A migration alone is not enough.** Invoking a `global.anthropic.*` inference profile requires
   `bedrock:InvokeModel` on **both the profile and the foundation model it points at**. The profile
   pattern matches any generation, but the foundation-model patterns pin a generation — so if you

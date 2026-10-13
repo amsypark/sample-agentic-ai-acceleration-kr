@@ -1206,6 +1206,11 @@ bedrock_allowed_model_arns = [
 
   # APAC cross-region inference profile (예비)
   "arn:aws:bedrock:ap-northeast-2::inference-profile/apac.anthropic.claude-*",
+
+  # bedrock-runtime OpenAI 호환 평면(gpt-5.6-*, gpt-6*)을 쓸 때 — 모델 ARN 양쪽 + project/default.
+  # project/default 가 없으면 모델 ARN 이 다 허용돼 있어도 401 "...on resource: ...:project/default".
+  # (전체 목록은 environments/llm-gateway-<env>/variables.tf 기본값 참고)
+  "arn:aws:bedrock:*:*:project/default",
 ]
 ```
 

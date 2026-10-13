@@ -242,6 +242,10 @@ variable "bedrock_allowed_model_arns" {
     # 프로파일 부재). 실측으로 fable-5 는 이 목록에서 AccessDenied 유지됨을 확인했다.
     "arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-5*",
     "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5*",
+    # Claude Haiku 5.5 (migration 0041). Opus/Sonnet 5.5 는 위 두 줄(`opus-5*`, `sonnet-5*`)이
+    # 이미 덮는다 — haiku 는 4 세대 줄(`haiku-4-*`)만 있어 5.5 가 AccessDenied 였다.
+    # fable 은 계속 막는다(0041 도 미등록).
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5*",
     # Global cross-region inference profiles (application 이 호출하는 엔트리포인트)
     "arn:aws:bedrock:*::inference-profile/global.anthropic.claude-*",
     "arn:aws:bedrock:*:*:inference-profile/global.anthropic.claude-*",
@@ -263,6 +267,24 @@ variable "bedrock_allowed_model_arns" {
     "arn:aws:bedrock:*::foundation-model/openai.gpt-5.6-*",
     "arn:aws:bedrock:*:*:inference-profile/us.openai.gpt-5.6-*",
     "arn:aws:bedrock:*:*:inference-profile/global.openai.gpt-5.6-*",
+    # ── GPT-6 / GPT-6.1 (migration 0041, 같은 runtime plane) ─────────────────────
+    # 버전을 박아 적는다(`gpt-6*` 로 열지 않는다): IAM 은 DB 행과 별개의 두 번째 게이트라,
+    # 미래 모델(예: gpt-6.2)이 마이그레이션 없이 열리지 않게 한다. 위 5.6 과 같이
+    # 프로파일과 foundation-model 을 **양쪽 다** 적는다.
+    "arn:aws:bedrock:*::foundation-model/openai.gpt-6-*",
+    "arn:aws:bedrock:*::foundation-model/openai.gpt-6.1-*",
+    "arn:aws:bedrock:*:*:inference-profile/us.openai.gpt-6-*",
+    "arn:aws:bedrock:*:*:inference-profile/us.openai.gpt-6.1-*",
+    "arn:aws:bedrock:*:*:inference-profile/global.openai.gpt-6-*",
+    "arn:aws:bedrock:*:*:inference-profile/global.openai.gpt-6.1-*",
+    # ⚠️ OpenAI 호환 엔드포인트(/openai/v1/*)는 InvokeModel 을 **project 리소스에도** 검사한다.
+    # 실측(2026-10-14, us-east-2, 파드 IRSA): 이 줄이 없으면 gpt-5.6-* 까지 401
+    #   "not authorized to perform: bedrock:InvokeModel on resource:
+    #    arn:aws:bedrock:us-east-2:<acct>:project/default"
+    # 같은 정책 버전으로 2026-09-09 까지는 200 이었다(dev usage_logs 마지막 성공) — 그 뒤 AWS 가 추가한 검사다.
+    # Claude(InvokeModel API)와 Mantle 은 이 검사를 받지 않는다(같은 날 실측).
+    # 게이트웨이는 project 를 지정하지 않으므로 default 만 허용한다.
+    "arn:aws:bedrock:*:*:project/default",
   ]
 }
 
