@@ -19,6 +19,7 @@
 // @vitest-environment node
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { NextURL } from 'next/dist/server/web/next-url';
 import { NextRequest } from 'next/server';
 import { GET as loginGET } from '@/app/api/auth/login/route';
 import { GET as callbackGET } from '@/app/api/auth/callback/route';
@@ -690,6 +691,22 @@ describe('GET /api/auth/callback — 실패를 읽히게', () => {
 
 // ───────────────────────── 3. middleware 목적지 ─────────────────────────
 
+/**
+ * 미들웨어 리다이렉트는 라우트 핸들러와 계약이 **반대**다: 같은 오리진의 절대 URL.
+ * 상대 Location 을 내면 Next 14 미들웨어 어댑터가 `new NextURL(location)` 에서
+ * Invalid URL 로 던져 그 요청이 500 이 된다(2026-10-14 dev·prod 실측). 같은 오리진이면
+ * Next 서버가 보내기 전에 상대 경로로 바꾸므로, 브라우저가 받는 Location 은 여전히 상대다.
+ */
+function expectMiddlewareRedirect(res: Response, path: string, origin = 'http://admin.test'): void {
+  const loc = res.headers.get('location');
+  expect(loc).not.toBeNull();
+  expect(() => new NextURL(loc!, { forceLocale: false })).not.toThrow();
+  const url = new URL(loc!);
+  expect(url.origin).toBe(origin); // 요청 오리진만 — 다른 호스트로는 절대 안 나간다
+  expect(url.pathname).toBe(path);
+  expect(url.search).toBe('');
+}
+
 describe('middleware — 로그인 목적지는 /api/auth/login 이다', () => {
   function b64(obj: unknown): string {
     return Buffer.from(JSON.stringify(obj)).toString('base64url');
@@ -698,14 +715,14 @@ describe('middleware — 로그인 목적지는 /api/auth/login 이다', () => {
   it('쿠키 없음 → /api/auth/login (dev-login 직행 금지)', async () => {
     const res = await middleware(req('http://admin.test/'));
     expect(res.status).toBe(307);
-    expectRelativeRedirect(res, '/api/auth/login');
-    expect(res.headers.get('location')).not.toBe('/api/auth/dev-login');
+    expectMiddlewareRedirect(res, '/api/auth/login');
+    expect(new URL(res.headers.get('location')!).pathname).not.toBe('/api/auth/dev-login');
   });
 
   it('만료된 토큰 → /api/auth/login + admin_jwt 제거', async () => {
     const expired = `header.${b64({ sub: 'u', role: 'ADMIN', exp: Math.floor(Date.now() / 1000) - 60 })}.sig`;
     const res = await middleware(req('http://admin.test/', { cookies: { admin_jwt: expired } }));
-    expectRelativeRedirect(res, '/api/auth/login');
+    expectMiddlewareRedirect(res, '/api/auth/login');
     const setCookie = res.headers.get('set-cookie') ?? '';
     expect(setCookie).toContain('admin_jwt=');
     expect(setCookie).toMatch(/Max-Age=0|Expires=Thu, 01 Jan 1970/);
@@ -713,7 +730,7 @@ describe('middleware — 로그인 목적지는 /api/auth/login 이다', () => {
 
   it('손상된 토큰 → /api/auth/login + admin_jwt 제거', async () => {
     const res = await middleware(req('http://admin.test/', { cookies: { admin_jwt: 'not-a-jwt' } }));
-    expectRelativeRedirect(res, '/api/auth/login');
+    expectMiddlewareRedirect(res, '/api/auth/login');
     expect(res.headers.get('set-cookie') ?? '').toContain('admin_jwt=');
   });
 
@@ -731,12 +748,13 @@ describe('middleware — 로그인 목적지는 /api/auth/login 이다', () => {
     expect(res.headers.get('location')).toBeNull();
   });
 
-  it('호스트를 싣지 않고 쿼리도 버린다 (상대 Location)', async () => {
-    // 옛 계약("Host 유지")은 프록시 뒤에서 내부 호스트를 가리킬 수 있었다. 상대 경로면
-    // 그 실패 모드가 구조적으로 사라진다. 쿼리를 버리는 성질은 그대로 지킨다 —
-    // 로그인 진입점에 원래 요청의 쿼리가 새어 들어갈 이유가 없다.
+  it('요청 오리진만 싣고 쿼리는 버린다', async () => {
+    // 미들웨어가 싣는 호스트는 **요청 자신의 오리진**뿐이다. 그래야 Next 서버가 같은
+    // 오리진으로 보고 상대 Location 으로 바꿔 보낸다 — 내부 호스트가 브라우저로 새지 않는다.
+    // (예전 "상대 Location 을 직접 낸다" 는 어댑터에서 500 이었다.) 쿼리를 버리는 성질은
+    // 그대로 지킨다 — 로그인 진입점에 원래 요청의 쿼리가 새어 들어갈 이유가 없다.
     const res = await middleware(req('http://admin.internal:3000/budgets?q=secret'));
-    expectRelativeRedirect(res, '/api/auth/login');
+    expectMiddlewareRedirect(res, '/api/auth/login', 'http://admin.internal:3000');
     expect(res.headers.get('location')).not.toContain('secret');
   });
 });

@@ -21,6 +21,12 @@
  *
  * ⚠️ 외부 오리진으로 나가는 리다이렉트에는 쓸 수 없다(IdP authorize URL 등) — 그건
  *    절대 URL 이어야 한다. 그래서 이 함수는 `/` 로 시작하는 경로만 받는다.
+ *
+ * ⚠️ **라우트 핸들러 전용이다 — middleware.ts 에서 쓰지 말 것.** Next 14 의 미들웨어
+ *    어댑터는 응답 Location 을 base 없이 `new NextURL(...)` 으로 다시 파싱해서, 상대 경로면
+ *    `TypeError: Invalid URL` 로 그 요청이 500 이 된다(2026-10-14 실측 — 로그인 리다이렉트를
+ *    타는 모든 페이지). 미들웨어는 절대 URL 로 리다이렉트하고, 같은 오리진이면 Next 가
+ *    보내기 전에 상대 경로로 바꾼다(middleware.ts 의 redirectSameOrigin).
  */
 
 import { NextResponse } from 'next/server';

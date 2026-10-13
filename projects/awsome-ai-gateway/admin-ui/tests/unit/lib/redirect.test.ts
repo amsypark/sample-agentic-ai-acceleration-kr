@@ -77,6 +77,13 @@ describe('redirectRelative', () => {
  *
  * 한 곳이라도 `NextResponse.redirect` 로 절대 URL 을 만들면 CloudFront 뒤에서 그 경로만
  * 내부 호스트로 새어나간다 — 그런 부분 회귀는 테스트로 잡히지 않고 배포 후에 드러난다.
+ *
+ * ⚠️ 단, **middleware.ts 는 반대다.** 미들웨어 응답의 Location 은 Next 어댑터가 base 없이
+ *    `new NextURL(...)` 으로 다시 파싱하므로 상대 경로면 Invalid URL 로 500 이 된다
+ *    (2026-10-14 dev·prod 실측 — 로그인 리다이렉트를 타는 모든 페이지). 미들웨어는
+ *    `request.nextUrl` 기준의 같은 오리진 절대 URL 만 쓰고, Next 서버가 그걸 상대 경로로
+ *    바꿔 보낸다. 그래서 아래에서 미들웨어는 "그 한 형태만 있고 redirectRelative 는 없다" 를
+ *    단정한다.
  */
 describe('같은 오리진 리다이렉트는 모두 redirectRelative 를 쓴다', () => {
   function uiRoot(): string {
@@ -118,6 +125,10 @@ describe('같은 오리진 리다이렉트는 모두 redirectRelative 를 쓴다
       // IdP authorize 로 나가는 리다이렉트는 **절대 URL 이어야** 한다(외부 오리진).
       expect(absolute).toHaveLength(1);
       expect(absolute[0]).toContain('authorizeUrl');
+    } else if (rel === 'src/middleware.ts') {
+      // 정규식은 첫 `)` 에서 끊기므로 `new URL(path, request.nextUrl` 까지만 잡힌다.
+      expect(absolute).toEqual(['new URL(path, request.nextUrl']);
+      expect(code).not.toContain('redirectRelative');
     } else {
       expect(absolute).toEqual([]);
     }

@@ -10,6 +10,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { NextRequest } from 'next/server';
+import { NextURL } from 'next/dist/server/web/next-url';
 import { middleware } from '@/middleware';
 
 function b64url(obj: unknown): string {
@@ -50,30 +51,47 @@ function requestWith(cookie?: string, pathname = '/'): NextRequest {
 //    OIDC authorize / dev 폼 / 읽히는 503 으로 갈라주는 단일 진입점 `/api/auth/login`
 //    으로 보낸다(src/app/api/auth/login/route.ts).
 /**
- * 같은 오리진 리다이렉트의 새 계약: Location 은 **상대 경로**다.
+ * 미들웨어 리다이렉트의 계약: Location 은 **같은 오리진의 절대 URL** 이다.
  *
- * 왜 절대 URL 이 아니어야 하나: 컨테이너 안에서 request.url 은 0.0.0.0 으로 풀리고,
- * Host 헤더도 CloudFront→ALB 구성에서는 ALB 의 DNS 이름이 들어온다. 절대 URL 을 만들면
- * 로그인 직후 브라우저가 내부 호스트로 이동해 CloudFront 오리진을 잃는다(내부 호스트에는
- * dev-login 이 열려 있을 수 있어 UX 문제로 끝나지 않는다). 상대 Location 은 브라우저가
- * **자신이 요청한 URL** 기준으로 해석하므로 서버가 자기 외부 주소를 알 필요가 없다.
+ * 예전 계약(상대 Location)은 이 파일에서는 통과했지만 실제 런타임에서 모든 페이지를 500
+ * 으로 만들었다. 이 테스트는 `middleware()` 를 직접 부르지만, 실제로는 그 반환값을 Next 의
+ * 미들웨어 어댑터가 받아 Location 을 `new NextURL(location)` 으로 **base 없이** 다시
+ * 파싱한다 — 상대 경로면 `TypeError: Invalid URL` (2026-10-14 dev·prod 실측, next 14.2.29).
+ * 그래서 여기서 **어댑터와 같은 파서**로 Location 을 다시 만들어 본다.
  *
- * 그래서 scheme/host 가 **없다는 것 자체**를 단정한다 — 절대 URL 로 되돌아가면 실패한다.
+ * 같은 오리진이어야 하는 이유: 어댑터는 요청과 같은 호스트의 URL 만 남기고, 서버가 그
+ * 리다이렉트를 상대 경로로 바꿔 보낸다 — 브라우저가 받는 것은 여전히 상대 Location 이라
+ * CloudFront 오리진이 유지된다(lib/redirect.ts 의 우려는 그대로 해소된다).
  */
-function expectRelativeRedirect(res: Response, path: string): void {
+function expectSameOriginRedirect(res: Response, path: string): void {
   const loc = res.headers.get('location');
-  expect(loc).toBe(path);
-  expect(loc).not.toMatch(/^https?:\/\//);
-  // `//host` 는 스킴 상대 URL 이라 외부로 나간다 — "/" 로 시작한다는 검사만으론 부족하다.
-  expect(loc!.startsWith('//')).toBe(false);
+  expect(loc).not.toBeNull();
+  // 어댑터가 하는 연산 그대로 — 여기서 던지면 그 요청은 실서버에서 500 이다.
+  expect(() => new NextURL(loc!, { forceLocale: false })).not.toThrow();
+  const url = new URL(loc!);
+  expect(url.origin).toBe('http://admin.test');
+  expect(url.pathname).toBe(path);
 }
+
+describe('middleware — Location survives the Next adapter', () => {
+  it('the parser used above really rejects a relative Location (대조군)', () => {
+    // 이 단정이 없으면 위 검사는 "NextURL 이 원래 관대하다" 일 때도 통과해 공허해진다.
+    expect(() => new NextURL('/api/auth/login', { forceLocale: false })).toThrow();
+  });
+
+  it('an unauthenticated page request gets an adapter-safe redirect', async () => {
+    const res = await middleware(requestWith(undefined, '/settings'));
+    expect(res.status).toBe(307);
+    expectSameOriginRedirect(res, '/api/auth/login');
+  });
+});
 
 describe('middleware — session expiry', () => {
   it('redirects an EXPIRED token to login and clears the stale cookie', async () => {
     const res = await middleware(requestWith(tokenWithExp(-3600)));
 
     expect(res.status).toBe(307);
-    expectRelativeRedirect(res, '/api/auth/login');
+    expectSameOriginRedirect(res, '/api/auth/login');
     // 못 쓰는 자격증명은 응답에서 제거돼야 한다.
     const setCookie = res.headers.get('set-cookie') ?? '';
     expect(setCookie).toContain('admin_jwt=');
@@ -117,19 +135,19 @@ describe('middleware — session expiry', () => {
     // 전부 401' 이라는 원래 증상이 재현된다. 10초 남은 토큰은 이미 로그인으로 보내야 한다.
     const res = await middleware(requestWith(tokenWithExp(10)));
     expect(res.status).toBe(307);
-    expectRelativeRedirect(res, '/api/auth/login');
+    expectSameOriginRedirect(res, '/api/auth/login');
   });
 
   it('still redirects when no cookie is present (and does not clear anything)', async () => {
     const res = await middleware(requestWith(undefined));
     expect(res.status).toBe(307);
-    expectRelativeRedirect(res, '/api/auth/login');
+    expectSameOriginRedirect(res, '/api/auth/login');
   });
 
   it('redirects a malformed token to login and clears the cookie', async () => {
     const res = await middleware(requestWith('not-a-jwt'));
     expect(res.status).toBe(307);
-    expectRelativeRedirect(res, '/api/auth/login');
+    expectSameOriginRedirect(res, '/api/auth/login');
     expect(res.headers.get('set-cookie') ?? '').toContain('admin_jwt=');
   });
 
