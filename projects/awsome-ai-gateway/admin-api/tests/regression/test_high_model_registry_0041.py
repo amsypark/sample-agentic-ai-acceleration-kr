@@ -115,6 +115,23 @@ def test_gpt6_uses_us_cris_on_the_us_east_2_runtime_plane():
         assert pmid == f"us.openai.{alias}", pmid
 
 
+def test_effective_from_is_before_the_migration_can_run():
+    """단가 행이 적용 시각보다 미래면 해석기가 무시하고 비용을 0 으로 기록한다(실측).
+
+    마이그레이션이 가장 일찍 돌 수 있는 시각은 Create Date 의 00:00 KST(= 전날 15:00 UTC)다.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    c = _consts()
+    eff = datetime.fromisoformat(c["EFFECTIVE_FROM"].replace("Z", "+00:00"))
+    created = re.search(r"Create Date: (\d{4}-\d{2}-\d{2})", _M0041.read_text()).group(1)
+    earliest_run = datetime.fromisoformat(created).replace(tzinfo=timezone(timedelta(hours=9)))
+    assert eff <= earliest_run, (
+        f"EFFECTIVE_FROM {eff.isoformat()} 가 가장 이른 적용 시각 {earliest_run.isoformat()} 보다 늦다 "
+        "— 그 사이 요청은 cost_usd=0 으로 기록된다"
+    )
+
+
 def test_fable_is_still_not_registered():
     c = _consts()
     names = [x for m in c["CLAUDE_MODELS"] for x in m[:2]] + [x for m in c["GPT_MODELS"] for x in m[:2]]
@@ -324,11 +341,21 @@ async def test_live_0041_state():
                     {"aliases": list(expected)},
                 )
             ).fetchall()
+        async with engine.connect() as conn:
+            stale = [r[0] for r in (await conn.execute(text(
+                "SELECT a.alias FROM model.model_aliases a WHERE a.status = 'ACTIVE' AND NOT EXISTS ("
+                "  SELECT 1 FROM model.model_pricings p WHERE p.model_alias = a.alias"
+                "   AND p.effective_from <= now()"
+                "   AND (p.effective_until IS NULL OR p.effective_until > now()))"
+            ))).fetchall()]
     finally:
         await engine.dispose()
 
     got = {r[0]: r for r in rows}
     assert set(got) == set(expected), f"누락: {set(expected) - set(got)}"
+    # 해석기와 **같은 조건**으로 "지금 유효한" 단가가 있는지. 행이 있어도 effective_from 이
+    # 미래면 gateway 는 단가 없음 → cost 0 으로 기록한다(2026-10-14 dev 실측).
+    assert not stale, f"지금 유효한 단가가 없는 ACTIVE alias: {stale} → cost_usd 0 으로 기록된다"
     for alias, (provider, pmid, endpoint, api_format, short, long) in expected.items():
         r = got[alias]
         assert (r[1], r[2], r[3], r[4], r[5]) == (provider, pmid, endpoint, api_format, "ACTIVE"), alias

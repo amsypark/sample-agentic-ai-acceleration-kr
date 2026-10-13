@@ -150,7 +150,14 @@ depends_on = None
 SYSTEM_USER = "00000000-0000-4000-a000-000000000010"
 GPT_ENDPOINT = "https://bedrock-runtime.us-east-2.amazonaws.com/openai"
 # Pinned (not now()) for cross-environment parity in price audits, like 0025/0027/0032.
-EFFECTIVE_FROM = "2026-10-14T00:00:00Z"
+#
+# ⚠️ 반드시 **적용 시각보다 과거**여야 한다. 해석기는 ``effective_from <= now()`` 인 행만 쓰고
+#    (gateway-proxy router_service._fetch_latest_pricing), 유효 단가가 없으면 비용을 **0** 으로
+#    기록한다 — 에러 없이 예산이 무력화된다. 처음엔 Create Date 와 같은 "2026-10-14T00:00:00Z"
+#    로 박았는데, 그 날짜는 KST 로 10/14 09:00 이라 KST 10/14 새벽에 적용한 dev 에서 신규 13개
+#    요청이 전부 cost_usd=0 으로 기록됐다(실측). 2026-10-07 은 이 묶음에서 가장 늦은 가격 변경일
+#    (Haiku 5.5 출시 · Sonnet 5.5 캐시 읽기 50% 인하)이다.
+EFFECTIVE_FROM = "2026-10-07T00:00:00Z"
 GPT_FALLBACK_DEFAULT = "codex-gpt-5.6-terra"
 
 # 단가는 전부 per-1K, 소수 8자리(0040 의 NUMERIC(12,8)). 출처 값(per-1M) / 1000.
