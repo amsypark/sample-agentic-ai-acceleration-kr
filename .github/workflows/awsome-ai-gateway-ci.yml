@@ -250,6 +250,7 @@ jobs:
             tests/regression/test_high_nonsargable_period_filter.py \
             tests/regression/test_high_duplicate_active_config.py \
             tests/regression/test_high_model_registry_claude5.py \
+            tests/regression/test_high_model_registry_0041.py \
             tests/regression/test_high_analytics_seed_reconciliation.py \
             tests/regression/test_high_productivity_idempotency.py \
             tests/regression/test_high_budget_redis_clobber.py \
