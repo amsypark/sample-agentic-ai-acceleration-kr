@@ -92,6 +92,14 @@ class _FakePricing:
         self.cache_creation_5m_price_per_1k_tokens = Decimal("0.00375")
         self.cache_creation_1h_price_per_1k_tokens = Decimal("0.006")
         self.cache_read_price_per_1k_tokens = Decimal("0.0003")
+        # long-context 티어 (0038) — 실 ModelPricing 과 같은 모양이어야 set_pricing 의 _keep
+        # (prior 승계)과 _to_response 가 읽을 수 있다. 티어 없는 모델이라 전부 None.
+        self.long_context_threshold_tokens = None
+        self.long_context_input_price_per_1k_tokens = None
+        self.long_context_output_price_per_1k_tokens = None
+        self.long_context_cache_creation_5m_price_per_1k_tokens = None
+        self.long_context_cache_creation_1h_price_per_1k_tokens = None
+        self.long_context_cache_read_price_per_1k_tokens = None
         self.effective_from = datetime.now(timezone.utc)
         self.effective_until = None
 
@@ -325,8 +333,10 @@ class TestImmutableFieldsRejected:
 
 class TestPriceUpperBound:
     async def test_bound_matches_the_column(self):
-        """상한이 컬럼(NUMERIC(10,6))에서 유도된 값인지 못 박는다 — 임의 상수 표류 방지."""
-        assert MAX_PRICE_PER_1K == Decimal("9999.999999")
+        """상한이 컬럼(NUMERIC(12,8), 마이그레이션 0040)에서 유도된 값인지 못 박는다 — 임의 상수 표류 방지.
+
+        정수부는 (10,6) 시절과 같은 4자리이고 소수부만 8자리로 늘었다."""
+        assert MAX_PRICE_PER_1K == Decimal("9999.99999999")
 
     async def test_pricing_overflow_is_422_not_500(
         self, client: AsyncClient, repo: _RecordingRepo
@@ -340,7 +350,7 @@ class TestPriceUpperBound:
             },
         )
         assert resp.status_code == 422, (
-            f"NUMERIC(10,6) 를 넘는 단가인데 {resp.status_code} — asyncpg "
+            f"NUMERIC(12,8) 를 넘는 단가인데 {resp.status_code} — asyncpg "
             f"NumericValueOutOfRange 가 맨 500 으로 새 나간다: {resp.text[:400]}"
         )
         err = _envelope(resp)

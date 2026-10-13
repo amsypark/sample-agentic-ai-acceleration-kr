@@ -35,6 +35,21 @@ function formatNumber(n: number): string {
   return new Intl.NumberFormat('ko-KR').format(n);
 }
 
+/**
+ * per-1K 단가 표시. 저장 정밀도(NUMERIC(12,8), 소수 8자리)까지 보여주고 끝자리 0 은 자른다.
+ * 최소 4자리는 유지해 열 정렬을 맞춘다.
+ *
+ * 예전에는 toFixed(4)/toFixed(5) 로 잘라 0.0001375 가 $0.00014 로 보였다 — 청구는 정확한데
+ * 화면이 다른 값을 보여 줘서, 화면을 보고 단가를 검수하면 틀린 값을 맞다고 판단하게 된다.
+ */
+export function formatPer1k(n: number): string {
+  return n.toLocaleString('en-US', {
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 8,
+    useGrouping: false,
+  });
+}
+
 export function ModelsTable({ models }: ModelsTableProps) {
   const t = useTranslations('models');
   const { toast } = useToast();
@@ -110,21 +125,21 @@ export function ModelsTable({ models }: ModelsTableProps) {
                     <ProviderBadge provider={model.provider} />
                   </Td>
                   <Td className="text-muted-foreground font-mono mono-id text-xs">{model.model_id}</Td>
-                  <Td numeric>${model.input_price_per_1k.toFixed(4)}/1K</Td>
-                  <Td numeric>${model.output_price_per_1k.toFixed(4)}/1K</Td>
+                  <Td numeric>${formatPer1k(model.input_price_per_1k)}/1K</Td>
+                  <Td numeric>${formatPer1k(model.output_price_per_1k)}/1K</Td>
                   <Td numeric className="text-muted-foreground">
                     {model.cache_creation_5m_price_per_1k > 0
-                      ? `$${model.cache_creation_5m_price_per_1k.toFixed(5)}/1K`
+                      ? `$${formatPer1k(model.cache_creation_5m_price_per_1k)}/1K`
                       : '—'}
                   </Td>
                   <Td numeric className="text-muted-foreground">
                     {model.cache_creation_1h_price_per_1k > 0
-                      ? `$${model.cache_creation_1h_price_per_1k.toFixed(5)}/1K`
+                      ? `$${formatPer1k(model.cache_creation_1h_price_per_1k)}/1K`
                       : '—'}
                   </Td>
                   <Td numeric className="text-muted-foreground">
                     {model.cache_read_price_per_1k > 0
-                      ? `$${model.cache_read_price_per_1k.toFixed(5)}/1K`
+                      ? `$${formatPer1k(model.cache_read_price_per_1k)}/1K`
                       : '—'}
                   </Td>
                   <Td>
