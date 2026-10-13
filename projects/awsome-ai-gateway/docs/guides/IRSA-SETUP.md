@@ -133,7 +133,11 @@ cd deployment/terraform/environments/llm-gateway-dev
 - **한쪽만 넣으면 403** 입니다. IAM 이 inference-profile 리소스와 그 아래 foundation-model 을 **둘 다** 평가합니다.
 - AWS 소유 형태(`:*::inference-profile/`)와 **계정 스코프 형태(`:*:*:inference-profile/`)가 둘 다** 필요합니다.
 - `bedrock:CountTokens` 도 같은 리소스 목록을 씁니다 → 목록이 좁으면 토큰 카운트 preflight 도 같이 깨집니다.
-- **GPT / Mantle 모델은 이 목록과 무관합니다** (Mantle 은 `bedrock-mantle:` 네임스페이스).
+- **GPT 는 평면에 따라 다릅니다.** Mantle(`codex-gpt-*`)은 `bedrock-mantle:` 네임스페이스라 이 목록과 무관하지만,
+  bedrock-runtime 평면(`gpt-5.6-*`, `gpt-6*`, 마이그레이션 0032·0041)은 **이 목록을 쓰고**, 모델 ARN 양쪽에 더해
+  **`arn:aws:bedrock:*:*:project/default`** 도 필요합니다. 없으면 모델 ARN 이 다 허용돼 있어도
+  401 `not authorized to perform: bedrock:InvokeModel on resource: ...:project/default` 입니다
+  (OpenAI 호환 엔드포인트가 project 리소스도 검사 — 2026-10 실측).
 
 ### 2-4. OIDC Provider 는 수동 생성하지 마십시오
 
