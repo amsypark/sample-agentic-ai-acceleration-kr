@@ -35,6 +35,8 @@
      리더는 팀 없는 사용자의 예산도 다루지 못한다(예전: None != None 이 False 라 통과).
   10. /admin/my/budget 의 팀 예산 상태 — 미배정 / 예산 없음 / 있음, 그리고 예산이 있어도 게이트웨이가
      거부하는 **소진** 상태(이번 KST 월의 budget_usages TEAM 행으로, 지난달 행은 섞이지 않는다).
+  11. TEAM_LEADER 의 예산 읽기 범위 — 다른 팀의 배정·자동 하향은 403, 예산 요약은 자기 팀과 그 멤버로
+     걸러진다(전사·팀 없는 사용자 제외). 팀 없는 리더는 아무 팀도 못 읽는다. 실제 budgets 라우터로 본다.
 
 실행::
 
@@ -1173,3 +1175,173 @@ async def test_my_budget_reports_an_exhausted_team_budget(
         await session.rollback()
 
     assert team == {"assigned": True, "budget_configured": True, "budget_exhausted": exhausted}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. TEAM_LEADER 의 예산 읽기 범위 — 배정·요약·자동 하향 (실제 라우터 + 실 PG, 끝에 롤백)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 세 GET 은 require_admin_or_team_leader 만 걸려 있었고 호출자를 서비스에 넘기지 않았다. 그래서 리더가
+# 다른 팀의 배정(팀 총액·멤버 이름·개인 배정액), 전사 예산 요약(다른 팀·팀 없는 사용자 포함), 다른 팀의
+# 자동 하향 규칙을 읽었다(관리자 가이드는 '자기 팀만' 이라고 적는다). 상태 코드까지 봐야 하므로 실제
+# budgets 라우터와 실제 예외 처리기를 띄운다. 세션은 바깥 트랜잭션의 savepoint 라 라우트가 커밋해도 끝에
+# 전부 되돌아간다 — 모듈이 공유하는 DB 의 다른 증명(10절의 TEAM_B '예산 없음' 등)을 움직이지 않는다.
+
+
+def _actor(role: str, team_id):
+    from app.core.auth import CurrentUser
+    from app.models.auth import UserRole
+
+    return CurrentUser(user_id=uuid.uuid4(), email="actor@example.com", role=UserRole(role), team_id=team_id)
+
+
+@pytest.fixture
+async def budget_routes(owned_dsn):
+    """``async with budget_routes(actor) as client`` — 같은 트랜잭션 안의 실제 budgets 라우터."""
+    import contextlib
+    from unittest.mock import AsyncMock, MagicMock
+
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+    from app.core.auth import get_current_user
+    from app.core.db import get_db_session
+    from app.main import register_exception_handlers
+    from app.routers import budgets
+    from app.services.budget_service import BudgetService
+
+    engine = create_async_engine(owned_dsn)
+
+    @contextlib.asynccontextmanager
+    async def _open(actor):
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            session = AsyncSession(bind=conn, join_transaction_mode="create_savepoint", expire_on_commit=False)
+            # 다른 팀(TEAM_B)에 읽을 거리가 있어야 '못 읽는다' 가 공허하지 않다 — 팀 예산, 멤버 개인 예산,
+            # 팀·멤버 자동 하향 규칙. 활성 config 는 (scope, scope_id, client) 당 하나라 먼저 비활성화한다.
+            for scope, sid, amount in (("TEAM", TEAM_B_ID, 777), ("USER", U_B, 123), ("TEAM", SEED_TEAM_ID, None)):
+                if amount is None:
+                    continue
+                await session.execute(
+                    text(
+                        "UPDATE budget.budget_configs SET is_active = false "
+                        "WHERE scope = CAST(:s AS budget.budget_scope) AND scope_id = :i AND client IS NULL AND is_active"
+                    ),
+                    {"s": scope, "i": sid},
+                )
+                await session.execute(
+                    text(
+                        "INSERT INTO budget.budget_configs "
+                        "(scope, scope_id, max_budget_usd, policy, allocated_by, effective_from) "
+                        "VALUES (CAST(:s AS budget.budget_scope), :i, :a, 'HARD_BLOCK', :by, CURRENT_DATE)"
+                    ),
+                    {"s": scope, "i": sid, "a": amount, "by": SEED_ADMIN_ID},
+                )
+            for scope, sid in (("TEAM", TEAM_B_ID), ("USER", U_B), ("TEAM", SEED_TEAM_ID), ("USER", U_A)):
+                await session.execute(
+                    text(
+                        "INSERT INTO budget.downgrade_policies "
+                        "(scope, scope_id, threshold_pct, from_model_alias, to_model_alias, created_by) "
+                        "SELECT CAST(:s AS budget.budget_scope), :i, 80, 'claude-sonnet-4-6', "
+                        "       'claude-haiku-4-5-20251001', :by "
+                        "WHERE NOT EXISTS (SELECT 1 FROM budget.downgrade_policies WHERE scope = CAST(:s AS "
+                        "budget.budget_scope) AND scope_id = :i AND from_model_alias = 'claude-sonnet-4-6' AND is_active)"
+                    ),
+                    {"s": scope, "i": sid, "by": SEED_ADMIN_ID},
+                )
+            await session.flush()
+
+            app = FastAPI()
+            register_exception_handlers(app)
+            app.include_router(budgets.router)
+            cache = MagicMock()
+            cache.invalidate = AsyncMock()
+            cache._redis = AsyncMock()
+            app.state.budget_service = BudgetService(cache_mgr=cache)
+            app.state.redis = None
+            app.dependency_overrides[get_current_user] = lambda: actor
+
+            async def _db():
+                yield session
+
+            app.dependency_overrides[get_db_session] = _db
+            try:
+                async with AsyncClient(transport=ASGITransport(app=app), base_url="http://proof") as client:
+                    yield client
+            finally:
+                await session.close()
+                await trans.rollback()
+
+    yield _open
+    await engine.dispose()
+
+
+def _summary_ids(resp) -> tuple[set[str], set[str], set[str | None]]:
+    items = resp.json()["summary"]
+    teams = {i["target_id"] for i in items if i["target_type"] == "team"}
+    users = {i["target_id"] for i in items if i["target_type"] == "user"}
+    user_teams = {i["team_id"] for i in items if i["target_type"] == "user"}
+    return teams, users, user_teams
+
+
+async def test_leader_reads_only_the_own_teams_allocation(budget_routes):
+    async with budget_routes(_actor("TEAM_LEADER", SEED_TEAM_ID)) as client:
+        other = await client.get(f"/admin/budgets/team/{TEAM_B_ID}/allocation")
+        assert other.status_code == 403, f"리더가 다른 팀의 배정을 읽었다: {other.text[:300]}"
+        assert "Range Team B" not in other.text and str(U_B) not in other.text
+
+        own = await client.get(f"/admin/budgets/team/{SEED_TEAM_ID}/allocation")  # 대조군
+        assert own.status_code == 200, own.text
+        body = own.json()
+        assert body["team_id"] == str(SEED_TEAM_ID)
+        assert {str(U_A), str(U_SEED)} <= {e["target_id"] for e in body["entries"]}
+
+
+async def test_leader_summary_is_the_own_team_view(budget_routes):
+    """리더 화면(/budgets, 대시보드 팀 순위)이 이 응답을 쓴다 — 403 이 아니라 자기 팀으로 걸러서 준다."""
+    from app.core.usage_filters import current_kst_period
+
+    params = {"period": current_kst_period()}
+    async with budget_routes(_actor("TEAM_LEADER", SEED_TEAM_ID)) as client:
+        resp = await client.get("/admin/budgets/summary", params=params)
+        assert resp.status_code == 200, resp.text
+        teams, users, user_teams = _summary_ids(resp)
+        assert teams == {str(SEED_TEAM_ID)}, f"다른 팀 행이 보인다: {teams}"
+        assert user_teams == {str(SEED_TEAM_ID)}, f"다른 팀·팀 없는 사용자가 보인다: {user_teams}"
+        assert {str(U_A), str(U_SEED)} <= users
+        assert not {str(U_B), str(U_TEAMLESS)} & users
+
+    async with budget_routes(_actor("ADMIN", None)) as client:  # 대조군 — 관리자는 전사를 본다
+        resp = await client.get("/admin/budgets/summary", params=params)
+        assert resp.status_code == 200, resp.text
+        teams, users, _ = _summary_ids(resp)
+        assert {str(SEED_TEAM_ID), str(TEAM_B_ID)} <= teams
+        assert {str(U_A), str(U_B), str(U_TEAMLESS)} <= users
+
+
+async def test_leader_cannot_read_another_teams_downgrade_rules(budget_routes):
+    async with budget_routes(_actor("TEAM_LEADER", SEED_TEAM_ID)) as client:
+        for path in (f"/admin/budgets/TEAM/{TEAM_B_ID}/downgrade", f"/admin/budgets/USER/{U_B}/downgrade"):
+            resp = await client.get(path)
+            assert resp.status_code == 403, f"{path} → {resp.status_code} {resp.text[:300]}"
+            assert "claude-haiku" not in resp.text, "거부 응답에 다른 팀의 규칙이 실렸다"
+
+        for path in (f"/admin/budgets/TEAM/{SEED_TEAM_ID}/downgrade", f"/admin/budgets/USER/{U_A}/downgrade"):
+            resp = await client.get(path)  # 대조군 — 자기 팀과 자기 팀 멤버는 그대로
+            assert resp.status_code == 200, f"{path} → {resp.status_code} {resp.text[:300]}"
+            assert resp.json()["enabled"] is True
+
+
+async def test_teamless_leader_reads_no_teams_budget_data(budget_routes):
+    """팀 없는 리더 — None == None 으로 통과하는 길이 없어야 한다."""
+    from app.core.usage_filters import current_kst_period
+
+    async with budget_routes(_actor("TEAM_LEADER", None)) as client:
+        assert (await client.get(f"/admin/budgets/team/{SEED_TEAM_ID}/allocation")).status_code == 403
+        resp = await client.get("/admin/budgets/summary", params={"period": current_kst_period()})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["summary"] == [], "팀 없는 리더에게 누군가의 예산이 보인다"
+        for path in (f"/admin/budgets/USER/{U_TEAMLESS}/downgrade", f"/admin/budgets/TEAM/{TEAM_B_ID}/downgrade"):
+            assert (await client.get(path)).status_code == 403, path

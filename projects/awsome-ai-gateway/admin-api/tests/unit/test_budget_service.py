@@ -311,7 +311,7 @@ class TestAllocateMembership:
 class TestGetBudgetSummary:
     @pytest.mark.asyncio
     async def test_budget_summary_returns_user_and_team_rows(
-        self, budget_service: BudgetService, mock_session: AsyncMock
+        self, budget_service: BudgetService, mock_session: AsyncMock, admin_user: CurrentUser
     ):
         team_id = uuid.uuid4()
         user_id = uuid.uuid4()
@@ -346,7 +346,7 @@ class TestGetBudgetSummary:
             URepo.return_value.list_all_teams = AsyncMock(return_value=[team_obj])
 
             result = await budget_service.get_budget_summary(
-                mock_session, scope=None, target_id=None, period="2026-04"
+                mock_session, scope=None, target_id=None, period="2026-04", actor=admin_user
             )
 
         target_types = sorted({i.target_type for i in result.summary})

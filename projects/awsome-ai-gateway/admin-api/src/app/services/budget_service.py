@@ -652,7 +652,14 @@ class BudgetService:
         *,
         team_id: uuid.UUID,
         period: str,
+        actor: CurrentUser,
     ) -> TeamBudgetAllocation | None:
+        # BR-BUD-03: 리더는 자기 팀의 배정만 본다(팀 없는 리더는 어느 팀도 — set_user_budget 의 ⚠️).
+        # ⚠️ 이 검사가 없었다. 라우트는 require_admin_or_team_leader 뿐이라 리더가 다른 팀 UUID 로 그 팀의
+        #    총액·멤버 이름·개인 배정액·사용액을 읽었다. 팀 존재 여부보다 먼저 거른다(남의 팀 UUID 탐색 방지).
+        if actor.role == UserRole.TEAM_LEADER and (actor.team_id is None or actor.team_id != team_id):
+            raise ForbiddenError("Team leaders can only view their own team's allocation")
+
         user_repo = UserRepository(session)
         team = await user_repo.get_team(team_id)
         if team is None:
@@ -722,6 +729,7 @@ class BudgetService:
         scope: str | None = None,
         target_id: uuid.UUID | None = None,
         period: str,
+        actor: CurrentUser,
     ) -> BudgetSummaryResponse:
         if not re.match(r'^\d{4}-\d{2}$', period):
             raise ValidationError(f"Invalid period format: {period}. Expected YYYY-MM")
@@ -745,6 +753,14 @@ class BudgetService:
         #    정렬 키(created_at)와 커서 키(id)가 달라 행을 건너뛴다. 전수 조회를 쓴다.
         users = await user_repo.iter_all_users()
         teams = await user_repo.list_all_teams()
+        # ⚠️ TEAM_LEADER 는 자기 팀과 그 멤버만 본다. 이 필터가 없어서 리더가 전사 요약(다른 팀의 한도·사용액,
+        #    다른 팀 사용자 이름·개인 예산, 팀 없는 사용자)을 받았다. 403 이 아니라 걸러서 준다 — 리더 화면
+        #    (/budgets, 대시보드 팀 순위)이 이 응답을 쓰고 자기 팀 행은 그대로 필요하다. 팀 없는 리더는 빈 요약
+        #    (None == None 으로 팀 없는 사용자가 섞이지 않게 actor.team_id 부터 본다).
+        if actor.role == UserRole.TEAM_LEADER:
+            own_team = actor.team_id
+            users = [u for u in users if own_team is not None and getattr(u, "team_id", None) == own_team]
+            teams = [t for t in teams if own_team is not None and t.id == own_team]
 
         # team_id(str) → (dept_id, dept_name). teams are loaded with
         # selectinload(Team.department), so this needs no extra query.
@@ -1053,7 +1069,20 @@ class BudgetService:
         *,
         scope: BudgetScope,
         scope_id: uuid.UUID,
+        actor: CurrentUser,
     ) -> AutoDowngradeConfigResponse:
+        # BR-BUD-03: 리더는 자기 팀(TEAM)과 자기 팀 멤버(USER)의 규칙만 읽는다. 팀 없는 리더는 아무것도.
+        # ⚠️ 이 검사가 없었다 — 리더가 다른 팀·다른 팀 사용자의 자동 하향 규칙을 읽었다.
+        if actor.role == UserRole.TEAM_LEADER:
+            own_team = actor.team_id
+            if scope == BudgetScope.TEAM:
+                allowed = own_team is not None and scope_id == own_team
+            else:
+                member = await UserRepository(session).get_user(scope_id)
+                allowed = own_team is not None and member is not None and member.team_id == own_team
+            if not allowed:
+                raise ForbiddenError("Team leaders can only view downgrade rules for their own team")
+
         rule_repo = DowngradePolicyRepository(session)
         rules = await rule_repo.get_rules(scope, scope_id)
 
@@ -1125,7 +1154,7 @@ class BudgetService:
                 ip_address=ip_address,
                 request_id=request_id,
             )
-            return await self.get_downgrade_config(session, scope=scope, scope_id=scope_id)
+            return await self.get_downgrade_config(session, scope=scope, scope_id=scope_id, actor=actor)
 
         model_repo = ModelRepository(session)
         all_aliases = {alias for rule in data.rules for alias in (rule.from_model_alias, rule.to_model_alias)}
@@ -1209,7 +1238,7 @@ class BudgetService:
             request_id=request_id,
         )
 
-        return await self.get_downgrade_config(session, scope=scope, scope_id=scope_id)
+        return await self.get_downgrade_config(session, scope=scope, scope_id=scope_id, actor=actor)
 
     async def delete_downgrade_config(
         self,
