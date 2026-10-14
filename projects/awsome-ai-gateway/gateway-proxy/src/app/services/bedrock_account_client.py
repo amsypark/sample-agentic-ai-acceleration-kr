@@ -45,6 +45,7 @@ from typing import Any
 
 import boto3
 import structlog
+from botocore.config import Config as BotoConfig
 from botocore.credentials import Credentials
 
 from app.services.account_credentials import (
@@ -66,6 +67,25 @@ FAILURE_BACKOFF = 30
 _STALE_SERVE_MIN = 60
 #: boto3 기본 세션의 client 생성 직렬화(모듈 docstring). 빌드는 키마다 시간당 한 번꼴이라 싸다.
 _BUILD_LOCK = threading.Lock()
+
+#: 요청 경로의 STS 클라이언트 설정(:func:`create_sts_client`). 설정이 없으면 botocore 기본값 —
+#: connect 60초 · read 60초 · legacy 재시도 총 5회(백오프 최대 약 15초) — 이라, 응답 없이 멈춘 STS
+#: (예: STS VPC 엔드포인트 보안 그룹 오설정) 에서 AssumeRole 한 번이 약 315초를 쓴다. 이 값이면
+#: 최악 3회 × (3 + 5)초 + 백오프 3초 이내 ≈ 27초, 연결 자체가 안 되면 3회 × 3초 + 3초 ≈ 12초다.
+#: 정상 AssumeRole 은 수십~수백 밀리초라 5초 read 는 넉넉하다.
+STS_BOTO_CONFIG = BotoConfig(
+    connect_timeout=3,
+    read_timeout=5,
+    retries={"mode": "standard", "total_max_attempts": 3},
+)
+
+
+def create_sts_client(region: str):
+    """게이트웨이가 요청 경로에서 쓰는 STS 클라이언트(main.py, 세 경로가 공유).
+
+    설정은 :data:`STS_BOTO_CONFIG`.
+    """
+    return boto3.client("sts", region_name=region, config=STS_BOTO_CONFIG)
 
 
 @dataclass
