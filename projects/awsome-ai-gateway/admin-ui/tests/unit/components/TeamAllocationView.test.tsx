@@ -109,6 +109,31 @@ describe('TeamAllocationView', () => {
     expect(rows.map((r: { target_type: string }) => r.target_type)).toEqual(['USER', 'USER']);
   });
 
+  it('센트 단위로 정확히 다 배정하면 저장이 열린다 (예전: 50.10+50.20 > 100.30 부동소수 오판)', async () => {
+    const user = userEvent.setup();
+    const wire = {
+      ...WIRE,
+      total_budget_usd: '100.3000',
+      entries: WIRE.entries.map((e) =>
+        e.target_type === 'USER' && e.target_name === 'Alice' ? { ...e, allocated_usd: '50.1000' } : e,
+      ),
+    } as TeamBudgetAllocation;
+    render(<TeamAllocationView teamId={TEAM_ID} initialAllocation={wire} />);
+
+    const [, bobInput] = screen.getAllByRole('spinbutton');
+    await user.clear(bobInput);
+    await user.type(bobInput, '50.20');
+
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText('unallocated').closest('tr')).toHaveTextContent(/^unallocated\$0\.00$/); // 예전엔 $-0.00
+    expect(screen.getByRole('button', { name: 'save' })).not.toBeDisabled();
+
+    await user.clear(bobInput);
+    await user.type(bobInput, '50.21'); // 대조군 — 1센트 초과는 여전히 막힌다
+    expect(screen.getByRole('alert')).toHaveTextContent('allocationExceeds:100.31,100.30');
+    expect(screen.getByRole('button', { name: 'save' })).toBeDisabled();
+  });
+
   it('편집해서 총예산을 넘기면 저장을 막는다 (대조군 — 초과 판정 자체는 살아 있다)', async () => {
     const user = userEvent.setup();
     render(<TeamAllocationView teamId={TEAM_ID} initialAllocation={WIRE} />);

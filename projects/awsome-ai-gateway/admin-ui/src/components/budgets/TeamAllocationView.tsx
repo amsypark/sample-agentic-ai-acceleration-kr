@@ -32,13 +32,17 @@ export function TeamAllocationView({ teamId, initialAllocation }: TeamAllocation
 
   // *_usd 는 Decimal-as-string 이다(entities.ts) — 산술 전에 숫자로 바꾼다. 문자열 그대로면
   // `0 + "60.0000"` 이 문자열 연결이 되고 `.toFixed()` 는 TypeError 로 렌더를 죽인다.
-  const totalBudget = Number(initialAllocation?.total_budget_usd ?? 0) || 0;
-  const totalAllocated = allocations.reduce(
-    (sum, entry) => sum + (Number(entry.allocated_usd) || 0),
-    0
-  );
-  const unallocated = totalBudget - totalAllocated;
-  const isOverBudget = totalAllocated > totalBudget;
+  //
+  // ⚠️ 합계·비교는 1/10000 달러 **정수**로 한다(DB 컬럼 NUMERIC(12,4), 서버 검사는 Decimal).
+  //    부동소수로 더하면 50.10 + 50.20 = 100.30000000000001 이라 $100.30 을 정확히 다 배정한
+  //    순간 '초과' 로 판정돼 저장이 막혔다(미배정 칸은 $-0.00).
+  const toUnits = (usd: unknown) => Math.round((Number(usd) || 0) * 10_000);
+  const totalBudgetUnits = toUnits(initialAllocation?.total_budget_usd);
+  const totalAllocatedUnits = allocations.reduce((sum, entry) => sum + toUnits(entry.allocated_usd), 0);
+  const totalBudget = totalBudgetUnits / 10_000;
+  const totalAllocated = totalAllocatedUnits / 10_000;
+  const unallocated = (totalBudgetUnits - totalAllocatedUnits) / 10_000;
+  const isOverBudget = totalAllocatedUnits > totalBudgetUnits;
 
   const handleAllocationChange = (targetId: string, newValue: number) => {
     setAllocations((prev) =>
