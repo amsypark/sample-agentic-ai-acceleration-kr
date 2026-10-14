@@ -390,6 +390,68 @@ Admin UI → Rate Limits 페이지
   - `X-RateLimit-Limit`: 한도값
   - `X-RateLimit-Reset`: 리셋 시각
 
+### 6.5 업그레이드 노트 — 이전 버전이 남긴 TTL 없는 키 정리
+
+비용(CPM/CPH)이나 TPM 한도를 이 수정 이전 버전에서 쓴 환경에는 **TTL 이 없는**(`TTL` 이 −1 인) rate-limit 키가 남아 있을 수 있습니다. 이전 정산은 예약하지 않은 스코프나 다음 분·시 창에 키를 TTL 없이 만들었고, TPM 검사는 `prev` 키에 TTL 을 걸지 않았습니다. 이런 키는 만료되지 않고 `volatile-lru` 도 축출하지 못해 메모리에 계속 쌓이며, 메모리가 차면 TTL 이 있는 키(rate-limit 카운터, 모델 캐시, 예산 설정)가 먼저 밀려납니다.
+
+| 키 | 모양 |
+|---|---|
+| 비용 | `rl:cost:{user\|team}:{<id>}:{cpm\|cph}:<창 시작 epoch>` |
+| TPM | `{USER\|TEAM\|GLOBAL:<id>:<모델>}:tpm:{cur\|prev\|window}` |
+
+새 버전은 이런 키를 만들지 않습니다. TPM 의 경우 쓰이고 있는 스코프의 키는 다음 버킷 회전이나 정산 때 TTL 을 다시 받지만, 더 이상 쓰이지 않는 스코프와 지난 창의 비용 키는 그대로 남습니다. 그래서 한 번 정리합니다.
+
+- **새 이미지가 모든 파드에 배포된 뒤에** 실행합니다(이전 파드가 남아 있으면 그 사이 다시 생깁니다).
+- 클러스터 모드에서는 키가 primary 마다 나뉘어 있으므로 **primary 마다** SCAN 합니다. 아래 스크립트는 gateway-proxy 파드 안에서 그 파드의 `REDIS_URL` 로 접속하고, `REDIS_CLUSTER_MODE=true` 이면 클러스터의 primary 를 하나씩 훑습니다(standalone 이면 그 노드 하나).
+- 먼저 **세기만** 하고(인자 없음), 숫자를 확인한 뒤 `--delete` 로 지웁니다. 지우기는 키마다 "TTL 이 아직 −1 일 때만 DEL" 을 한 번의 EVAL 로 해서, 그 사이 TTL 이 걸린 키는 남깁니다. 여러 번 실행해도 안전합니다.
+- 쓰이고 있는 TPM 키를 지우면 그 스코프의 그 분 카운터가 0 에서 다시 시작합니다(그 1분 동안만 덜 막힙니다). 비용 키의 TTL −1 은 전부 이전 정산이 남긴 것입니다.
+
+`cleanup_ttl_less_rl_keys.py`:
+
+```python
+import os
+import sys
+
+import redis
+from redis.cluster import RedisCluster
+
+DELETE = "--delete" in sys.argv
+PATTERNS = ("rl:cost:*", "{*}:tpm:*")
+# TTL 이 아직 -1 일 때만 지운다 — 확인과 삭제를 한 번에(원자적으로).
+DEL_IF_NO_TTL = "if redis.call('TTL', KEYS[1]) == -1 then return redis.call('DEL', KEYS[1]) end return 0"
+
+url = os.environ["REDIS_URL"]  # 비밀번호가 들어 있다 — 출력하지 않는다
+if os.environ.get("REDIS_CLUSTER_MODE", "").lower() == "true":
+    rc = RedisCluster.from_url(url)
+    nodes = [(n.name, n.redis_connection) for n in rc.get_primaries()]
+else:
+    nodes = [("standalone", redis.Redis.from_url(url))]
+
+for name, node in nodes:
+    for pattern in PATTERNS:
+        found = deleted = 0
+        for key in node.scan_iter(match=pattern, count=1000):
+            if node.ttl(key) != -1:
+                continue
+            found += 1
+            if DELETE:
+                deleted += node.eval(DEL_IF_NO_TTL, 1, key)
+        print(f"{name} {pattern}: ttl=-1 {found}" + (f", deleted {deleted}" if DELETE else ""))
+```
+
+```bash
+NS=llm-gateway
+DEPLOY=deploy/llm-gateway-gateway-proxy   # 릴리스 이름에 맞게
+# 1) 세기만 한다
+kubectl exec -i -n "$NS" "$DEPLOY" -- /app/.venv/bin/python - < cleanup_ttl_less_rl_keys.py
+# 2) 숫자를 확인한 뒤 지운다
+kubectl exec -i -n "$NS" "$DEPLOY" -- /app/.venv/bin/python - --delete < cleanup_ttl_less_rl_keys.py
+# 3) 다시 세어 0 인지 확인한다
+kubectl exec -i -n "$NS" "$DEPLOY" -- /app/.venv/bin/python - < cleanup_ttl_less_rl_keys.py
+```
+
+> 참고: 비용 한도를 하나도 설정하지 않은 환경에서는 이전 버전도 비용 정산을 하지 않았으므로 `rl:cost:*` 에 남은 키가 없습니다. 한 운영 환경의 2026-10-14 읽기 전용 조사에서도 `rl:cost:*` 키는 0 개였습니다. TPM 한도를 쓴 환경이라면 `{*}:tpm:*` 쪽에 `prev` 키가 남아 있을 수 있습니다.
+
 ---
 
 ## 7. API Key (Virtual Key) 관리
