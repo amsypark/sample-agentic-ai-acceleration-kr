@@ -24,6 +24,38 @@ router = APIRouter(prefix="/admin/my", tags=["My Usage"])
 _GATEWAY_SOFT_LIMIT_PCT = 110
 
 
+async def _team_used_usd(redis, session: AsyncSession, team_id: uuid.UUID, period: str) -> Decimal:
+    """게이트웨이가 팀 계층을 판정할 때 보는 이번 달 팀 사용액 — 원천과 해석이 게이트웨이와 같아야 한다.
+
+    * Redis 카운터 ``budget:team:{<team_id>}:<period>`` 가 원천이다. gateway-proxy 가 요청을 끝낼 때마다 직접
+      INCRBYFLOAT 하고(services/cost_recorder.py → budget_deduct.lua) budget_check.lua 가 그 값으로 거부한다.
+      ⚠️ 예전엔 budget_usages 만 읽었다. 그 행은 cost-recorder-worker 가 배치로 쌓아 카운터보다 늦다 — 이미
+      거부되는 팀을 '여유 있음' 으로 보였다.
+    * 키가 없으면 **0** 이다. budget_check.lua 는 ``GET … or '0'`` 으로 읽고, 게이트웨이는 팀 카운터를 DB 에서
+      복원하지 않는다 — 카운터가 사라진 직후(장애·재시작) 게이트웨이는 실제로 그 팀을 통과시킨다.
+    * Redis 를 쓸 수 없을 때만 budget_usages 다(게이트웨이도 그때 DB 폴백으로 같은 행을 읽는다). 모델은
+      budget_service.get_budget_summary 의 Redis 우선 조회다.
+    """
+    if redis is not None:
+        try:
+            raw = await redis.get(f"budget:team:{{{team_id}}}:{period}")
+            return Decimal(raw.decode() if isinstance(raw, bytes) else raw) if raw is not None else Decimal("0")
+        except Exception:  # noqa: BLE001 - 연결 실패·이상한 값이면 게이트웨이처럼 DB 로 판정한다
+            pass
+    return Decimal(
+        (
+            await session.execute(
+                select(func.coalesce(func.sum(BudgetUsage.used_usd), 0)).where(
+                    BudgetUsage.scope == BudgetScope.TEAM,
+                    BudgetUsage.scope_id == team_id,
+                    BudgetUsage.period == period,
+                    BudgetUsage.client.is_(None),
+                )
+            )
+        ).scalar_one()
+    )
+
+
 @router.get("/budget")
 async def get_my_budget(
     request: Request,
@@ -92,8 +124,8 @@ async def get_my_budget(
     #      SOFT_WARNING used * 100 >= limit * 110   ($0 은 항상 거부. Redis 가 죽었을 때의 DB 폴백만
     #                                                `limit > 0` 조건 때문에 $0 을 통과시킨다 — 평소 경로를 따른다)
     #      THROTTLE     거부하지 않는다(RPM 만 줄인다)
-    #    used 는 이번 KST 월의 budget_usages TEAM 행이다 — 게이트웨이 DB 폴백이 읽는 행이고, 게이트웨이의 Redis
-    #    카운터와 같은 비용 스트림(cost-recorder-worker)으로 쌓인다(그쪽이 flush 주기만큼 앞설 수 있다).
+    #    used 는 게이트웨이가 판정에 쓰는 Redis 팀 카운터다(gateway-proxy 가 직접 올린다). Redis 를 쓸 수 없을 때만
+    #    budget_usages(게이트웨이 DB 폴백이 읽는 행 — cost-recorder-worker 가 배치로 쌓아 카운터보다 늦다) — _team_used_usd.
     team_budget_exhausted = False
     if team_id is not None:
         team_cfg = (
@@ -110,18 +142,7 @@ async def get_my_budget(
         ).scalar_one_or_none()
         team_budget_configured = team_cfg is not None
         if team_cfg is not None:
-            team_used = Decimal(
-                (
-                    await session.execute(
-                        select(func.coalesce(func.sum(BudgetUsage.used_usd), 0)).where(
-                            BudgetUsage.scope == BudgetScope.TEAM,
-                            BudgetUsage.scope_id == team_id,
-                            BudgetUsage.period == period,
-                            BudgetUsage.client.is_(None),
-                        )
-                    )
-                ).scalar_one()
-            )
+            team_used = await _team_used_usd(request.app.state.redis, session, team_id, period)
             team_limit = team_cfg.max_budget_usd
             if team_cfg.policy == BudgetPolicy.HARD_BLOCK:
                 team_budget_exhausted = team_used >= team_limit

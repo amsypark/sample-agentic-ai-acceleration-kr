@@ -1068,7 +1068,10 @@ async def _my_budget(session, user_id):
 
     # JWT 의 team_id 는 일부러 비운다 — 라우트는 DB 의 현재 소속을 읽어야 한다(게이트웨이도 그렇다).
     me = CurrentUser(user_id=user_id, email="me@example.com", role=UserRole.DEVELOPER, team_id=None)
-    return await get_my_budget(request=MagicMock(), user=me, session=session)
+    request = MagicMock()
+    # 이 절은 DB 경로(budget_usages)를 본다 — Redis 카운터 경로는 test_high_my_budget_gateway_parity_real.py.
+    request.app.state.redis = None
+    return await get_my_budget(request=request, user=me, session=session)
 
 
 async def test_my_budget_reports_the_team_budget_the_gateway_will_check(session):

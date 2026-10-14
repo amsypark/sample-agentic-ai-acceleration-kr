@@ -71,8 +71,20 @@ def _session(
     return session
 
 
+def _period() -> str:
+    from app.core.usage_filters import current_kst_period
+
+    return current_kst_period()
+
+
+def _db_request() -> MagicMock:
+    request = MagicMock()
+    request.app.state.redis = None  # 팀 사용액은 DB 경로(budget_usages)
+    return request
+
+
 async def _my(config, used="12.34", **team) -> dict:
-    return await get_my_budget(request=MagicMock(), user=_user(), session=_session(config, used, **team))
+    return await get_my_budget(request=_db_request(), user=_user(), session=_session(config, used, **team))
 
 
 async def _budget(config, used="12.34") -> dict:
@@ -160,3 +172,72 @@ async def test_team_budget_exhausted_follows_the_gateway_deny_rule(policy, limit
     out = await _my(None, team_budget=team_budget, team_used=team_used)
     assert out["team"]["budget_configured"] is True, "소진이어도 예산 행은 있다 — '미설정' 이라고 말하면 거짓이다"
     assert out["team"]["budget_exhausted"] is exhausted
+
+
+# ── 팀 사용액의 원천 — 게이트웨이가 판정에 쓰는 Redis 카운터(gateway-proxy 가 요청마다 INCRBYFLOAT) ──────────
+#
+# budget_usages 는 cost-recorder-worker 가 배치로 쌓아 카운터보다 늦다. 게이트웨이는 카운터로 거부하므로, DB 만
+# 보면 이미 거부되는 팀을 '여유 있음' 으로 보인다. 키가 없으면 게이트웨이는 0 으로 읽고(팀 카운터는 DB 에서
+# 복원하지 않는다) 통과시킨다. Redis 를 쓸 수 없을 때만 budget_usages 로 판정한다(게이트웨이의 DB 폴백과 같은 행).
+
+TEAM_100 = SimpleNamespace(max_budget_usd=Decimal("100"), policy=BudgetPolicy.HARD_BLOCK)
+
+
+class _FakeRedis:
+    def __init__(self, values: dict[str, str] | None = None, *, down: bool = False):
+        self.values = values or {}
+        self.down = down
+        self.keys: list[str] = []
+
+    async def get(self, key: str):
+        self.keys.append(key)
+        if self.down:
+            raise ConnectionError("redis is down")
+        return self.values.get(key)
+
+
+def _redis_session(*, team_used_in_db: str | None) -> AsyncMock:
+    """팀 사용액 SELECT 가 나가면(DB 경로) team_used_in_db 를 돌려준다 — Redis 로 판정하면 그 결과는 안 쓰인다."""
+    results = [
+        _result(scalar_one_or_none=None),
+        _result(scalar_one=Decimal("0")),
+        _result(scalar_one_or_none=TEAM_ID),
+        _result(scalar_one_or_none=TEAM_100),
+    ]
+    if team_used_in_db is not None:
+        results.append(_result(scalar_one=Decimal(team_used_in_db)))
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=results)
+    return session
+
+
+async def _team_with(redis, *, team_used_in_db: str | None) -> dict:
+    request = MagicMock()
+    request.app.state.redis = redis
+    out = await get_my_budget(request=request, user=_user(), session=_redis_session(team_used_in_db=team_used_in_db))
+    return out["team"]
+
+
+async def test_worker_lag_the_gateway_counter_is_ahead_of_budget_usages():
+    """카운터 100(게이트웨이는 이미 거부) · budget_usages 50(워커가 아직 안 쌓음) → 소진이다."""
+    redis = _FakeRedis({f"budget:team:{{{TEAM_ID}}}:" + _period(): "100"})
+    team = await _team_with(redis, team_used_in_db="50")
+    assert team["budget_exhausted"] is True, "워커가 늦게 쌓은 budget_usages 로 판정했다"
+    assert redis.keys == [f"budget:team:{{{TEAM_ID}}}:" + _period()]
+
+
+async def test_a_missing_counter_reads_as_zero_like_the_gateway():
+    """키가 없으면 게이트웨이는 0 으로 읽고 통과시킨다 — DB 가 소진이라고 해도 카드는 게이트웨이를 따른다."""
+    team = await _team_with(_FakeRedis({}), team_used_in_db="150")
+    assert team["budget_exhausted"] is False, "게이트웨이는 0 으로 읽는 팀을 budget_usages 로 소진이라고 했다"
+
+
+async def test_redis_down_falls_back_to_budget_usages():
+    """Redis 를 쓸 수 없으면 게이트웨이처럼 budget_usages 로 판정한다."""
+    assert (await _team_with(_FakeRedis(down=True), team_used_in_db="100"))["budget_exhausted"] is True
+    assert (await _team_with(_FakeRedis(down=True), team_used_in_db="50"))["budget_exhausted"] is False
+
+
+async def test_no_redis_client_uses_budget_usages():
+    """대조군 — Redis 가 없는 배포(app.state.redis None)는 DB 경로다."""
+    assert (await _team_with(None, team_used_in_db="100"))["budget_exhausted"] is True
