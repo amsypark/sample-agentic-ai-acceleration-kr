@@ -267,8 +267,8 @@ jobs:
           # 통과했더라도 실질 실행이 0건이면 실패다 — 그게 이 잡을 만든 이유다.
           # ⚠️ 하한만 본다. 정확한 통과 수는 DB 에 쌓인 데이터에 따라 달라진다 — 일부
           #    테스트는 대상 테이블이 비어 있으면 스스로 skip 한다(플랜 어서션 2건). 로컬 실측
-          #    (fresh init SQL + alembic head, 실 Redis): 205 passed / 2 skipped.
-          #    REDIS_PROOF_URL 만 빠지면 190 passed / 10 skipped / 7 errors 다 — 커밋 뒤 무효화
+          #    (fresh init SQL + alembic head, 실 Redis): 210 passed / 2 skipped.
+          #    REDIS_PROOF_URL 만 빠지면 193 passed / 10 skipped / 9 errors 다 — 커밋 뒤 무효화
           #    파일과 실시간 사용량 파일은 PROOF_DSN 이 있는데 Redis 가 없으면 skip 이 아니라
           #    실패하고, 예산 Lua 파일(8건)은 skip 하므로 하한 200 이 그것도 잡는다. 예전 하한 95 는
           #    185건 시절에도 절반 가까이 skip 돼야 걸렸다.
