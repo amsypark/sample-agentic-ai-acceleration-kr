@@ -126,8 +126,13 @@ export default async function AnalyticsPage({ searchParams }: AnalyticsPageProps
   const effectiveMonth = isMonth(requested) && periods.includes(requested) ? requested : latest;
 
   const filter = parseFilter(searchParams, effectiveMonth);
-  // 차트 key: custom 이면 날짜, 아니면 월 — 변경 시 remount + 재요청.
-  const sectionKey = filter.period === 'custom' ? `custom-${filter.start_date ?? ''}` : effectiveMonth;
+  // 차트 key: custom 이면 날짜 **범위 전체**, 아니면 월 — 변경 시 remount + 재요청.
+  // ⚠️ end_date 도 키에 있어야 한다. 서버가 이제 범위를 실제로 반영하므로, 종료일만 바꿨을 때
+  //    Suspense 경계가 그대로 남으면 화면이 이전 범위의 숫자를 계속 보여준다.
+  const sectionKey =
+    filter.period === 'custom'
+      ? `custom-${filter.start_date ?? ''}-${filter.end_date ?? ''}`
+      : effectiveMonth;
   // 컨텍스트용 사람이 읽는 기간 라벨.
   const periodLabel =
     filter.period === 'custom'

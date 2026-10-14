@@ -8,8 +8,14 @@ from decimal import Decimal
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.usage_filters import cost_period_filter, kst_month_expr
+from app.core.usage_filters import cost_day_range_filter, cost_period_filter
 from app.models.usage import ROIAggregation, ROIScope, UsageLog
+
+#: 집계 시간창 — None 이면 period 월 전체, 아니면 KST 일자 범위 (start, end) (end 포함).
+#: ⚠️ 아래 집계 메서드는 전부 같은 규칙(`cost_day_range_filter if date_range else
+#:    cost_period_filter`)으로 창을 고른다. 한 메서드만 월로 남으면 /admin/analytics 의
+#:    요약 카드(범위)와 분해 표(월)가 한 화면 안에서 서로 다른 기간을 말한다.
+DateRange = tuple[str, str]
 
 
 class AnalyticsRepository:
@@ -62,14 +68,20 @@ class AnalyticsRepository:
     # ── UsageLog queries (for scheduler aggregation) ──
 
     async def sum_usage_by_model(
-        self, period: str, scope: ROIScope, scope_id: uuid.UUID | None
+        self,
+        period: str,
+        scope: ROIScope,
+        scope_id: uuid.UUID | None,
+        *,
+        date_range: DateRange | None = None,
     ) -> dict[str, Decimal]:
         """Returns {model_alias: total_cost_usd} for the given period/scope."""
         stmt = select(
             UsageLog.model_alias,
             func.sum(UsageLog.cost_usd).label("total_cost"),
         ).where(
-            cost_period_filter(period),  # §59 SUCCESS + KST
+            # §59 SUCCESS + KST — 월 또는 일자 범위
+            cost_day_range_filter(*date_range) if date_range else cost_period_filter(period),
         )
         stmt = self._apply_scope_filter(stmt, scope, scope_id)
         stmt = stmt.group_by(UsageLog.model_alias)
@@ -77,7 +89,12 @@ class AnalyticsRepository:
         return {row.model_alias: row.total_cost or Decimal("0") for row in result}
 
     async def count_requests_by_model(
-        self, period: str, scope: ROIScope, scope_id: uuid.UUID | None
+        self,
+        period: str,
+        scope: ROIScope,
+        scope_id: uuid.UUID | None,
+        *,
+        date_range: DateRange | None = None,
     ) -> dict[str, int]:
         """Returns {model_alias: request_count} for the given period/scope.
 
@@ -90,30 +107,54 @@ class AnalyticsRepository:
             UsageLog.model_alias,
             func.count().label("requests"),
         ).where(
-            cost_period_filter(period),  # §59 SUCCESS + KST
+            # §59 SUCCESS + KST — 월 또는 일자 범위
+            cost_day_range_filter(*date_range) if date_range else cost_period_filter(period),
         )
         stmt = self._apply_scope_filter(stmt, scope, scope_id)
         stmt = stmt.group_by(UsageLog.model_alias)
         result = await self._session.execute(stmt)
         return {row.model_alias: int(row.requests or 0) for row in result}
 
-    async def count_active_users(self, period: str, scope: ROIScope, scope_id: uuid.UUID | None) -> int:
+    async def count_active_users(
+        self,
+        period: str,
+        scope: ROIScope,
+        scope_id: uuid.UUID | None,
+        *,
+        date_range: DateRange | None = None,
+    ) -> int:
         stmt = select(func.count(distinct(UsageLog.user_id))).where(
-            cost_period_filter(period),  # §59 SUCCESS + KST
+            # §59 SUCCESS + KST — 월 또는 일자 범위
+            cost_day_range_filter(*date_range) if date_range else cost_period_filter(period),
         )
         stmt = self._apply_scope_filter(stmt, scope, scope_id)
         result = await self._session.execute(stmt)
         return result.scalar_one() or 0
 
-    async def total_requests(self, period: str, scope: ROIScope, scope_id: uuid.UUID | None) -> int:
+    async def total_requests(
+        self,
+        period: str,
+        scope: ROIScope,
+        scope_id: uuid.UUID | None,
+        *,
+        date_range: DateRange | None = None,
+    ) -> int:
         stmt = select(func.count(UsageLog.id)).where(
-            cost_period_filter(period),  # §59 SUCCESS + KST
+            # §59 SUCCESS + KST — 월 또는 일자 범위
+            cost_day_range_filter(*date_range) if date_range else cost_period_filter(period),
         )
         stmt = self._apply_scope_filter(stmt, scope, scope_id)
         result = await self._session.execute(stmt)
         return result.scalar_one() or 0
 
-    async def total_tokens(self, period: str, scope: ROIScope, scope_id: uuid.UUID | None) -> int:
+    async def total_tokens(
+        self,
+        period: str,
+        scope: ROIScope,
+        scope_id: uuid.UUID | None,
+        *,
+        date_range: DateRange | None = None,
+    ) -> int:
         """모든 과금 버킷의 합. 캐시(생성/읽기)를 빼면 총 토큰이 과소보고된다
         (dev 실측 -29.2%). 이 값은 대시보드 KPI 와 BI 챗 어시스턴트가 같이 읽는다.
         reasoning_tokens 는 output_tokens 에 이미 포함(models/usage.py:61)이라 제외."""
@@ -123,7 +164,8 @@ class AnalyticsRepository:
             + func.coalesce(func.sum(UsageLog.cache_creation_tokens), 0)
             + func.coalesce(func.sum(UsageLog.cache_read_tokens), 0)
         ).where(
-            cost_period_filter(period),  # §59 SUCCESS + KST
+            # §59 SUCCESS + KST — 월 또는 일자 범위
+            cost_day_range_filter(*date_range) if date_range else cost_period_filter(period),
         )
         stmt = self._apply_scope_filter(stmt, scope, scope_id)
         result = await self._session.execute(stmt)

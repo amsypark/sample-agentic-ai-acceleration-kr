@@ -14,12 +14,25 @@ class AnalyticsQueryParams(BaseModel):
     period: str = Field(description="YYYY-MM format")
     group_by: str = Field("model", description="model | team | department | user")
     scope: str = Field("all", description="all | team:{id}")
+    start_date: str | None = Field(None, description="YYYY-MM-DD (KST). end_date 와 함께만 유효")
+    end_date: str | None = Field(None, description="YYYY-MM-DD (KST). start_date 와 함께만 유효")
 
 
 class ExportParams(BaseModel):
+    """`/admin/analytics/export` 쿼리 — **`AnalyticsQueryParams` 의 상위집합이어야 한다.**
+
+    export 는 화면과 같은 데이터셋을 파일로 내려주는 것이다. 화면 라우트가 받는 필터를
+    하나라도 못 받으면 FastAPI 는 그 파라미터를 422 없이 버리므로, 파일은 조용히 다른
+    질문에 답한다(scope 를 못 받아 팀 범위 화면에서 전사 CSV 가 내려간 것이 실제 결함이었다).
+    tests/unit/test_analytics_query_param_parity.py 가 이 관계를 강제한다.
+    """
+
     format: str = Field("csv", description="csv | json")
     period: str = Field(description="YYYY-MM format")
     group_by: str = Field("model")
+    scope: str = Field("all", description="all | team:{id}")
+    start_date: str | None = Field(None, description="YYYY-MM-DD (KST). end_date 와 함께만 유효")
+    end_date: str | None = Field(None, description="YYYY-MM-DD (KST). start_date 와 함께만 유효")
 
 
 # ── Responses ──
@@ -61,6 +74,12 @@ class TrendItem(BaseModel):
 
 class AnalyticsResponse(BaseModel):
     period: str
+    # 실제로 집계한 KST 일자 범위. start_date/end_date 를 주지 않으면 None(= period 월 전체).
+    # 응답에 싣는 이유: 클라이언트가 "서버가 내 범위를 정말 반영했는가" 를 확인할 수 있어야
+    # 한다. 예전에는 UI 가 날짜를 보내도 라우트가 선언하지 않아 FastAPI 가 조용히 버렸고
+    # (선언되지 않은 쿼리 파라미터는 422 없이 드롭된다), 5일을 고른 화면에 월 전체 숫자가 떴다.
+    start_date: str | None = None
+    end_date: str | None = None
     currency: str = "USD"
     cost_summary: CostSummary
     by_model: list[ModelBreakdown] = []
