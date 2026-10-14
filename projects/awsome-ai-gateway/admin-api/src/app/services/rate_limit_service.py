@@ -518,6 +518,10 @@ class RateLimitService:
         else:
             _queue_invalidation(session, patterns=(f"rl:config:{scope.value}:{sid}:*",))
 
+        after: dict = {"scope": scope.value, "rpm": data.rpm, "tpm": data.tpm}
+        if model_alias is not None:
+            # GLOBAL 은 모델별이다 — resource_id(새 행 id)만으로는 어느 모델의 한도인지 알 수 없다.
+            after["model_alias"] = model_alias
         await audit_logger.log(
             session,
             actor_user_id=actor.user_id,
@@ -525,7 +529,7 @@ class RateLimitService:
             action="SET_RATE_LIMIT",
             resource_type="RateLimitConfig",
             resource_id=str(config.id),
-            changes={"after": {"scope": scope.value, "rpm": data.rpm, "tpm": data.tpm}},
+            changes={"after": after},
             ip_address=ip_address,
             request_id=request_id,
         )

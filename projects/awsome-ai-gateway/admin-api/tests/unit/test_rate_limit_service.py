@@ -286,7 +286,8 @@ class TestGlobalIsPerModel:
         assert (saved.scope, saved.scope_id, saved.model_alias, saved.rpm_limit) == (
             RateLimitScope.GLOBAL, None, "claude-opus", 10,
         )
+        # 감사 기록에 모델이 있어야 한다 — resource_id(새 행 id)만으로는 어느 모델인지 모른다.
         assert mock_audit.log.await_args.kwargs["changes"] == {
-            "after": {"scope": "GLOBAL", "rpm": 10, "tpm": None}
+            "after": {"scope": "GLOBAL", "rpm": 10, "tpm": None, "model_alias": "claude-opus"}
         }
         assert (result.model_alias, result.rpm_limit) == ("claude-opus", 10)
