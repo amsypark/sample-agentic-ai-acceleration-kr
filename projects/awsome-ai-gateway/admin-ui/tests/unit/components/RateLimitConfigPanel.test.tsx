@@ -238,13 +238,18 @@ describe('실시간 사용량 표시', () => {
   });
 
   it('상속 노드의 게이지 분모로 팀 한도를 쓰지 않는다', async () => {
-    // 상속 사용자는 자기 카운터가 없다 → measured=false. 팀 한도(100)로 나눈 비율을 보여주면
-    // "USER 스코프 사용률" 이라는 거짓 지표가 된다.
-    fetchRateLimitUsage.mockResolvedValue(usage({ measured: false, limit_rpm: null, rpm_used_total: 0 }));
-    render(<RateLimitConfigPanel node={inheritingNode} />);
+    // ⚠️ measured=true 여야 의미가 있다 — measured=false 면 게이지 분기 자체가 안 그려져 분모를 볼
+    //    수 없다(예전 이 테스트는 그래서 무엇을 고쳐도 통과했다). 상속 사용자도 USER 카운터가 잡힐 수
+    //    있다(예: 방금 지운 개인 한도의 ZSET 이 창 안에 남음). 그래도 자기 rpm 한도는 없다
+    //    (limit_rpm=null) — 그 사용량을 팀 한도(100)로 나누면 "USER 스코프 사용률" 이라는 거짓 지표다.
+    expect(inheritingNode.config?.rpm).toBe(100); // 전제: 상속 노드의 config 는 팀의 행이다
+    fetchRateLimitUsage.mockResolvedValue(usage({ measured: true, limit_rpm: null, rpm_used_total: 7 }));
+    const { container } = render(<RateLimitConfigPanel node={inheritingNode} />);
 
-    await waitFor(() => expect(screen.getByText('usageNotMeasured')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('7')).toBeInTheDocument()); // 측정 분기가 그려졌다
+    expect(screen.getByText('7').textContent).toBe('7'); // 분모(" / N") 가 붙지 않았다
     expect(screen.queryByText(/\/ 100/)).toBeNull();
+    expect(container.querySelector('[style*="width"]')).toBeNull(); // 게이지 막대도 없다
   });
 
   it('측정 중이면 자기 한도를 분모로 표시한다', async () => {
