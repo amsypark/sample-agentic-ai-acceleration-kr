@@ -303,3 +303,144 @@ def test_estimate_cost_falls_back_to_short_when_long_rate_missing():
     cost = _estimate_cost(model, estimated_input=_THRESHOLD + 1, max_output=0)
     expected = Decimal(_THRESHOLD + 1) / Decimal(1000) * Decimal("0.0022")
     assert cost == expected.quantize(Decimal("0.000001"))
+
+
+# ── 티어 판정에서 base64 미디어 바이트 제외 ─────────────────────────────────────
+#
+# 예약량(TPM·비용 크기)은 body 전체의 bytes/4 그대로 둔다. 바뀌는 것은 **티어 판정**뿐이다:
+# 이미지·파일의 base64 바이트는 프롬프트 토큰이 아니라서(AWS 는 이미지를 해상도 기반 수백~수천
+# 토큰으로 센다) ~1.1MB 짜리 data URL 하나가 요청을 long 티어로 밀어 CPM/CPH 를 2배로 잡고,
+# 멀티모달 요청에 거짓 429 를 낸다.
+
+_MEDIA = "A" * 1_100_000  # base64 1.1MB ≈ bytes/4 로 275K "토큰" — 임계(272K) 초과
+
+
+def _responses_body(content: list) -> dict:
+    return {
+        "model": "gpt-5.6-terra",
+        "max_output_tokens": 1000,
+        "input": [{"role": "user", "content": content}],
+    }
+
+
+_MEDIA_BODIES = {
+    "responses_input_image": _responses_body(
+        [
+            {"type": "input_text", "text": "describe this"},
+            {"type": "input_image", "image_url": f"data:image/png;base64,{_MEDIA}"},
+        ]
+    ),
+    "responses_input_file": _responses_body(
+        [
+            {"type": "input_text", "text": "summarize"},
+            {
+                "type": "input_file",
+                "filename": "a.pdf",
+                "file_data": f"data:application/pdf;base64,{_MEDIA}",
+            },
+        ]
+    ),
+    "chat_image_url": {
+        "model": "gpt-5.6-terra",
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_MEDIA}"}},
+                ],
+            }
+        ],
+    },
+    "chat_input_audio": {
+        "model": "gpt-5.6-terra",
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": _MEDIA, "format": "wav"}}
+                ],
+            }
+        ],
+    },
+}
+
+
+async def _reserved_cost_for(monkeypatch, mock_redis, body: dict) -> Decimal:
+    """``enforce_rate_limits`` 가 reserve_cost 에 넘기는 예약액을 그대로 잡는다."""
+    from app.schemas.domain import CostLimitResult, RateLimitResult
+    from app.services import rate_limit_enforcement as enf
+    from app.services.rate_limit_config_loader import AllScopeLimits, ScopeLimits
+
+    seen: list[Decimal] = []
+
+    async def _ok(*_a, **_k):
+        return RateLimitResult(allowed=True, remaining=-1, limit=-1)
+
+    async def _reserve(*_a, **kwargs):
+        seen.append(kwargs["estimated_cost"])
+        return CostLimitResult(allowed=True, reserved_cost=kwargs["estimated_cost"])
+
+    async def _limits(**_k):
+        return AllScopeLimits(
+            user=ScopeLimits(cpm=Decimal("100")), team=ScopeLimits(), global_=ScopeLimits()
+        )
+
+    monkeypatch.setattr(enf.RateLimitService, "check_multi_scope_rpm", _ok)
+    monkeypatch.setattr(enf.RateLimitService, "check_multi_scope_tpm", _ok)
+    monkeypatch.setattr(enf.RateLimitService, "reserve_cost", _reserve)
+    monkeypatch.setattr(enf, "load_all_scope_limits", _limits)
+
+    auth = AuthContext(
+        user_id="u-1", team_id="t-1", dept_id="d-1", roles=["USER"], auth_type=AuthType.VIRTUAL_KEY
+    )
+    resp = await enforce_rate_limits(
+        redis=mock_redis,
+        auth_context=auth,
+        model_config=_tiered_model(),
+        body=body,
+        state={},
+        request_id="req-media",
+    )
+    assert resp is None and len(seen) == 1
+    return seen[0]
+
+
+def _expected(estimated_input: int, max_output: int, *, long: bool) -> Decimal:
+    in_rate, out_rate = ("0.0044", "0.0198") if long else ("0.0022", "0.0132")
+    return (
+        Decimal(estimated_input) / Decimal(1000) * Decimal(in_rate)
+        + Decimal(max_output) / Decimal(1000) * Decimal(out_rate)
+    ).quantize(Decimal("0.000001"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_MEDIA_BODIES))
+async def test_base64_media_does_not_push_a_request_into_the_long_tier(
+    monkeypatch, mock_redis, shape
+):
+    """⚠️ 고치기 전: data URL 하나로 long 단가 예약(약 2배) → 멀티모달에 거짓 CPM/CPH 429."""
+    from app.services.rate_limit_enforcement import _estimate_input_tokens
+
+    body = _MEDIA_BODIES[shape]
+    estimated_input = _estimate_input_tokens(body)
+    assert estimated_input > _THRESHOLD, "전제: bytes/4 로는 임계를 넘는 body 다"
+    reserved = await _reserved_cost_for(monkeypatch, mock_redis, body)
+    # 예약 크기는 그대로(body 전체 bytes/4), 단가만 short.
+    assert reserved == _expected(estimated_input, 1000, long=False), reserved
+
+
+@pytest.mark.asyncio
+async def test_text_over_the_threshold_still_reserves_at_long_rates(monkeypatch, mock_redis):
+    """대조군 — 같은 크기의 **텍스트**는 여전히 long 이다.
+
+    미디어만 빠졌는지, 티어 판정 자체가 꺼졌는지를 이것으로 구분한다.
+    """
+    from app.services.rate_limit_enforcement import _estimate_input_tokens
+
+    body = _responses_body([{"type": "input_text", "text": "x" * 1_100_000}])
+    estimated_input = _estimate_input_tokens(body)
+    reserved = await _reserved_cost_for(monkeypatch, mock_redis, body)
+    assert reserved == _expected(estimated_input, 1000, long=True), reserved
