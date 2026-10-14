@@ -9,12 +9,14 @@
      바꾸지 않는다(대조군: 판정이 없으면 0045 인덱스 생성이 PostgreSQL 의 중복 키 오류로 죽는다).
   3. 아무것도 집행하지 않는 행 — rpm·tpm 이 모두 NULL 이거나 alias 가 없는 행 — 은 판정에서 빠지고, 트리거를
      ``SET LOCAL`` 로 우회해 비활성화되며 감사 로그가 남는다(대조군: alias 없는 행을 세던 판정은 거부했다).
-  4. 0046 은 양방향 모두 ACCESS EXCLUSIVE 를 **먼저** 잡는다 — 이 테이블을 읽고 이어서 쓰는 트랜잭션이
+  4. 문서(06-upgrade-rollback §4.4)의 정리 SQL 은 그 블록을 **그대로** 실행한다 — 우회 없이는 커밋에서
+     거부되고(대조군), 우회는 그 트랜잭션에만 걸린다.
+  5. 0046 은 양방향 모두 ACCESS EXCLUSIVE 를 **먼저** 잡는다 — 이 테이블을 읽고 이어서 쓰는 트랜잭션이
      끝까지 간다(대조군: SHARE·SHARE ROW EXCLUSIVE 에서 올리던 순서는 그 트랜잭션을 교착으로 죽였다).
-  5. init SQL 의 0046 블록은 객체가 있으면 잠그지 않고, 만들어야 할 때만 잠그며 그 대기는 lock_timeout 5s 로
+  6. init SQL 의 0046 블록은 객체가 있으면 잠그지 않고, 만들어야 할 때만 잠그며 그 대기는 lock_timeout 5s 로
      묶인다 — 넘으면 깨끗이 실패하고 다시 돌리면 된다(대조군: 맨 ``CREATE UNIQUE INDEX IF NOT EXISTS`` 는
      인덱스가 있어도 열린 쓰기 뒤에서 기다린다).
-  6. 0046 이 USER/TEAM 인덱스의 **이름을 그대로** 쓰는 이유: 이전 차트의 init SQL 이 0046 DB 에서 다시 돌아도
+  7. 0046 이 USER/TEAM 인덱스의 **이름을 그대로** 쓰는 이유: 이전 차트의 init SQL 이 0046 DB 에서 다시 돌아도
      no-op 이다(대조군: 그 이름이 없으면 같은 문장이 단일 슬롯을 조용히 되살린다).
 
 마이그레이션 함수는 alembic 없이 돈다(이 서비스의 lock 에 alembic 이 없다). 모듈의 ``from alembic import op``
@@ -53,6 +55,7 @@ _OWNED_SUFFIX = "_rl0046"
 _PROJECT = Path(__file__).resolve().parents[3]
 _M0046 = _PROJECT / "db" / "versions" / "0046_global_rate_limit_per_model.py"
 _INIT_TABLES = _PROJECT / "db" / "init" / "02_create_tables.sql"
+_ROLLBACK_DOC = _PROJECT / "deployment" / "docs" / "eks-fargate" / "06-upgrade-rollback.md"
 
 pytestmark = pytest.mark.skipif(not PROOF_DSN, reason="PROOF_DSN 미설정 — 실 PostgreSQL 필요")
 
@@ -304,6 +307,57 @@ async def test_control_without_set_constraints_immediate_the_downgrade_ddl_is_re
     finally:
         op.execute = real_execute
     assert [kind for kind, _ in (await _state(engine))[1]] == ["function", "trigger"]
+
+
+# ── 4. 문서의 정리 SQL ────────────────────────────────────────────────────────────────────
+
+
+def _documented_cleanup(keep: str) -> str:
+    """06-upgrade-rollback.md 의 정리 SQL 블록 — 자리표시자만 채워 **그대로** 실행한다."""
+    doc = _ROLLBACK_DOC.read_text(encoding="utf-8")
+    blocks = [b for b in re.findall(r"```sql\n(.*?)```", doc, re.S) if "rl.allow_global_release" in b]
+    assert len(blocks) == 1, f"정리 SQL 블록을 하나만 찾아야 한다: {len(blocks)}"
+    sql = blocks[0]
+    for placeholder in ("<남길 alias>", "<운영자 user id>"):
+        assert placeholder in sql, placeholder
+    return sql.replace("<남길 alias>", keep).replace("<운영자 user id>", str(SEED_ADMIN_ID))
+
+
+async def test_the_documented_cleanup_needs_the_bypass_and_it_stays_in_its_transaction(
+    dsn, engine, m0046
+):
+    import asyncpg
+
+    await _global(engine, "claude-opus-4-7", rpm=60)
+    await _global(engine, "claude-sonnet-4-6", rpm=30)
+    sql = _documented_cleanup("claude-opus-4-7")
+
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        # 대조군 — 우회 없는 같은 UPDATE 는 커밋에서 거부되고 아무것도 바뀌지 않는다.
+        without_bypass = sql.replace("SET LOCAL rl.allow_global_release = 'on';", "")
+        with pytest.raises(asyncpg.CheckViolationError, match="claude-sonnet-4-6"):
+            await conn.execute(without_bypass)
+        if conn.is_in_transaction():
+            await conn.execute("ROLLBACK")
+        assert len(await _all(engine, _ACTIVE_GLOBAL)) == 2
+
+        await conn.execute(sql)  # 문서 그대로 — BEGIN … COMMIT
+        assert await _all(engine, _ACTIVE_GLOBAL) == [("claude-opus-4-7", 60, None)]
+        assert await _all(engine, _AUDITED_RELEASES) == [("claude-sonnet-4-6", "30")]
+
+        # 우회는 그 트랜잭션에서 끝났다 — 같은 연결의 다음 해제는 다시 거부된다.
+        assert await conn.fetchval("SELECT current_setting('rl.allow_global_release', true)") == ""
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE model.rate_limit_configs SET is_active = false, updated_at = now() "
+                "WHERE scope = 'GLOBAL' AND is_active"
+            )
+    finally:
+        await conn.close()
+
+    await _run(engine, m0046, "downgrade")  # 남은 실제 한도는 하나 — 통과
+    assert await _all(engine, _ACTIVE_GLOBAL) == [("claude-opus-4-7", 60, None)]
 
 
 # ── 5. 잠금 순서 ──────────────────────────────────────────────────────────────────────────

@@ -726,6 +726,7 @@ Request body:
 > **GLOBAL 한도는 모델마다 따로 걸립니다(migration 0046).** `PUT /admin/rate-limits/global/{model}` 은 그 모델의 한도만 바꾸고, 다른 모델의 GLOBAL 한도는 그대로 둡니다. Bedrock 쿼터가 모델별이기 때문입니다. 0046 이전에는 활성 GLOBAL 행이 전체에서 하나뿐이라 한 모델에 저장하면 다른 모델의 한도가 해제됐고, 그래서 409 와 `release_alias` 동의가 있었습니다. 이제 해제되는 것이 없으므로 둘 다 없습니다.
 >
 > - 한 모델의 한도를 지우려면 rpm·tpm 을 모두 비워 저장합니다(콘솔: 입력을 비우고 저장). GLOBAL 은 상속이 없으므로 빈 행은 한도 없음과 같습니다. 다른 모델에는 영향이 없습니다.
+> - DB 는 같은 모델의 대체 행 없이 GLOBAL 한도를 해제하는 커밋을 거부합니다(0046 의 `rl_global_release_guard`). API·콘솔의 저장과 비우기는 대체 행을 함께 넣으므로 영향이 없습니다. SQL 로 직접 해제해야 하면 [Upgrade · Rollback §4.4](../deployment/docs/eks-fargate/06-upgrade-rollback.md#44-migration-0046--global-rate-limit-을-모델별로) 의 정리 SQL 을 씁니다.
 > - `?release_alias=` 는 더 이상 받지 않습니다. 보내면 **409** 이고 아무것도 바뀌지 않습니다. 0046 이전 콘솔은 다른 모델의 한도가 "해제된다" 고 확인받은 뒤 이 값을 보냈습니다. 그 값을 무시하고 저장하면 운영자가 풀었다고 믿는 한도가 계속 집행되므로 거절합니다. 스크립트는 이 파라미터를 빼고 보냅니다.
 > - 게이트웨이는 GLOBAL 한도를 요청의 model alias 로 찾고 카운터도 alias 별로 둡니다. 같은 Bedrock model ID 를 쓰는 alias(예: `claude-sonnet-4-6` 와 `claude-sonnet-4-6[1m]`)는 한도와 카운터가 따로이므로, 그 쿼터를 나눠 쓰도록 각각 잡습니다.
 > - alias 에 `/` 나 `[1m]` 이 들어 있어도 됩니다. 경로에 넣을 때 URL 인코딩합니다.

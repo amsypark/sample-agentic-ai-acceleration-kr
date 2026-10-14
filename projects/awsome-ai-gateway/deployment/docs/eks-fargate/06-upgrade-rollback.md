@@ -174,8 +174,14 @@ helm rollback llm-gateway 1 -n llm-gateway --wait --timeout 10m
 
 ⚠️ **다운타임 발생** — 모든 Pod가 삭제 후 재생성됩니다. 4.1 롤백이 불가할 때만 사용.
 
+⚠️ **DB 가 이전 차트보다 앞서 있으면(이전 차트에 없는 마이그레이션이 적용돼 있으면) 이전 차트를 uninstall →
+install 하지 않는다.** install 의 pre-install 훅(마이그레이션 Job)이 `alembic upgrade head` 에서
+`Can't locate revision identified by '<지금 리비전>'` 으로 실패하고, 훅이 실패하면 Deployment 가 하나도 만들어지지
+않는다 — uninstall 로 이미 다 지웠으므로 복구될 때까지 전면 중단이다. 0043~0046 모두 해당한다. **먼저 DB 를
+이전 차트의 alembic head 로 내린 뒤**(4.4 의 "다운그레이드 Job") 이 절차를 쓴다.
+
 ```bash
-# 현재 릴리즈 바로 삭제 + 재설치
+# 현재 릴리즈 바로 삭제 + 재설치 — DB 가 <old-chart-version> 의 alembic head 에 있을 때만
 helm uninstall llm-gateway -n llm-gateway
 # Secret/PVC 는 "helm.sh/resource-policy: keep" 때문에 보존됨
 helm install llm-gateway ./deployment/charts/llm-gateway \
@@ -183,13 +189,24 @@ helm install llm-gateway ./deployment/charts/llm-gateway \
   ... --version <old-chart-version>
 ```
 
-⚠️ 마이그레이션 Job 이 재실행됨. 이미 진행된 migration 은 skip되므로 안전.
+마이그레이션 Job 이 다시 돈다. DB 가 그 차트의 head 에 있으면 init SQL 은 멱등이고 `alembic upgrade head` 는
+no-op 이다. DB 가 앞서 있으면 위처럼 실패한다.
 
 ### 4.4 Migration 0046 — GLOBAL rate limit 을 모델별로
 
 0046 은 활성 GLOBAL rate limit 행의 유일성을 "전체에서 1개" 에서 "model alias 당 1개" 로 바꾼다
 (USER/TEAM 은 그대로 주체당 1개). 데이터는 바꾸지 않는다 — 0045 까지 활성 GLOBAL 행은 많아야 1개였으므로
 새 제약이 이미 성립한다. 이후 한 모델의 GLOBAL 저장은 다른 모델의 GLOBAL 한도를 해제하지 않는다.
+
+함께 들어가는 지연 제약 트리거 `rl_global_release_guard` 는 **같은 모델의 대체 행 없이 활성 GLOBAL 행을
+비활성화하는 커밋**을 거부한다(`check_violation`). 이 릴리스의 저장·비우기는 대체 행을 함께 넣으므로 영향이
+없다. 막는 대상은 0046 DB 에 붙은 이전 admin-api 다 — 그 upsert 는 alias 와 무관하게 활성 GLOBAL 행을 전부
+비활성화하므로, 모델 N 개 중 N−1 개의 한도를 감사 기록도 없이 해제했다. 의도된 해제는 그 트랜잭션에서만
+`SET LOCAL rl.allow_global_release = 'on'` 으로 우회한다(세션 단위 `SET` 은 쓰지 않는다).
+
+0046 은 `model.rate_limit_configs` 에 ACCESS EXCLUSIVE 를 처음에 잡는다(양방향). 그 대기(`lock_timeout` 5s 가
+상한)와 DDL 동안 이 테이블의 읽기도 줄을 선다 — gateway-proxy 의 한도 캐시 미스와 rate-limit 화면이다. 5초 안에
+못 잡으면 마이그레이션이 아무것도 바꾸지 않고 실패하고 Job 이 재시도한다.
 
 **업그레이드 순서.** 평소의 `helm upgrade` 그대로다. 마이그레이션 Job(pre-upgrade 훅)이 init SQL →
 `alembic upgrade head` 를 마친 뒤 Deployment 가 롤링된다.
@@ -199,43 +216,116 @@ helm install llm-gateway ./deployment/charts/llm-gateway \
   Redis 증명은 gateway-proxy `tests/regression/test_high_global_rate_limit_per_model_real.py`, Redis Cluster 는
   `tests/integration/test_rate_limit_cluster.py`.
 - **롤링이 끝날 때까지 GLOBAL 한도를 편집하지 않는다.** 그동안 섞이는 조합:
-  - 이전 admin-api 파드가 받은 GLOBAL 저장은 이전 의미대로 다른 모델의 GLOBAL 한도를 해제한다. 새 파드가 이미 두
-    모델 이상에 저장했다면, 단일 슬롯 409 가 있는 이전 버전은 활성 GLOBAL 행을 하나로 가정하고 읽다가 **500**
-    이다(`MultipleResultsFound`, 아무것도 바뀌지 않는다). 그보다 이전 버전은 저장이 성공하면서 다른 모델의
-    GLOBAL 행을 전부 비활성화한다.
+  - 이전 admin-api 파드의 GLOBAL 저장은 다른 모델의 활성 GLOBAL 행이 하나라도 있으면 **500** 이다 — 트리거가
+    커밋을 거부해 `rate_limit_configs` 는 아무것도 바뀌지 않는다(예전에는 다른 모델의 한도를 말없이 해제했다).
+    트리거는 Job 의 init SQL 이 만들므로 alembic 보다도 먼저, 즉 이 Job 이 돈 순간부터 걸린다. 다른 모델의 활성
+    GLOBAL 행이 없을 때의 저장은 그대로 된다. ⚠️ 그 파드의 감사 로그에는 거부된 저장도 `SET_RATE_LIMIT` 로 남을
+    수 있다 — 감사 항목은 커밋 전에 큐에 들어간다.
   - 이전 콘솔은 다른 모델이 한도를 가진 동안 "그 한도가 해제된다" 고 확인받은 뒤 `release_alias` 를 보낸다.
     새 admin-api 는 이를 **409** 로 거절하고 아무것도 바꾸지 않는다. 콘솔을 새로 고친다.
   - 이전·새 admin-api 의 GLOBAL 저장은 같은 advisory lock 키로 직렬화되므로 서로 끼어들어 유니크 위반을 내지 않는다.
 
-**롤백.**
+**이미지만 되돌릴 때.** `helm rollback`(그리고 `helm upgrade --atomic` 의 자동 롤백)은 마이그레이션 훅을 돌리지
+않는다(훅은 pre-install·pre-upgrade 뿐이다). DB 는 0046 에 남는다. 이전 gateway-proxy 는 위와 같이 모델별로
+집행하므로 안전하다. 이전 admin-api 는 위 "섞이는 조합" 의 이전 파드처럼, 다른 모델의 GLOBAL 행이 있는 동안 GLOBAL
+저장이 500 이다. 이전 동작으로 돌아가려면 **이미지를 되돌리기 전에** 아래 다운그레이드를 한다.
 
-- `helm rollback` 은 마이그레이션 훅을 돌리지 않는다(훅은 pre-install·pre-upgrade 뿐이다). 이미지만 되돌리면
-  DB 는 0046 에 남는다. 이전 gateway-proxy 는 위와 같이 모델별로 집행하므로 안전하다. 이전 admin-api 는 위
-  "섞이는 조합" 의 이전 파드처럼 동작한다 — 두 모델 이상이 GLOBAL 행을 가진 동안 GLOBAL 저장이 500 이거나,
-  저장할 때 한 모델만 남긴다.
-- 단일 슬롯으로 정말 돌아가려면 **이미지를 되돌리기 전에**, 0046 이 있는 마이그레이션 이미지로
-  `alembic downgrade 0045` 를 돌린다.
-  - 실제 한도(rpm 또는 tpm)를 가진 활성 GLOBAL 행이 2개 이상이면 **실패하고 아무것도 바꾸지 않는다.** 메시지에
-    모델·한도 목록과 정리 SQL 이 있다. 남길 모델을 정해 나머지를 비운 뒤(콘솔에서 입력을 비우고 저장, 또는 아래
-    UPDATE) 다시 돌린다.
+**다운그레이드 대상 = 이전 차트의 alembic head.** 0045 가 아니다. 되돌릴 차트의 마이그레이션 이미지로 확인한다.
 
-    ```sql
-    SELECT model_alias, rpm_limit, tpm_limit FROM model.rate_limit_configs
-     WHERE scope = 'GLOBAL' AND is_active ORDER BY model_alias;
-    UPDATE model.rate_limit_configs SET is_active = false
-     WHERE scope = 'GLOBAL' AND is_active AND model_alias IS DISTINCT FROM '<남길 alias>';
-    ```
+```bash
+docker run --rm <이전 차트의 마이그레이션 이미지> alembic heads   # 예: main 차트 → 0042 (head)
+```
 
-  - rpm·tpm 이 모두 비어 있는 활성 GLOBAL 행은 아무것도 집행하지 않으므로 다운그레이드가 비활성화한다(삭제가
-    아니다, 이력은 남는다).
-  - 자동으로 하나만 남기지 않는 이유: 나머지 모델의 Bedrock 쿼터 보호가 아무 신호 없이 사라진다. 어느 모델을
-    남길지는 운영 판단이다.
-- **부분 다운그레이드와 다음 Job.** 0045 로 내린 뒤 0046 이 있는 차트로 Job 이 다시 돌면 init SQL 이 GLOBAL
-  인덱스를 다시 만들고 alembic 이 0046 을 다시 적용한다. 0045 로 남기려면 다운그레이드 직후 `helm rollback` 으로
-  이전 차트로 돌아간다(롤백은 Job 을 돌리지 않는다).
-- 다운그레이드하지 않고 이전 차트로 `helm upgrade` 하면 그 Job 은 실패한다. 이전 init SQL 은 같은 이름의 인덱스가
-  있어 no-op 이라 모델별 GLOBAL 은 그대로지만, 이어지는 `alembic upgrade head` 가
-  `Can't locate revision identified by '0046'` 로 끝난다. 먼저 위 다운그레이드를 한다.
+prod 의 이전 차트(main)는 head 가 0042 다. 0045 까지만 내리고 그 차트로 돌아가면 그 차트의 Job 이
+`Can't locate revision identified by '0045'` 로 실패한다(exit 255). 0042 로 내리면 0043~0045(alias 별 AWS
+계정) 도 함께 내려간다 — 무엇을 잃는지는 [멀티 계정 가이드 §5](../../../docs/guides/multi-account-bedrock-setup.md#5-롤백).
+
+1. **GLOBAL 한도를 하나로 줄인다.** 다운그레이드는 실제 한도(rpm 또는 tpm)를 가진, alias 있는 활성 GLOBAL 행이
+   2개 이상이면 아무것도 바꾸지 않고 실패한다 — 자동으로 하나만 남기면 나머지 모델의 Bedrock 쿼터 보호가 신호
+   없이 사라지고, 어느 모델을 남길지는 운영 판단이기 때문이다. 콘솔에서 나머지 모델의 RPM·TPM 을 비우고 저장하거나
+   (감사 로그가 남는다), SQL 로 한 트랜잭션에서 우회와 감사 기록을 함께 남긴다. `<운영자 user id>` 는 본인의
+   `auth.users.id` 다.
+
+   ```sql
+   SELECT model_alias, rpm_limit, tpm_limit FROM model.rate_limit_configs
+    WHERE scope = 'GLOBAL' AND is_active ORDER BY model_alias;
+   BEGIN;
+   SET LOCAL rl.allow_global_release = 'on';
+   WITH released AS (
+       UPDATE model.rate_limit_configs SET is_active = false, updated_at = now()
+        WHERE scope = 'GLOBAL' AND is_active AND model_alias IS DISTINCT FROM '<남길 alias>'
+       RETURNING id, model_alias, rpm_limit, tpm_limit
+   )
+   INSERT INTO audit.audit_logs
+       (actor_user_id, actor_role, action, resource_type, resource_id, changes,
+        result, ip_address, request_id)
+   SELECT '<운영자 user id>'::uuid, 'ADMIN', 'DELETE_RATE_LIMIT', 'RateLimitConfig', id::text,
+          jsonb_build_object(
+              'before', jsonb_build_object(
+                  'scope', 'GLOBAL', 'model_alias', model_alias,
+                  'rpm', rpm_limit, 'tpm', tpm_limit),
+              'after', jsonb_build_object('scope', 'GLOBAL', 'deactivated', 1),
+              'reason', 'manual cleanup before alembic downgrade below 0046'),
+          'SUCCESS', '0.0.0.0', 'manual-0046-downgrade'
+     FROM released
+   RETURNING resource_id, changes -> 'before';
+   COMMIT;
+   ```
+
+   `SET LOCAL` 없이 같은 UPDATE 를 커밋하면 트리거가 거부한다. rpm·tpm 이 모두 비어 있는 행과 alias 없는 행은
+   아무것도 집행하지 않으므로 다운그레이드가 비활성화하고 행마다 `DELETE_RATE_LIMIT` 감사 기록을 남긴다.
+
+2. **다운그레이드 Job 을 한 번 돌린다.** 훅 Job 은 성공하면 지워지므로 `kubectl create job --from` 은 쓸 수 없다.
+   지금 배포된(0046 이 있는) 차트 디렉터리에서, 배포된 값으로 마이그레이션 Job 을 렌더링하고 이름과 명령만 바꾼다.
+   이미지·env·Secret 은 훅 Job 과 같다. `helm template` 과 `kubectl kustomize` 는 클러스터에 접속하지 않는다.
+
+   ```bash
+   NS=llm-gateway
+   TARGET=0042                       # 이전 차트의 alembic head
+   mkdir downgrade-job && cd downgrade-job
+   helm get values llm-gateway -n "$NS" -o yaml > deployed-values.yaml
+   helm template llm-gateway ../deployment/charts/llm-gateway -n "$NS" -f deployed-values.yaml \
+     --show-only templates/jobs/migration.yaml > migration.yaml
+   cat > kustomization.yaml <<EOF
+   resources:
+     - migration.yaml
+   patches:
+     - target:
+         annotationSelector: helm.sh/hook
+       patch: |-
+         - op: remove
+           path: /metadata/annotations
+     - target:
+         kind: Job
+       patch: |-
+         - op: replace
+           path: /metadata/name
+           value: llm-gateway-migration-downgrade
+         - op: add
+           path: /spec/template/spec/containers/0/command
+           value: ["alembic", "downgrade", "$TARGET"]
+   EOF
+   kubectl kustomize . > downgrade-job.yaml
+   grep -A3 'command:' downgrade-job.yaml        # alembic downgrade <TARGET> 인지 확인
+   kubectl apply -n "$NS" -f downgrade-job.yaml
+   kubectl wait -n "$NS" --for=condition=complete job/llm-gateway-migration-downgrade --timeout=10m
+   kubectl logs -n "$NS" job/llm-gateway-migration-downgrade   # Job 은 끝나고 10분 뒤 사라진다
+   kubectl delete -n "$NS" -f downgrade-job.yaml
+   ```
+
+   렌더링된 ServiceAccount·Role·RoleBinding 은 훅이 쓰는 것과 이름이 같다(initContainer 가 Secret 을 기다리는 데
+   필요하다). 마지막 `kubectl delete` 로 함께 지운다. Job 이 실패하면(`kubectl wait` 가 시간 초과) 로그에 이유가
+   있다 — 0046 의 거부라면 1 로 돌아간다.
+
+3. **차트를 되돌린다.** `helm rollback llm-gateway <이전 리비전> -n llm-gateway`. 롤백은 Job 을 돌리지 않는다.
+   다음 `helm upgrade` 의 Job 은 DB 가 그 차트의 head 에 있으므로 정상이다.
+
+**다운그레이드한 DB 와 다음 Job.** 다운그레이드한 뒤 0046 이 있는 차트로 Job 이 다시 돌면 init SQL 이 GLOBAL
+인덱스와 트리거를 다시 만들고 alembic 이 0043~0046 을 다시 적용한다 — 그래서 3 을 바로 이어서 한다.
+
+**다운그레이드 없이 이전 차트로 `helm upgrade` 하면** 그 Job 은 실패한다. 이전 init SQL 은 같은 이름의 인덱스가
+있어 no-op 이라 모델별 GLOBAL 은 그대로지만, 이어지는 `alembic upgrade head` 가
+`Can't locate revision identified by '0046'` 로 끝난다. 먼저 위 다운그레이드를 한다.
 
 ---
 
