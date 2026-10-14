@@ -27,6 +27,7 @@ from typing import Any
 import structlog
 
 from app.schemas.body_log import BodyLogRecord
+from app.services import bg_tasks
 
 logger = structlog.get_logger(__name__)
 
@@ -147,9 +148,6 @@ _TERMINAL_MARKERS = {
     "responses": "response.completed",
 }
 
-#: 클라이언트 끊김 경로에서 떼어낸 발화 태스크들의 강한 참조 집합(아래 사용처 주석 참조).
-_PENDING_FIRES: set[asyncio.Task] = set()
-
 
 def wrap_stream_for_body_log(
     gen: AsyncIterator[bytes],
@@ -199,17 +197,19 @@ def wrap_stream_for_body_log(
             async for chunk in gen:
                 frames.append(chunk.decode("utf-8", errors="replace"))
                 yield chunk
-        except GeneratorExit:
+        except (asyncio.CancelledError, GeneratorExit):
             # ⚠️ 여기서 `await _fire()` 를 하면 안 된다. GeneratorExit 처리 중에 이벤트
             #    루프로 양보하는 await 가 있으면 Python 이 "async generator ignored
             #    GeneratorExit" RuntimeError 를 던지고, 그 예외가 응답 태스크를 오염시킨다.
             #    enqueue 는 큐에 put 하므로 양보할 수 있다 → 태스크로 떼어 보낸다.
             #    (`_fire` 는 로컬 frames 를 닫고 있으므로 제너레이터가 사라져도 안전하다.)
-            task = asyncio.ensure_future(_fire())
-            # 태스크에 대한 강한 참조를 유지한다. 두지 않으면 GC 가 실행 전에 수거할 수 있고
-            # 그러면 이 레코드만 조용히 사라진다.
-            _PENDING_FIRES.add(task)
-            task.add_done_callback(_PENDING_FIRES.discard)
+            # ⚠️ CancelledError 도 같은 처리다. 클라이언트 끊김에 Starlette 가 응답 태스크를
+            #    취소하면(스티처의 회계 도중이면 특히) 예외가 여기까지 올라오고, 여기서의 await
+            #    도 다시 취소된다(anyio level-triggered). 종결 프레임 직후의 끊김이면 frames 에
+            #    이미 종결 표지가 있어 success 로 남는다.
+            # bg_tasks.spawn — 강한 참조(GC 로 레코드가 사라지지 않게)이고, 셧다운 drain 이
+            # body_logger.stop() 보다 먼저 이것을 기다린다.
+            bg_tasks.spawn(_fire(), name="web_search_body_log")
             raise
         except Exception:
             # 상류 실패로 스트림이 끊긴 경우. 이 경로를 빼면 실패한 요청의 본문이 사라지는데,

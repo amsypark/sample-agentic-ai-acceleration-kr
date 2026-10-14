@@ -33,7 +33,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any, Optional
+from typing import Optional
 
 import structlog
 from fastapi import Request
@@ -41,6 +41,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.providers.openai_usage import extract_responses_usage
 from app.schemas.domain import TokenUsage
+from app.services import bg_tasks
 from app.services.agentcore_mcp_client import AgentCoreMcpClient, AgentCoreMcpError
 
 logger = structlog.get_logger(__name__)
@@ -746,10 +747,23 @@ async def _anthropic_stream(
     finally:
         merged.web_search_count = searches_done
         merged.total_tokens = merged.input_tokens + merged.output_tokens
-        try:
-            await on_usage(merged)
-        except Exception:
-            logger.warning("web_search.on_usage_failed")
+        # ⚠️ 보호 태스크로 넘긴다(services/bg_tasks.py). 이 finally 는 마지막 yield 뒤(종결
+        #    프레임 직후의 끊김)와 취소 **그 자체** 때문에 돈다 — Starlette 의 anyio 취소는
+        #    level-triggered 라, 여기서의 평범한 await 는 첫 Redis 왕복에서 다시 잘려 N 턴의
+        #    토큰과 검색 횟수가 원장 없이 사라진다(차감만 남을 수도 있다).
+        await bg_tasks.spawn_shielded(
+            _fire_usage(on_usage, merged), name="web_search_anthropic_usage"
+        )
+
+
+async def _fire_usage(
+    on_usage: Callable[[TokenUsage], Awaitable[None]], usage: TokenUsage
+) -> None:
+    """두 스티처의 finally 가 보호 태스크에 싣는 발화. 절대 raise 하지 않는다."""
+    try:
+        await on_usage(usage)
+    except Exception:
+        logger.warning("web_search.on_usage_failed")
 
 
 async def _drain_error(chunk_iter: AsyncIterator[bytes], envelope_open: bool) -> AsyncIterator[bytes]:
@@ -1171,10 +1185,10 @@ async def _responses_stream(
     finally:
         merged.web_search_count = searches_done
         merged.total_tokens = merged.input_tokens + merged.output_tokens
-        try:
-            await on_usage(merged)
-        except Exception:
-            logger.warning("web_search.on_usage_failed")
+        # 보호 태스크로 — 근거는 anthropic 스티처의 같은 finally 참조.
+        await bg_tasks.spawn_shielded(
+            _fire_usage(on_usage, merged), name="web_search_responses_usage"
+        )
 
 
 def _finalize_responses_obj(

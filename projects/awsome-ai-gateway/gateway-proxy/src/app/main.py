@@ -38,6 +38,7 @@ from app.resilience.retry_worker import RetryWorker
 from app.routers import bedrock, health, messages, openai_compat, usage
 from app.schemas.domain import ProviderType
 from app.security.event_detector import SecurityEventDetector
+from app.services import bg_tasks
 from app.services.agentcore_mcp_client import AgentCoreMcpClient
 from app.services.bedrock_account_client import BedrockAccountClientProvider
 from app.services.circuit_breaker import CircuitBreakerService
@@ -415,6 +416,21 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("gateway_proxy_shutting_down")
     await health_checker.stop()
+    # 떼어 낸 회계 태스크를 **먼저** 끝낸다 — 그것들이 쓰는 싱크를 닫기 전에.
+    #
+    # shield 는 요청 취소만 막는다(services/bg_tasks.py). 이 drain 이 없으면 회계는 여전히
+    # 프로세스 셧다운에 노출되고, 롤링 배포마다 같은 조용한 원장 누락이 생긴다. 순서가 핵심이다:
+    #   · body_logger.stop() 앞 — 진행 중인 finalize 가 끝에 본문 로그(on_complete)를 넣는다.
+    #     stop() 은 flusher 를 취소한 뒤 큐를 비우므로, 그 뒤에 들어온 레코드는 조용히 버려진다.
+    #   · redis.aclose()/db_engine.dispose() 앞 — finalize 가 차감과 원장 XADD 에 Redis 를 쓴다.
+    #   · cost_stream_spool.drain() 앞 — 이 태스크들이 spool 한 레코드도 마지막 재발행을 받게.
+    # timeout 10s 는 pod terminationGracePeriodSeconds(60) 안에 들어간다.
+    try:
+        completed = await bg_tasks.drain(timeout=10.0)
+        if completed:
+            logger.info("bg_tasks_drained_on_shutdown", count=completed)
+    except Exception:
+        logger.warning("bg_tasks_shutdown_drain_failed")
     # 큐에 남은 레코드를 flush 한다 — 종료 시 버리면 감사 기록에 구멍이 생긴다.
     await body_logger.stop()
     await retry_worker.stop()
