@@ -23,6 +23,7 @@ from app.services.fallback_loop import release_reservations
 from app.services.router_service import ModelInactiveError, RouterService
 from app.services.service_tier_gate import reject_unpriced_service_tier
 from app.services.streaming import openai_sse_stream
+from app.services.tokenizer import estimate_prompt_usage
 
 logger = structlog.get_logger(__name__)
 
@@ -153,6 +154,12 @@ async def responses(request: Request) -> StreamingResponse | JSONResponse:
     (SSE re-framing, usage parsing, costing) is shared.
     """
     return await _handle_responses(request)
+
+
+def _client_wants_usage(req_data) -> bool:
+    """클라이언트 스스로 ``stream_options.include_usage`` 를 요청했는지(라우터가 본 원래 body)."""
+    opts = req_data.get("stream_options") if isinstance(req_data, dict) else None
+    return isinstance(opts, dict) and opts.get("include_usage") is True
 
 
 async def _handle_openai(request: Request, path: str):
@@ -341,9 +348,11 @@ async def _handle_openai(request: Request, path: str):
                 client=client,
             )
 
-        # ⚠️ 상류가 비-2xx 면 SSE 제너레이터는 오류 프레임만 내보내고 on_usage 는 발화하지
-        #    않는다 → finalize 가 돌지 않아 예약이 창(window) 끝까지 남는다. 스트림을
-        #    클라이언트에게 넘기기 **전에** 되돌린다(release_reservations 는 멱등).
+        # ⚠️ 상류가 비-2xx 면 스트림을 클라이언트에게 넘기기 **전에** 예약을 되돌린다.
+        #    SSE 제너레이터는 이때도 zero-usage on_usage 를 쏘고(KI-08), 아래 _record 는
+        #    미리 잡아 둔 rate_limit_state 로 finalize 한다 — 그래서 release_reservations 가
+        #    그 dict 를 제자리에서 비운다. 안 그러면 finalize 가 한 번 더 환불해 카운터가
+        #    음수가 된다(services/fallback_loop.py release_reservations docstring).
         if not (200 <= status < 300):
             await release_reservations(redis=redis, state=state, auth_context=auth_context)
 
@@ -376,6 +385,9 @@ async def _handle_openai(request: Request, path: str):
             else None
         )
 
+        async def _estimate_prompt() -> TokenUsage | None:
+            return await estimate_prompt_usage(tokenizer, req_data, model_config)
+
         return StreamingResponse(
             openai_sse_stream(
                 request,
@@ -383,6 +395,13 @@ async def _handle_openai(request: Request, path: str):
                 on_usage=_record,
                 tokenizer_hook=_estimate,
                 on_complete=_on_complete,
+                # 잘린 스트림의 프롬프트(usage 가 마지막 청크에만 온다). 비-2xx 는 상류가 받지
+                # 않은 요청이라 프롬프트를 청구하지 않는다.
+                prompt_usage_hook=_estimate_prompt if 200 <= status < 300 else None,
+                # 런타임 plane 은 usage 를 받으려고 include_usage 를 강제로 켠다
+                # (bedrock_openai_adapter.with_chat_usage). 클라이언트가 요청하지 않았으면 그
+                # usage 청크(choices: [])는 클라이언트 스트림에서 감춘다.
+                strip_usage_chunk=is_bedrock_runtime and not _client_wants_usage(req_data),
             ),
             status_code=status,
             media_type="text/event-stream",
@@ -714,6 +733,10 @@ async def _handle_responses(request: Request):
             model_id=model_config.provider_model_id,
         )
 
+    async def _estimate_prompt() -> TokenUsage | None:
+        # 잘린 스트림의 프롬프트(PromptUsageHook). _estimate 와 같은 이유로 웹서치 분기보다 앞.
+        return await estimate_prompt_usage(_tokenizer, req_data, model_config)
+
     # --- Server-side web search (Architecture C) — opt-in per routing profile ---
     # When the codex profile enables web search AND the AgentCore MCP client is present,
     # run the Responses-dialect tool-use loop instead of the plain single dispatch below.
@@ -829,6 +852,7 @@ async def _handle_responses(request: Request):
             max_searches_per_turn=_settings_ws.web_search_max_searches_per_turn,
             handshake_timeout=_settings_ws.agentcore_handshake_timeout,
             tokenizer_hook=_estimate,
+            prompt_usage_hook=_estimate_prompt,
             on_stream_complete=_ws_log_stream if _ws_logging else None,
             on_nonstream_complete=_ws_log_nonstream if _ws_logging else None,
         )
@@ -842,8 +866,8 @@ async def _handle_responses(request: Request):
             body, model_config.provider_model_id, **invoke_kwargs
         )
 
-        # 비-2xx 면 on_usage 가 발화하지 않아 예약을 되돌리는 곳이 없다 — 근거는
-        # _handle_openai 의 같은 주석 참조.
+        # 비-2xx 면 스트림 전에 예약을 되돌린다 — 이중 환불이 안 되는 이유까지 _handle_openai 의
+        # 같은 주석 참조.
         if not (200 <= status < 300):
             await release_reservations(redis=redis, state=state, auth_context=auth_context)
 
@@ -906,6 +930,8 @@ async def _handle_responses(request: Request):
                 # KI-08 역산 — 이 방언은 usage 가 종결 이벤트 안에만 있어서, 그 전에
                 # 끊기면 역산이 없으면 usage_logs 행이 아예 만들어지지 않는다.
                 tokenizer_hook=_estimate,
+                # 같은 이유로 프롬프트도 — 없으면 끊긴 턴의 입력이 0 으로 청구된다. 비-2xx 제외.
+                prompt_usage_hook=_estimate_prompt if 200 <= status < 300 else None,
             ),
             status_code=status,
             media_type="text/event-stream",

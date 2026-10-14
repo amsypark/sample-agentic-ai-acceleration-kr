@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
@@ -22,6 +23,64 @@ OnUsage = Callable[[TokenUsage, float | None], Awaitable[None]] | None
 # KI-08 tokenizer fallback: 누적된 output 텍스트를 받아 토큰 수를 역산.
 # None 반환 시 추정 불가 (cost_recorder는 0 토큰 + estimated=True로 기록).
 TokenizerHook = Callable[[str], Awaitable[int | None]] | None
+
+#: 잘린 스트림의 프롬프트 usage 추정 — 인자 없음, ``TokenUsage``(입력 버킷만) 또는 None.
+#: Responses / chat 방언은 usage 를 종결 이벤트에만 실어서, 그 전에 끊기면 입력이 0 으로 남는다.
+#: 라우터가 요청 body 로 만들어 넘긴다(tokenizer.estimate_prompt_usage). 비-2xx 스트림에는 넘기지
+#: 않는다 — 상류가 받지 않은 요청의 프롬프트를 청구하면 안 된다.
+PromptUsageHook = Callable[[], Awaitable[TokenUsage | None]] | None
+
+
+async def _with_prompt_estimate(usage: TokenUsage, hook: PromptUsageHook) -> TokenUsage:
+    """usage 이벤트 없이 끊긴 스트림의 입력 0 을 추정으로 채운다(KI-08 의 입력 쪽).
+
+    호출자는 "usage 이벤트를 하나도 못 받았고, 상류가 요청을 받아들인 이벤트를 하나라도 보냈다"
+    일 때만 부른다 — 출력 텍스트가 없어도(추론 중이거나 도구 호출만) 프롬프트는 이미 처리됐다.
+    오류 프레임만 온 스트림은 받아들여지지 않은 것이라 부르지 않는다. 실패하면 원래 usage
+    그대로(크래시 없음).
+    """
+    if hook is None:
+        return usage
+    try:
+        est = await hook()
+    except Exception:
+        logger.warning("prompt_usage_hook_failed")
+        return usage
+    if est is None:
+        return usage
+    prompt = est.input_tokens + est.cache_read_input_tokens + est.cache_creation_input_tokens
+    if prompt <= 0:
+        return usage
+    return usage.model_copy(
+        update={
+            "input_tokens": est.input_tokens,
+            "cache_read_input_tokens": est.cache_read_input_tokens,
+            "cache_creation_input_tokens": est.cache_creation_input_tokens,
+            "total_tokens": prompt + usage.output_tokens,
+            "estimated": True,
+        }
+    )
+
+
+#: SSE 프레임 경계(빈 줄). strip_usage_chunk 모드가 네트워크 청크를 프레임 단위로 다시 묶는다.
+_SSE_FRAME_END = re.compile(rb"\r?\n\r?\n")
+
+
+def _is_usage_only_frame(frame: bytes) -> bool:
+    """``data: {..., "choices": [], "usage": {...}}`` — include_usage 가 붙이는 마지막 청크."""
+    line = frame.strip()
+    if not line.startswith(b"data:"):
+        return False
+    try:
+        data = json.loads(line[len(b"data:"):].strip())
+    except (ValueError, TypeError):
+        return False
+    return (
+        isinstance(data, dict)
+        and data.get("choices") == []
+        and isinstance(data.get("usage"), dict)
+    )
+
 
 #: 스트림 종료 훅 — ``(누적된 원본 SSE 프레임 전문, status)``.
 #: status 는 ``"success"`` 또는 ``"partial"``(disconnect / timeout / 중간 예외).
@@ -358,6 +417,8 @@ async def openai_sse_stream(
     drain_timeout: float | None = None,
     tokenizer_hook: TokenizerHook = None,
     on_complete: OnComplete = None,
+    prompt_usage_hook: PromptUsageHook = None,
+    strip_usage_chunk: bool = False,
 ) -> AsyncIterator[bytes]:
     """OpenAI-compatible SSE chunks → passthrough bytes (no re-formatting).
 
@@ -365,6 +426,11 @@ async def openai_sse_stream(
     `data: [DONE]\\n\\n`). A single httpx chunk may contain one or many
     frames. We yield chunks as-is and scan each chunk for a `usage` object
     (vLLM emits it on the final chunk when `stream_options.include_usage`).
+
+    ``strip_usage_chunk``: usage 를 게이트웨이가 강제로 켰는데(bedrock-runtime chat —
+    bedrock_openai_adapter.with_chat_usage) 클라이언트는 요청하지 않았을 때. 청크를 완결된 프레임
+    단위로 다시 묶어 usage 를 읽고, usage 전용 프레임(``choices: []``)만 클라이언트에서 뺀다.
+    기본(False)은 지금까지와 바이트 단위로 같다(vLLM 경로).
 
     Edge case handling mirrors `bedrock_anthropic_sse_stream`:
     - Client disconnect: stop, background-drain so usage is still recorded.
@@ -383,6 +449,10 @@ async def openai_sse_stream(
     usage_fired = False  # 과금 멱등 가드 — bedrock_anthropic_sse_stream 과 동일 계약
     accumulated_frames: list[str] = []  # 본문 로깅용(on_complete 없으면 미사용)
     complete_fired = False
+    #: 상류가 생성 청크(choices)를 하나라도 보냈는지 — 요청을 받아들였다는 뜻(PromptUsageHook).
+    upstream_started = False
+    #: strip_usage_chunk 모드에서 아직 끝나지 않은 프레임 조각(네트워크 청크는 프레임 경계와 무관).
+    pending_tail = b""
 
     def _emit_error_chunk(err_type: str, message: str) -> bytes:
         payload = {"error": {"type": err_type, "message": message}}
@@ -390,7 +460,7 @@ async def openai_sse_stream(
 
     def _scan_usage(chunk: bytes) -> TokenUsage | None:
         """Scan a (possibly multi-frame) chunk for usage + accumulate delta content."""
-        nonlocal first_token_time
+        nonlocal first_token_time, upstream_started
         try:
             text = chunk.decode("utf-8", errors="ignore")
         except Exception:
@@ -407,6 +477,8 @@ async def openai_sse_stream(
                 data = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            if isinstance(data, dict) and "choices" in data:
+                upstream_started = True  # 오류 청크({"error": ...})에는 choices 가 없다
             # KI-08: delta content 누적. OpenAI SSE: {"choices":[{"delta":{"content":"..."}}]}
             for choice in data.get("choices", []) or []:
                 delta = choice.get("delta") or {}
@@ -422,6 +494,36 @@ async def openai_sse_stream(
                 # sends them and would otherwise be billed as if nothing were cached.
                 found = extract_chat_usage(u)
         return found
+
+    def _scan_chunk(chunk: bytes) -> bytes:
+        """usage 를 읽고 클라이언트에 보낼 바이트를 돌려준다(strip_usage_chunk docstring)."""
+        nonlocal latest_usage, pending_tail
+        if not strip_usage_chunk or not isinstance(chunk, bytes):
+            if u := _scan_usage(chunk):
+                latest_usage = u
+            return chunk
+        buf = pending_tail + chunk
+        out: list[bytes] = []
+        start = 0
+        for m in _SSE_FRAME_END.finditer(buf):
+            frame = buf[start:m.end()]
+            start = m.end()
+            if u := _scan_usage(frame):
+                latest_usage = u
+            if not _is_usage_only_frame(frame):
+                out.append(frame)
+        pending_tail = buf[start:]
+        return b"".join(out)
+
+    def _flush_tail() -> bytes:
+        """끝에 남은(빈 줄로 닫히지 않은) 프레임 조각 — strip 모드에서만 생긴다."""
+        nonlocal latest_usage, pending_tail
+        tail, pending_tail = pending_tail, b""
+        if not tail:
+            return b""
+        if u := _scan_usage(tail):
+            latest_usage = u
+        return b"" if _is_usage_only_frame(tail) else tail
 
     async def _estimate_if_needed(usage: TokenUsage | None) -> TokenUsage | None:
         """KI-08: usage 없고 누적 텍스트 있으면 tokenizer 역산."""
@@ -482,6 +584,10 @@ async def openai_sse_stream(
             cache_creation_input_tokens=0,
             cache_read_input_tokens=0,
         )
+        if latest_usage is None and upstream_started:
+            # usage 는 마지막 청크에만 온다 — 그 전에 끊기면 입력이 0 이다(PromptUsageHook).
+            # 텍스트가 없어도(도구 호출만, 추론 중) 프롬프트는 이미 처리됐다.
+            usage = await _with_prompt_estimate(usage, prompt_usage_hook)
         try:
             await on_usage(usage, first_token_time)
         except Exception:
@@ -510,8 +616,8 @@ async def openai_sse_stream(
                 if time.monotonic() > deadline:
                     logger.warning("stream_drain_timeout")
                     break
-                if u := _scan_usage(chunk):
-                    latest_usage = u
+                _scan_chunk(chunk)  # usage 만 읽는다(클라이언트는 이미 없다)
+            _flush_tail()
         except Exception:
             logger.exception("stream_drain_error")
         finally:
@@ -530,6 +636,8 @@ async def openai_sse_stream(
             try:
                 chunk = await asyncio.wait_for(iterator.__anext__(), timeout=idle_timeout)
             except StopAsyncIteration:
+                if tail := _flush_tail():  # try 안에서 — 끊김 핸들러가 이 yield 도 덮는다
+                    yield tail
                 break
             except TimeoutError:
                 logger.warning("stream_idle_timeout", idle_timeout=idle_timeout)
@@ -540,8 +648,9 @@ async def openai_sse_stream(
                 )
                 return
 
-            if u := _scan_usage(chunk):
-                latest_usage = u
+            chunk = _scan_chunk(chunk)
+            if not chunk:
+                continue  # usage 전용 프레임만 있었다(strip 모드)
             if on_complete is not None:
                 accumulated_frames.append(
                     chunk.decode("utf-8", errors="replace")
@@ -583,6 +692,7 @@ async def responses_sse_stream(
     drain_timeout: float | None = None,
     on_complete: OnComplete = None,
     tokenizer_hook: TokenizerHook = None,
+    prompt_usage_hook: PromptUsageHook = None,
 ) -> AsyncIterator[bytes]:
     """OpenAI **Responses API** → re-framed SSE (`event: {type}\\ndata: {json}\\n\\n`).
 
@@ -610,6 +720,9 @@ async def responses_sse_stream(
     usage_fired = False  # 과금 멱등 가드 — bedrock_anthropic_sse_stream 과 동일 계약
     accumulated_frames: list[str] = []  # 본문 로깅용(on_complete 없으면 미사용)
     complete_fired = False
+    #: 상류가 요청을 받아들인 이벤트(response.created, 추론·도구 델타 등)를 보냈는지 —
+    #: PromptUsageHook 의 조건. 오류 이벤트는 세지 않는다.
+    upstream_started = False
 
     def _emit_error_chunk(err_type: str, message: str) -> bytes:
         payload = {"error": {"type": err_type, "message": message}}
@@ -631,7 +744,7 @@ async def responses_sse_stream(
         Malformed JSON is passed through as a bare `data:` frame (no crash), matching
         bedrock_anthropic_sse_stream's defensive behaviour.
         """
-        nonlocal latest_usage, first_token_time
+        nonlocal latest_usage, first_token_time, upstream_started
         try:
             data = json.loads(chunk)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -639,6 +752,8 @@ async def responses_sse_stream(
             return f"data: {raw}\n\n".encode()
         if isinstance(data, dict):
             etype = data.get("type", "")
+            if etype and etype not in ("error", "response.failed"):
+                upstream_started = True
             if etype == "response.output_text.delta":
                 if (d := data.get("delta")) and isinstance(d, str):
                     if first_token_time is None:
@@ -722,6 +837,10 @@ async def responses_sse_stream(
         estimated_usage = await _estimate_output_tokens()
         if estimated_usage is not None:
             usage = estimated_usage
+        if latest_usage is None and upstream_started:
+            # usage 는 종결 이벤트에만 온다 — 그 전에 끊기면 입력이 0 이다(PromptUsageHook).
+            # 출력 텍스트가 없어도(추론 중, 도구 호출만) 프롬프트는 이미 처리됐다.
+            usage = await _with_prompt_estimate(usage, prompt_usage_hook)
         try:
             await on_usage(usage, first_token_time)
         except Exception:

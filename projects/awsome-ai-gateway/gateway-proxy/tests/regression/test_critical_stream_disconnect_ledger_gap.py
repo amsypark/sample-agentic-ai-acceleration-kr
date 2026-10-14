@@ -279,6 +279,71 @@ async def test_concurrent_disconnecting_clients_all_land_in_the_ledger():
     assert bg_tasks.pending_count() == 0
 
 
+async def test_sigterm_cuts_in_flight_sse_and_the_cut_turn_is_still_accounted():
+    """⚠️ 한계의 특성화 — SIGTERM(uvicorn graceful shutdown)은 진행 중 SSE 를 **즉시** 자른다.
+
+    uvicorn 0.44 의 ``shutdown()`` 은 진행 중 요청의 ``receive()`` 가 ``http.disconnect`` 를
+    돌려주게 하고, Starlette 1.0 ``StreamingResponse`` 는 그것을 클라이언트 끊김으로 보고 응답
+    태스크를 취소한다. 그래서 남은 terminationGracePeriodSeconds 동안 스트림이 끝나기를
+    기다려 주지 않는다 — 스트림이 살아남을 수 있는 창은 preStop sleep 뿐이다(차트의 preStop
+    주석 참조). 클라이언트는 종결 이벤트 없는 EOF 를 받는다.
+
+    고칠 수 있는 것은 회계다: 잘린 턴도 drain 이 지금까지 생성된 출력(역산)과 프롬프트(추정,
+    prompt_usage_hook)로 기록한다 — 고치기 전에는 프롬프트가 0 이었다.
+    """
+    from app.schemas.domain import TokenUsage
+
+    seen: list[TokenUsage] = []
+
+    async def on_usage(usage, first_token_time):
+        seen.append(usage)
+
+    async def tokenizer_hook(text: str) -> int:
+        return len(text)
+
+    async def prompt_hook() -> TokenUsage:
+        return TokenUsage(cache_read_input_tokens=1234)
+
+    async def app_route(request):
+        async def upstream():  # ~20 초 동안 생성을 계속하는 모델
+            for _ in range(200):
+                yield json.dumps({"type": "response.output_text.delta", "delta": "x"}).encode()
+                await asyncio.sleep(0.1)
+            yield _events()[-1]  # pragma: no cover - 셧다운이 먼저 온다
+
+        return StreamingResponse(
+            responses_sse_stream(
+                request, upstream(), on_usage=on_usage, tokenizer_hook=tokenizer_hook,
+                prompt_usage_hook=prompt_hook, idle_timeout=5.0, drain_timeout=30.0,
+            ),
+            media_type="text/event-stream",
+        )
+
+    server = _Server(Starlette(routes=[Route("/v1/responses", app_route, methods=["GET"])]))
+    await server.__aenter__()
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    writer.write(b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+    await writer.drain()
+    await asyncio.sleep(0.5)  # 몇 개의 델타가 흐른 뒤
+    started = time.monotonic()
+    await server.__aexit__(None, None, None)  # = SIGTERM → uvicorn graceful shutdown
+    body = await asyncio.wait_for(reader.read(-1), timeout=5)
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+
+    assert time.monotonic() - started < 5, (
+        "셧다운이 스트림을 기다렸다 — 특성이 바뀌었으면 차트 preStop 주석을 갱신할 것"
+    )
+    assert b"response.output_text.delta" in body
+    assert b"response.completed" not in body, "종결 이벤트 없이 잘린다(클라이언트는 EOF)"
+    await bg_tasks.drain(timeout=2.0)
+    assert len(seen) == 1, f"잘린 턴의 회계가 {len(seen)}회"
+    usage = seen[0]
+    assert usage.output_tokens > 0 and usage.estimated
+    assert usage.cache_read_input_tokens == 1234, "잘린 턴의 프롬프트가 청구되지 않았다"
+
+
 # ── 2. 실 대사 — 실제 finalize + 실 Redis ────────────────────────────────────
 
 #: 명령 하나의 응답 지연. finalize 는 이 경로에서 EVAL 2회 + XADD 1회라 회계 창이 약 150ms —

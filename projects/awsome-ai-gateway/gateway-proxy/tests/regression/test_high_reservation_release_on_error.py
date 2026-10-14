@@ -34,11 +34,13 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import time
 import uuid
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -224,6 +226,303 @@ def _model_config():
         status=ModelStatus.ACTIVE,
         created_at=datetime(2026, 1, 1),
     )
+
+
+@_redis_required
+async def test_release_then_finalize_with_a_captured_state_refunds_once():
+    """⚠️ 이중 환불 — 라우터가 ``rate_limit_state`` 를 release **전에** 지역 변수로 잡는다.
+
+    ``release_reservations`` 는 ``state`` 에서 키를 pop 할 뿐이었다. 미리 잡아 둔 dict 는 예약을
+    그대로 들고 있었고, 비-2xx 스트림에서 SSE 헬퍼가 쏘는 zero-usage ``on_usage`` 가 그 dict 로
+    ``finalize`` 를 불러 **한 번 더** 환불했다 — CPM 0.5 → 0 → -0.5(리뷰 프로브로 실측).
+    음수 카운터는 그 사용자에게 다음 요청들에서 남의 한도를 빌려 준다.
+    """
+    import redis.asyncio as aioredis
+
+    from app.schemas.domain import TokenUsage
+    from app.services.cost_recorder import CostRecorder
+
+    r = aioredis.from_url(REDIS_PROOF_URL, decode_responses=True)
+    user_id, team_id = str(uuid.uuid4()), str(uuid.uuid4())
+    keys = _cost_keys(user_id, team_id)
+    try:
+        for k in keys:
+            await r.incrbyfloat(k, 0.5)
+        state = {
+            "rate_limit_state": {
+                "tpm_descriptors": [],
+                "tpm_reserved": 0,
+                "cost_reserved": Decimal("0.5"),
+            }
+        }
+        captured = state["rate_limit_state"]  # openai_compat 가 하는 것: release 전에 잡는다
+        auth = _Auth(user_id, team_id)
+        await release_reservations(redis=r, state=state, auth_context=auth)
+        await CostRecorder().finalize(
+            r, auth, _model_config(), TokenUsage(), "req-x", True, 1, rate_limit_state=captured
+        )
+        after = await _read_floats(r, keys)
+        assert all(abs(v) < 1e-9 for v in after), f"이중 환불로 음수가 됐다: {after}"
+    finally:
+        for k in keys:
+            await r.delete(k)
+        await r.aclose()
+
+
+# ── 라우터 그대로 — 실 enforce → 비-2xx 스트림 → release → SSE zero-usage → finalize ──
+
+
+class _RouteRequest:
+    def __init__(self, body: dict, state: dict, app_state) -> None:
+        from starlette.datastructures import Headers
+
+        self._body = json.dumps(body).encode()
+        self.scope = {"state": state}
+        self.app = SimpleNamespace(state=app_state)
+        self.headers = Headers()
+
+    async def body(self) -> bytes:
+        return self._body
+
+    async def is_disconnected(self) -> bool:
+        return False
+
+
+def _gpt_config(provider):
+    from app.schemas.domain import ApiFormat, ModelConfigSchema, ModelPricingSchema, ModelStatus
+
+    return ModelConfigSchema(
+        provider_model_id="us.openai.gpt-5.6-terra",
+        alias="gpt-5.6-terra",
+        provider=provider,
+        api_format=ApiFormat.OPENAI_RESPONSES,
+        endpoint="https://runtime.example.invalid/openai",
+        pricing=ModelPricingSchema(
+            input_per_1k=Decimal("0.0022"), output_per_1k=Decimal("0.0132")
+        ),
+        status=ModelStatus.ACTIVE,
+    )
+
+
+async def _limits(**_kwargs):
+    from app.services.rate_limit_config_loader import AllScopeLimits, ScopeLimits
+
+    return AllScopeLimits(
+        user=ScopeLimits(rpm=1000, tpm=1_000_000, cpm=Decimal("100"), cph=Decimal("1000")),
+        team=ScopeLimits(),
+        global_=ScopeLimits(),
+    )
+
+
+def _counter_keys(user_id: str, alias: str) -> list[str]:
+    from app.services.rate_limit_scope import RateLimitScope, build_tpm_key_group
+
+    now = int(time.time())
+    cur, _prev, _win = build_tpm_key_group(RateLimitScope.USER, user_id, alias)
+    return [
+        f"rl:cost:user:{{{user_id}}}:cpm:{(now // 60) * 60}",
+        f"rl:cost:user:{{{user_id}}}:cph:{(now // 3600) * 3600}",
+        cur,
+    ]
+
+
+async def _drive_non_2xx_stream(monkeypatch, r, route: str, *, release_mod: str):
+    """라우트 하나를 실제로 호출해 비-2xx 스트림을 끝까지 소비하고, (release 직전 값, 최종 값)."""
+    from app.schemas.domain import AuthContext, AuthType, ProviderType, Role
+    from app.services import fallback_loop as fl
+    from app.services.cost_recorder import CostRecorder
+    from app.services.lua_loader import LuaScriptLoader
+
+    LuaScriptLoader.load_all(_SRC / "redis_scripts")
+    user_id = str(uuid.uuid4())
+    auth = AuthContext(
+        user_id=user_id,
+        team_id=str(uuid.uuid4()),
+        dept_id=str(uuid.uuid4()),
+        roles=[Role.USER],
+        auth_type=AuthType.VIRTUAL_KEY,
+    )
+    monkeypatch.setattr("app.services.rate_limit_enforcement.load_all_scope_limits", _limits)
+
+    before_release: list[list[float]] = []
+    real_release = fl.release_reservations
+
+    async def _spy_release(**kwargs):
+        before_release.append(await _read_floats(r, keys))
+        await real_release(**kwargs)
+
+    monkeypatch.setattr(release_mod, _spy_release)
+
+    adapter = SimpleNamespace()
+    state = {
+        "auth_context": auth,
+        "client": "codex",
+        "_redis": r,
+        "_session_factory": None,
+        "request_id": f"req-{route}",
+    }
+    app_state = SimpleNamespace(
+        provider_registry=SimpleNamespace(get=lambda _p: adapter),
+        cost_recorder=CostRecorder(),
+        tokenizer=None,
+        body_logger=None,
+        metrics=None,
+        agentcore_mcp_client=None,
+        circuit_breaker=None,
+        fallback_resolver=None,
+        alias_provider_map={},
+        bedrock_account_client_provider=None,
+    )
+
+    if route in ("chat", "responses"):
+        from app.routers import openai_compat
+        from app.schemas.routing import RoutingProfileSchema
+
+        cfg = _gpt_config(ProviderType.BEDROCK_RUNTIME_OPENAI)
+        keys = _counter_keys(user_id, cfg.alias)
+
+        async def _resolve(redis, db, alias):
+            return cfg
+
+        monkeypatch.setattr(openai_compat._router_service, "resolve_openai_model", _resolve)
+        monkeypatch.setattr(openai_compat._router_service, "resolve_codex_model", _resolve)
+        profile = RoutingProfileSchema(
+            client="codex", backend="bedrock_openai", account_role_arn=None,
+            region="us-east-2", default_model=cfg.alias, external_id=None,
+        )
+        app_state.routing_profile_loader = SimpleNamespace(load=_async_return(profile))
+        if route == "chat":
+            err = b'data: {"error":{"type":"invalid_request_error","message":"bad"}}\n\n'
+            body = {"model": cfg.alias, "stream": True, "max_tokens": 1000,
+                    "messages": [{"role": "user", "content": "hi"}]}
+        else:
+            err = b'{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}'
+            body = {"model": cfg.alias, "stream": True, "max_output_tokens": 1000, "input": "hi"}
+        adapter.invoke_stream = _async_return((400, _one(err), {}, "rid-1"))
+        req = _RouteRequest(body, state, app_state)
+        if route == "chat":
+            resp = await openai_compat._handle_openai(req, "/v1/chat/completions")
+        else:
+            resp = await openai_compat._handle_responses(req)
+    else:  # /v1/messages — 폴백 루프 경로
+        from datetime import datetime
+
+        import app.routers.messages as messages_mod
+        from app.schemas.domain import (
+            ApiFormat,
+            ModelConfigSchema,
+            ModelPricingSchema,
+            ModelStatus,
+        )
+        from app.services.router_service import RouterService
+
+        cfg = ModelConfigSchema(
+            provider_model_id="anthropic.claude-sonnet-4-6",
+            alias="claude-sonnet-4-6",
+            provider=ProviderType.BEDROCK,
+            api_format=ApiFormat.ANTHROPIC_MESSAGES,
+            pricing=ModelPricingSchema(
+                input_per_1k=Decimal("0.003"), output_per_1k=Decimal("0.015")
+            ),
+            status=ModelStatus.ACTIVE,
+            created_at=datetime(2026, 1, 1),
+        )
+        keys = _counter_keys(user_id, cfg.alias)
+
+        class _Router(RouterService):
+            async def alias_provider(self, redis, db, alias):
+                return ProviderType.BEDROCK
+
+            async def resolve_bedrock_model(self, redis, db, alias):
+                return cfg
+
+        monkeypatch.setattr(messages_mod, "_router_service", _Router())
+        profile = SimpleNamespace(
+            backend="bedrock", default_model=None, web_search_enabled=False,
+            region=None, account_role_arn=None,
+        )
+        app_state.routing_profile_loader = SimpleNamespace(load=_async_return(profile))
+        err = b'{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}'
+        adapter.invoke_stream = _async_return((400, _one(err), {}, "rid-1"))
+        state["client"] = "claude-code"
+        body = {"model": cfg.alias, "stream": True, "max_tokens": 1000,
+                "messages": [{"role": "user", "content": "hi"}]}
+        resp = await messages_mod.messages(_RouteRequest(body, state, app_state))
+
+    async for _ in resp.body_iterator:
+        pass
+    after = await _read_floats(r, keys)
+    for k in keys:
+        await r.delete(k)
+    return before_release, after
+
+
+def _async_return(value):
+    async def _fn(*_a, **_k):
+        return value
+
+    return _fn
+
+
+def _one(chunk: bytes):
+    async def _gen():
+        yield chunk
+
+    return _gen()
+
+
+@_redis_required
+@pytest.mark.parametrize(
+    ("route", "release_mod"),
+    [
+        ("chat", "app.routers.openai_compat.release_reservations"),
+        ("responses", "app.routers.openai_compat.release_reservations"),
+    ],
+)
+async def test_openai_streaming_non_2xx_releases_the_reservation_exactly_once(
+    monkeypatch, route, release_mod
+):
+    """⚠️ 실 enforce 로 예약하고, 실 라우터·SSE 헬퍼·finalize 를 그대로 탄다.
+
+    고치기 전에는 비용 카운터와 TPM 카운터가 둘 다 **음수**(예약액만큼)로 끝났다.
+    """
+    import redis.asyncio as aioredis
+
+    r = aioredis.from_url(REDIS_PROOF_URL, decode_responses=True)
+    try:
+        before, after = await _drive_non_2xx_stream(monkeypatch, r, route, release_mod=release_mod)
+    finally:
+        await r.aclose()
+    assert before and all(v > 0 for v in before[0]), (
+        f"전제: release 직전에 실제 예약(비용·TPM)이 있어야 한다 — {before}"
+    )
+    assert all(abs(v) < 1e-9 for v in after), (
+        f"{route}: 예약이 정확히 한 번 환불되지 않았다(음수=이중 환불): {after}"
+    )
+
+
+@_redis_required
+async def test_messages_streaming_non_2xx_releases_exactly_once_too(monkeypatch):
+    """``/v1/messages`` 는 영향이 없다는 보고의 검증.
+
+    폴백 루프가 release 한 **뒤에** 라우터가 상태를 읽어(None) finalize 에 넘긴다.
+
+    이 테스트는 고치기 전에도 통과한다(대조군). 깨지면 이 경로도 같은 결함을 얻은 것이다.
+    """
+    import redis.asyncio as aioredis
+
+    r = aioredis.from_url(REDIS_PROOF_URL, decode_responses=True)
+    try:
+        before, after = await _drive_non_2xx_stream(
+            monkeypatch,
+            r,
+            "messages",
+            release_mod="app.services.fallback_loop.release_reservations",
+        )
+    finally:
+        await r.aclose()
+    assert before and all(v > 0 for v in before[0]), before
+    assert all(abs(v) < 1e-9 for v in after), after
 
 
 async def test_release_is_a_noop_without_a_reservation():

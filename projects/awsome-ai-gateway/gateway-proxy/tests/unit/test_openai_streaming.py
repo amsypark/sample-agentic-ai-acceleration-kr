@@ -271,3 +271,57 @@ async def test_openai_streaming_multiline_chunk_parses_usage():
     await asyncio.sleep(0)
     assert captured[-1].input_tokens == 2
     assert captured[-1].output_tokens == 3
+
+
+# ── strip_usage_chunk — 게이트웨이가 강제한 usage 청크를 클라이언트에서 감춘다 ─────────
+
+_USAGE_ONLY = (
+    b'data: {"id":"c1","object":"chat.completion.chunk","choices":[],'
+    b'"usage":{"prompt_tokens":12,"completion_tokens":6,"total_tokens":18}}\n\n'
+)
+_TEXT = (
+    b'data: {"id":"c1","object":"chat.completion.chunk",'
+    b'"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\n'
+)
+
+
+async def _run(chunks, *, strip):
+    seen = []
+
+    async def on_usage(usage, first_token_time):
+        seen.append(usage)
+
+    async def _gen():
+        for c in chunks:
+            yield c
+
+    out = [
+        c
+        async for c in openai_sse_stream(
+            FakeRequest(), _gen(), on_usage=on_usage, idle_timeout=5.0, drain_timeout=5.0,
+            strip_usage_chunk=strip,
+        )
+    ]
+    return b"".join(out), seen
+
+
+async def test_strip_mode_hides_the_usage_only_frame_and_still_bills_it():
+    client, seen = await _run([_TEXT, _USAGE_ONLY, b"data: [DONE]\n\n"], strip=True)
+    assert client == _TEXT + b"data: [DONE]\n\n"
+    assert (seen[0].input_tokens, seen[0].output_tokens) == (12, 6)
+
+
+async def test_strip_mode_reassembles_frames_split_across_chunks():
+    """네트워크 청크는 프레임 경계와 무관하다 — 쪼개진 usage 프레임도 감추고 읽어야 한다."""
+    stream = _TEXT + _USAGE_ONLY + b"data: [DONE]\n\n"
+    pieces = [stream[i:i + 7] for i in range(0, len(stream), 7)]
+    client, seen = await _run(pieces, strip=True)
+    assert client == _TEXT + b"data: [DONE]\n\n"
+    assert (seen[0].input_tokens, seen[0].output_tokens) == (12, 6)
+
+
+async def test_without_strip_the_usage_frame_passes_through_untouched():
+    chunks = [_TEXT, _USAGE_ONLY, b"data: [DONE]\n\n"]
+    client, seen = await _run(chunks, strip=False)
+    assert client == b"".join(chunks)
+    assert (seen[0].input_tokens, seen[0].output_tokens) == (12, 6)

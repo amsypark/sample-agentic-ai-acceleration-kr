@@ -193,10 +193,15 @@ async def release_reservations(
        되돌리지 않았다. 400 을 연속으로 받은 사용자는 **한 푼도 쓰지 않고** 자기 CPM/CPH
        한도를 소진해 그 분/시간이 끝날 때까지 스스로 429 를 맞는다.
 
-    ⚠️ 마지막에 ``state["rate_limit_state"]`` 를 지운다 — 이것이 멱등성의 근거다.
-       정산이 이미 됐으면 상태가 비어 있어 이 함수는 no-op 이고, 반대로 이 함수가 먼저
-       돌면 ``finalize`` 가 이중 정산하지 않는다. 그래서 "혹시 몰라 한 번 더" 부르는 것이
-       안전하다.
+    ⚠️ 마지막에 예약 dict 를 **제자리에서** 비우고 ``state["rate_limit_state"]`` 를 지운다 —
+       이것이 멱등성의 근거다. 두 번째 호출은 상태가 없어 no-op 이고, 이 함수 뒤에 도는
+       ``finalize`` 는 비워진 dict 를 받아 다시 환불하지 않는다.
+
+       pop 만으로는 부족했다. 라우터가 이 dict 를 release **전에** 지역 변수로 잡아
+       ``finalize`` 에 넘기므로(openai_compat 의 두 스트리밍 경로), pop 뒤에도 그 사본이 예약을
+       그대로 들고 있었다. 비-2xx 스트림에서 SSE 헬퍼의 zero-usage ``on_usage`` 가 그 사본으로
+       ``finalize`` 를 불러 **한 번 더** 환불했다 — CPM/CPH 와 TPM 이 예약액만큼 음수가
+       됐다(실 Redis 로 실측). 음수 카운터는 그 사용자에게 다음 요청들에서 남의 한도를 빌려 준다.
     """
     rls = state.get("rate_limit_state")
     if not rls:
@@ -227,7 +232,11 @@ async def release_reservations(
         except Exception:
             logger.warning("fallback_unwind_cost_failed")
 
-    # Clear so finalize() does not double-settle
+    # finalize() 가 이중 정산하지 않게 — state 에서 지우는 것과 **같은 dict 를 비우는 것** 둘 다.
+    # (docstring 참조: 미리 잡아 둔 사본이 있으면 pop 만으로는 그 사본이 예약을 계속 들고 있다.)
+    rls["tpm_descriptors"] = []
+    rls["tpm_reserved"] = 0
+    rls["cost_reserved"] = Decimal("0")
     state.pop("rate_limit_state", None)
 
 

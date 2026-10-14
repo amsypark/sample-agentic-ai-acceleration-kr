@@ -37,7 +37,15 @@ def resolve_context_tier(usage: TokenUsage, pricing: ModelConfigSchema) -> str |
 
     청구와 감사가 어긋나지 않도록(청구=long/기록=short) 판정은 여기 한 곳에서만 한다 —
     임계값 비교 자체는 :func:`resolve_tier_for_prompt_total` (pre-reserve 추정과 공유).
+
+    ⚠️ ``usage.turns`` (웹서치 루프가 합친 여러 상류 호출)가 있으면 **호출마다** 판정한다 —
+       한 턴이라도 long 이면 long. 합계를 임계와 비교하면 각자 short 인 턴들이 long 이 된다.
     """
+    if usage.turns:
+        tiers = {resolve_context_tier(t, pricing) for t in usage.turns}
+        if tiers == {None}:
+            return None
+        return "long" if "long" in tiers else "short"
     prompt_total = (
         usage.input_tokens
         + usage.cache_read_input_tokens
@@ -73,7 +81,23 @@ def calculate_cost(usage: TokenUsage, pricing: ModelConfigSchema) -> Decimal:
     오늘의 단일 요율 동작 그대로.
 
     quantize 는 마지막에 한 번만 — 항마다 반올림하면 오차가 누적된다.
+
+    ⚠️ ``usage.turns`` 가 있으면 상류 호출마다 **자기 티어로** 청구해 합한다(AWS 가 그렇게
+       청구한다). 캐시 TTL 은 요청 단위 값(``usage.cache_ttl_1h``)을 모든 턴에 쓴다 — 라우터가
+       루프가 끝난 뒤 합계 usage 에만 세우기 때문이다.
     """
+    if usage.turns:
+        total = sum(
+            (_uncapped_cost(t, pricing, cache_ttl_1h=usage.cache_ttl_1h) for t in usage.turns),
+            Decimal("0"),
+        )
+    else:
+        total = _uncapped_cost(usage, pricing, cache_ttl_1h=usage.cache_ttl_1h)
+    return total.quantize(COST_PRECISION, rounding=ROUND_HALF_UP)
+
+
+def _uncapped_cost(usage: TokenUsage, pricing: ModelConfigSchema, *, cache_ttl_1h: bool) -> Decimal:
+    """한 상류 호출의 비용(반올림 전). 티어는 그 호출 자신의 프롬프트로 판정한다."""
     p = pricing.pricing
     long_ctx = resolve_context_tier(usage, pricing) == "long"
 
@@ -84,7 +108,7 @@ def calculate_cost(usage: TokenUsage, pricing: ModelConfigSchema) -> Decimal:
 
     input_rate = _rate(p.input_per_1k, p.long_input_per_1k)
     output_rate = _rate(p.output_per_1k, p.long_output_per_1k)
-    if usage.cache_ttl_1h:
+    if cache_ttl_1h:
         cache_write_rate = _rate(p.cache_write_1h_per_1k, p.long_cache_write_1h_per_1k)
     else:
         cache_write_rate = _rate(p.cache_write_per_1k, p.long_cache_write_per_1k)
@@ -94,9 +118,7 @@ def calculate_cost(usage: TokenUsage, pricing: ModelConfigSchema) -> Decimal:
     output_cost = (Decimal(usage.output_tokens) / 1000) * output_rate
     cache_write_cost = (Decimal(usage.cache_creation_input_tokens) / 1000) * cache_write_rate
     cache_read_cost = (Decimal(usage.cache_read_input_tokens) / 1000) * cache_read_rate
-    return (input_cost + output_cost + cache_write_cost + cache_read_cost).quantize(
-        COST_PRECISION, rounding=ROUND_HALF_UP
-    )
+    return input_cost + output_cost + cache_write_cost + cache_read_cost
 
 
 class CostRecorder:
