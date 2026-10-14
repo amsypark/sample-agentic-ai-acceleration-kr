@@ -32,7 +32,7 @@ interface Props {
  */
 type SqlRunResult =
   | { ok: true; rows?: Array<Record<string, unknown>>; row_count?: number }
-  | { ok: false; error?: string };
+  | { ok: false; error?: string; hint?: string };
 
 /** 실패 응답 본문에서 사람이 읽을 사유를 뽑는다. 실제로 도착하는 모양이 넷이다:
  *  Lambda 검증 실패 `{ok:false, error}` / 크래시 `{errorMessage}`(구버전 admin-api) /
@@ -48,6 +48,12 @@ function extractSqlError(body: unknown): string | undefined {
   if (typeof b.errorMessage === 'string') return b.errorMessage;
   if (typeof b.detail === 'string') return b.detail;
   return undefined;
+}
+
+/** admin-api 가 Lambda 크래시/타임아웃을 정규화할 때 붙이는 복구 안내(`hint`) — 무엇을 하면 되는지. */
+function extractSqlHint(body: unknown): string | undefined {
+  const hint = (body as { hint?: unknown } | null)?.hint;
+  return typeof hint === 'string' && hint ? hint : undefined;
 }
 
 function SqlEditor({ sql, sessionId }: { sql: string; sessionId: string }) {
@@ -79,7 +85,7 @@ function SqlEditor({ sql, sessionId }: { sql: string; sessionId: string }) {
       const body: unknown = await r.json().catch(() => null);
       const okFlag = (body as { ok?: unknown } | null)?.ok;
       if (!r.ok || okFlag !== true) {
-        setResult({ ok: false, error: extractSqlError(body) ?? '실행 실패' });
+        setResult({ ok: false, error: extractSqlError(body) ?? '실행 실패', hint: extractSqlHint(body) });
       } else {
         setResult(body as SqlRunResult);
       }
@@ -143,6 +149,8 @@ function SqlEditor({ sql, sessionId }: { sql: string; sessionId: string }) {
             // Lambda 검증/실행 에러를 그대로 노출 — 분석가가 보고 수정(에디터 UX 핵심)
             <div className="rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive whitespace-pre-wrap">
               {result.error || '실행 실패'}
+              {/* 예전엔 hint 를 버렸다 — 크래시/타임아웃이면 "범위를 좁혀 다시 실행" 이 다음 행동이다. */}
+              {result.hint && <p className="mt-1 text-muted-foreground">{result.hint}</p>}
             </div>
           ) : (
             <div>

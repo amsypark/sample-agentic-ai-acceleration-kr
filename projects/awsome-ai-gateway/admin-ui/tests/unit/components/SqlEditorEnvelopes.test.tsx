@@ -103,3 +103,29 @@ describe('successes still render as successes (controls)', () => {
     expect(screen.getByText(/\(1행\)/)).toBeInTheDocument();
   });
 });
+
+describe('the recovery hint from admin-api is shown', () => {
+  // admin-api 는 Lambda 크래시/타임아웃(FunctionError)을 `{ok:false, error, hint}` 로 정규화한다. hint 는
+  // "무엇을 하면 되는지"(범위를 좁혀 다시 실행) 다 — 예전 에디터는 error 만 그리고 hint 를 버렸다.
+  const HINT = '쿼리가 중단됐습니다(크래시 또는 시간 초과). 범위를 좁혀 다시 실행하세요.';
+
+  it('renders error and hint together', async () => {
+    mockFetch(200, { ok: false, error: 'Task timed out after 30.00 seconds', hint: HINT });
+    const user = userEvent.setup();
+    renderEditor();
+    await runQuery(user);
+
+    await waitFor(() => expect(screen.getByText(/Task timed out/)).toBeInTheDocument());
+    expect(screen.getByText(HINT)).toBeInTheDocument();
+  });
+
+  it('a failure without a hint shows only the error (control)', async () => {
+    mockFetch(200, { ok: false, error: 'SELECT only' });
+    const user = userEvent.setup();
+    renderEditor();
+    await runQuery(user);
+
+    await waitFor(() => expect(screen.getByText('SELECT only')).toBeInTheDocument());
+    expect(screen.queryByText(/범위를 좁혀/)).toBeNull();
+  });
+});
