@@ -14,9 +14,14 @@
   5. 0046 은 양방향 모두 ACCESS EXCLUSIVE 를 **먼저** 잡는다 — 이 테이블을 읽고 이어서 쓰는 트랜잭션이
      끝까지 간다(대조군: SHARE·SHARE ROW EXCLUSIVE 에서 올리던 순서는 그 트랜잭션을 교착으로 죽였다).
   6. init SQL 의 0046 블록은 객체가 있으면 잠그지 않고, 만들어야 할 때만 잠그며 그 대기는 lock_timeout 5s 로
-     묶인다 — 넘으면 깨끗이 실패하고 다시 돌리면 된다(대조군: 맨 ``CREATE UNIQUE INDEX IF NOT EXISTS`` 는
-     인덱스가 있어도 열린 쓰기 뒤에서 기다린다).
-  7. 0046 이 USER/TEAM 인덱스의 **이름을 그대로** 쓰는 이유: 이전 차트의 init SQL 이 0046 DB 에서 다시 돌아도
+     묶인다 — 넘으면 깨끗이 실패하고 다시 돌리면 된다. rate_limit_configs 에 쓰기가 열려 있어도 init SQL
+     파일 전체가 기다리지 않는다(대조군: 맨 ``CREATE [UNIQUE] INDEX IF NOT EXISTS`` 는 인덱스가 있어도 열린
+     쓰기 뒤에서 기다린다).
+  7. init SQL 은 트리거를 새 설치(alembic_version 없음)와 이미 0046 이후인 DB 에만 만든다. 0046 에 닿기 전에
+     멈춘 0042 DB 에서는 만들지 않으므로, 이전 admin-api 의 단일 슬롯 교체가 그대로 된다(대조군: 트리거가
+     있으면 그 교체가 커밋에서 거부된다). 0024 이전 DB 가 이 차트의 Job 으로 0046 에 닿는지는 실 alembic
+     이 필요해 CI pg-proof 잡의 "a DB below 0024" 스텝이 본다.
+  8. 0046 이 USER/TEAM 인덱스의 **이름을 그대로** 쓰는 이유: 이전 차트의 init SQL 이 0046 DB 에서 다시 돌아도
      no-op 이다(대조군: 그 이름이 없으면 같은 문장이 단일 슬롯을 조용히 되살린다).
 
 마이그레이션 함수는 alembic 없이 돈다(이 서비스의 lock 에 alembic 이 없다). 모듈의 ``from alembic import op``
@@ -530,13 +535,14 @@ async def test_init_sql_block_takes_no_lock_when_the_objects_exist(dsn):
 
 async def test_init_sql_block_gives_up_after_lock_timeout_and_can_run_again(dsn):
     """0045 DB(0046 객체 없음)에서 열린 쓰기 뒤에 막히면 5초 뒤 깨끗이 실패한다 — 아무것도 만들지 않고,
-    쓰기가 끝난 뒤 다시 돌리면 만든다(마이그레이션 Job 재실행과 같다)."""
+    쓰기가 끝난 뒤 다시 돌리면 인덱스를 만든다(마이그레이션 Job 재실행과 같다). 트리거는 0046 이 만든다(7)."""
     import asyncpg
 
     conn = await asyncpg.connect(_plain(dsn))
     try:
         await conn.execute("DROP TRIGGER rl_global_release_guard ON model.rate_limit_configs")
         await conn.execute("DROP INDEX model.uq_rate_limit_configs_global_active")
+        await _stamp(conn, "0045")
         writer, tx = await _open_writer(dsn)
         try:
             t0 = time.monotonic()
@@ -553,12 +559,145 @@ async def test_init_sql_block_gives_up_after_lock_timeout_and_can_run_again(dsn)
         assert await conn.fetchval("SELECT to_regclass('model.uq_rate_limit_configs_global_active')")
         assert await conn.fetchval(
             "SELECT count(*) FROM pg_trigger WHERE tgname = 'rl_global_release_guard'"
-        ) == 1
+        ) == 0
     finally:
         await conn.close()
 
 
-# ── 7. 이름을 그대로 쓰는 이유 ────────────────────────────────────────────────────────────
+async def test_rerunning_the_whole_init_sql_does_not_wait_behind_a_rate_limit_writer(dsn):
+    """02_create_tables.sql 을 통째로 다시 돌려도(매 마이그레이션 Job) rate_limit_configs 의 열린 쓰기 뒤에서
+    기다리지 않는다 — 그 테이블의 인덱스·트리거 문장은 전부 존재를 먼저 보는 블록 안에 있다."""
+    import asyncpg
+
+    writer, tx = await _open_writer(dsn)
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        await conn.execute("SET lock_timeout = '1s'")  # 1초라도 기다리면 실패한다
+        t0 = time.monotonic()
+        await conn.execute(_INIT_TABLES.read_text(encoding="utf-8"))
+        assert time.monotonic() - t0 < 5
+
+        # 대조군 — 블록에 넣기 전의 맨 문장은 인덱스가 있어도 SHARE 를 기다린다.
+        with pytest.raises(asyncpg.LockNotAvailableError):
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rate_limit_configs_scope "
+                "ON model.rate_limit_configs (scope, scope_id) WHERE is_active = true"
+            )
+    finally:
+        await conn.close()
+        await tx.rollback()
+        await writer.close()
+
+
+# ── 7. init SQL 이 트리거를 만드는 DB ────────────────────────────────────────────────────────
+
+
+async def _stamp(conn, version: str | None) -> None:
+    """alembic_version 을 그 리비전으로 만든다(None = 테이블 없음 — 새 설치)."""
+    await conn.execute("DROP TABLE IF EXISTS public.alembic_version")
+    if version is not None:
+        await conn.execute(
+            "CREATE TABLE public.alembic_version (version_num VARCHAR(32) PRIMARY KEY)"
+        )
+        await conn.execute("INSERT INTO public.alembic_version VALUES ($1)", version)
+
+
+@pytest.mark.parametrize(
+    "version, guard_installed",
+    [(None, True), ("0046", True), ("0047", True), ("0045", False), ("0042", False),
+     ("0023", False), ("not-a-revision", False)],
+)
+async def test_init_sql_installs_the_guard_only_on_a_fresh_install_or_at_0046(
+    dsn, version, guard_installed
+):
+    import asyncpg
+
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        await conn.execute("DROP TRIGGER IF EXISTS rl_global_release_guard ON model.rate_limit_configs")
+        await _stamp(conn, version)
+        await conn.execute(_init_sql_0046_block())
+        installed = await conn.fetchval(
+            "SELECT count(*) FROM pg_trigger WHERE tgname = 'rl_global_release_guard'"
+        )
+        assert installed == (1 if guard_installed else 0), (version, installed)
+    finally:
+        await conn.close()
+
+
+async def _as_a_0042_db(conn) -> None:
+    """init SQL 로 만든 DB 를 0042 의 모양으로 — 트리거·GLOBAL 인덱스 없음, 0024 의 단일 슬롯 인덱스,
+    alembic_version 0042(이 차트의 Job 이 0046 에 닿기 전에 멈춘 DB 가 이렇다)."""
+    await conn.execute("DROP TRIGGER rl_global_release_guard ON model.rate_limit_configs")
+    await conn.execute("DROP INDEX model.uq_rate_limit_configs_global_active")
+    await conn.execute("DROP INDEX model.uq_rate_limit_configs_active")
+    await conn.execute(_executed_0024_index_sql("uq_rate_limit_configs_active"))
+    await _stamp(conn, "0042")
+
+
+_MAIN_SLOT_SWAP = (  # main(이전 릴리스)의 GLOBAL upsert — alias 와 무관하게 활성 GLOBAL 행을 전부 비활성화
+    "UPDATE model.rate_limit_configs SET is_active = false, updated_at = now() "
+    "WHERE scope = 'GLOBAL' AND scope_id IS NULL AND is_active",
+    "INSERT INTO model.rate_limit_configs (scope, model_alias, rpm_limit, is_active, created_by) "
+    "VALUES ('GLOBAL', 'claude-sonnet-4-6', 30, true, $1)",
+)
+
+
+async def _main_slot_swap(conn) -> None:
+    async with conn.transaction():
+        await conn.execute(_MAIN_SLOT_SWAP[0])
+        await conn.execute(_MAIN_SLOT_SWAP[1], SEED_ADMIN_ID)
+
+
+async def test_a_0042_db_whose_upgrade_stops_before_0046_keeps_main_slot_swaps(dsn, engine):
+    import asyncpg
+
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        await _as_a_0042_db(conn)
+        await _global(engine, "claude-opus-4-7", rpm=60)
+    finally:
+        await conn.close()
+
+    await _apply_init_sql(dsn)  # 이 차트의 Job 첫 단계 — 그 뒤 alembic 이 0046 전에 실패했다고 본다
+    indexes, guard = await _state(engine)
+    assert [kind for kind, _ in guard] == ["function"], "트리거가 0046 전에 생겼다"
+    single_slot = dict(indexes)["model.uq_rate_limit_configs_active"]
+    assert "scope <>" not in single_slot, "init SQL 이 0024 의 단일 슬롯 정의를 바꿨다"
+
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        await _main_slot_swap(conn)  # 이전 admin-api 가 GLOBAL 을 다른 모델로 옮긴다 — 0042 에서는 정상이다
+    finally:
+        await conn.close()
+    assert await _all(engine, _ACTIVE_GLOBAL) == [("claude-sonnet-4-6", 30, None)]
+
+
+async def test_control_with_the_guard_on_a_0042_db_main_slot_swaps_are_refused(dsn, engine):
+    """대조군 — 이전 init SQL 처럼 트리거를 무조건 만들면, 같은 0042 DB 에서 이전 admin-api 의 정상적인 슬롯
+    교체가 커밋에서 거부된다."""
+    import asyncpg
+
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        await _as_a_0042_db(conn)
+        await _global(engine, "claude-opus-4-7", rpm=60)
+        await conn.execute(_release_guard_trigger_ddl())
+        with pytest.raises(asyncpg.CheckViolationError, match="claude-opus-4-7"):
+            await _main_slot_swap(conn)
+    finally:
+        await conn.close()
+    assert await _all(engine, _ACTIVE_GLOBAL) == [("claude-opus-4-7", 60, None)]
+
+
+def _release_guard_trigger_ddl() -> str:
+    src = _INIT_TABLES.read_text(encoding="utf-8")
+    match = re.search(r"CREATE CONSTRAINT TRIGGER rl_global_release_guard\b.*?;", src, re.S)
+    assert match, "rl_global_release_guard trigger DDL not found in init SQL"
+    return match.group(0)
+
+
+# ── 8. 이름을 그대로 쓰는 이유 ────────────────────────────────────────────────────────────
 
 
 async def test_the_previous_init_sql_cannot_bring_the_single_slot_back(engine):

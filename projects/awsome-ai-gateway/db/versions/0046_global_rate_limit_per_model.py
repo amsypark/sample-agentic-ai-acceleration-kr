@@ -74,9 +74,12 @@ EXCLUSIVE 를 잡는다 — 읽고 쓰는 트랜잭션이 있으면 그것이 �
 마이그레이션이 실패하고 아무것도 바뀌지 않으며 Job 이 재시도한다. 잡은 뒤의 DDL 은 작은 테이블이라
 짧다. 이 테이블의 읽기는 gateway-proxy 의 한도 캐시 미스(TTL 300s)와 admin-api 의 rate-limit 화면이다.
 
-init SQL(``02_create_tables.sql``)이 같은 인덱스·함수·트리거를 갖는다. 클라우드 Job 에서는 init SQL 이
-먼저 GLOBAL 인덱스와 트리거를 만들고(옛 인덱스가 아직 있어 단일 슬롯은 유지된다) 이 리비전이 옛 정의를
-바꾼다.
+init SQL(``02_create_tables.sql``)이 같은 인덱스·함수·트리거를 갖는다. 기존 DB 의 클라우드 Job 에서는
+init SQL 이 먼저 GLOBAL 인덱스를 만들고(옛 인덱스가 아직 있어 단일 슬롯은 유지된다) 이 리비전이 옛 정의를
+바꾸고 트리거를 만든다. init SQL 은 트리거를 **새 설치**(alembic_version 없음)와 이미 0046 이후인 DB 에만
+만든다 — 0024 이전 DB 에 먼저 있으면 0024 의 중복 정리가 남긴 지연 이벤트 때문에 0024 의 CREATE INDEX 가
+거부되고, 0046 에 닿기 전에 실패한 업그레이드가 0042~0045 DB 에 트리거만 남기면 이전 admin-api 의 정상적인
+슬롯 교체가 거부된다.
 
 ## 되돌리기(downgrade) — GLOBAL 한도를 말없이 버리지 않는다
 
@@ -99,8 +102,8 @@ init SQL(``02_create_tables.sql``)이 같은 인덱스·함수·트리거를 갖
     (``cannot CREATE INDEX ... because it has pending trigger events`` — 실 PG16).
 
 ⚠️ 다운그레이드한 DB 는 **0046 이 있는 차트의 다음 마이그레이션 Job 이 돌 때까지만** 그 상태다. 그 Job 의
-   init SQL 이 GLOBAL 인덱스와 트리거를 다시 만들고 alembic 이 이 리비전을 다시 적용한다. 되돌릴 대상
-   리비전은 0045 가 아니라 **이전 차트의 alembic head** 다 — 순서와 명령은
+   init SQL 이 GLOBAL 인덱스를 다시 만들고 alembic 이 이 리비전을 다시 적용한다(트리거는 이 리비전이 다시
+   만든다). 되돌릴 대상 리비전은 0045 가 아니라 **이전 차트의 alembic head** 다 — 순서와 명령은
    deployment/docs/eks-fargate/06-upgrade-rollback.md §4.4.
 """
 
@@ -163,7 +166,7 @@ END
 $$
 """
 
-# CONSTRAINT TRIGGER 에는 IF NOT EXISTS 가 없다 — init SQL 이 먼저 만들었을 수 있다.
+# CONSTRAINT TRIGGER 에는 IF NOT EXISTS 가 없다 — 새 설치에서는 init SQL 이 먼저 만들었다.
 CREATE_RELEASE_GUARD_TRIGGER = """
 DO $$
 BEGIN

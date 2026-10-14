@@ -258,8 +258,6 @@ CREATE TABLE IF NOT EXISTS model.rate_limit_configs (
     updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_rate_limit_configs_scope ON model.rate_limit_configs (scope, scope_id) WHERE is_active = true;
-
 -- migration 0046 과 동일(0024 를 대체). 활성 행의 유일성은 두 인덱스로 나뉜다.
 --   USER/TEAM — 주체당 1개. model_alias 는 키에 넣지 않는다: 그 upsert 는 alias 무관하게 주체의
 --               활성 행 전부를 비활성화하므로, alias 를 넣으면 실제 중복 창이 열린다.
@@ -301,12 +299,28 @@ $$;
 --    묶는다(넘으면 이 문장이 실패해 Job 이 실패하고, 그대로 다시 돌릴 수 있다). 파일 전체에는 걸지 않는다
 --    — usage_logs·budget_usages 의 기존 no-op 문장이 바쁜 쓰기 뒤에서 Job 을 떨어뜨린다.
 --    0045 DB 에서는 uq_rate_limit_configs_active 가 옛 정의로 이미 있어 건너뛰고, 0046 이 그 정의를 바꾼다.
---    CONSTRAINT TRIGGER 에는 IF NOT EXISTS 가 없어 pg_trigger 로 본다.
+--
+-- ⚠️ rl_global_release_guard 는 **새 설치**(alembic_version 이 아직 없다)이거나 이미 **0046 이후**인 DB 에만
+--    여기서 만든다. 0046 이전의 기존 DB 는 0046 이 만든다. 이유 둘:
+--      · 0024 이전 DB 에서 트리거가 먼저 있으면 0024 의 중복 정리(GLOBAL 행 비활성화)가 지연 트리거 이벤트를
+--        남기고, 같은 트랜잭션의 0024 CREATE INDEX 가 "pending trigger events" 로 거부된다 — Job 이 0023 에서
+--        멈추고 재시도해도 같다.
+--      · 0046 에 닿기 전에 실패한 업그레이드가 0042~0045 의 단일 슬롯 DB 에 트리거만 남기면, 이전 admin-api 의
+--        정상적인 슬롯 교체(다른 모델로 GLOBAL 을 옮기기)가 거부된다.
+--    판정은 alembic_version 이다 — "0046 이 적용됐는가" 를 직접 묻는다. 인덱스 존재로는 알 수 없다(GLOBAL
+--    인덱스는 이 블록이 0046 이전 DB 에도 만든다). 리비전 id 는 0 으로 채운 4자리 번호라 문자열 비교가 순서와
+--    같다. 그 모양이 아니면 만들지 않는다(그 DB 는 0046 이 만든다). CONSTRAINT TRIGGER 에는 IF NOT EXISTS 가
+--    없어 pg_trigger 로 본다.
 DO $$
 DECLARE
     prev_lock_timeout text := current_setting('lock_timeout');
+    guard_wanted boolean;
 BEGIN
     PERFORM set_config('lock_timeout', '5s', true);
+    IF to_regclass('model.idx_rate_limit_configs_scope') IS NULL THEN
+        CREATE INDEX IF NOT EXISTS idx_rate_limit_configs_scope
+            ON model.rate_limit_configs (scope, scope_id) WHERE is_active = true;
+    END IF;
     IF to_regclass('model.uq_rate_limit_configs_active') IS NULL THEN
         CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_limit_configs_active
             ON model.rate_limit_configs (scope, COALESCE(scope_id, '00000000-0000-0000-0000-000000000000'::uuid))
@@ -317,7 +331,15 @@ BEGIN
             ON model.rate_limit_configs (COALESCE(model_alias, ''))
             WHERE is_active = true AND scope = 'GLOBAL';
     END IF;
-    IF NOT EXISTS (
+    IF to_regclass('public.alembic_version') IS NULL THEN
+        guard_wanted := true;  -- 새 설치: alembic 이 아직 돌지 않았다
+    ELSE
+        -- 동적 SQL — 테이블이 없는 DB 에서 이 문장이 미리 해석되지 않게 한다.
+        EXECUTE 'SELECT EXISTS (SELECT 1 FROM public.alembic_version '
+             || 'WHERE version_num ~ ''^[0-9]{4}$'' AND version_num >= ''0046'')'
+            INTO guard_wanted;
+    END IF;
+    IF guard_wanted AND NOT EXISTS (
         SELECT 1 FROM pg_trigger
          WHERE tgrelid = 'model.rate_limit_configs'::regclass
            AND tgname = 'rl_global_release_guard'

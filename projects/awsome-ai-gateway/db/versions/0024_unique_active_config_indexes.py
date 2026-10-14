@@ -104,12 +104,6 @@ def upgrade() -> None:
             )
 
     op.execute(DEDUPE_BUDGET_CONFIGS)
-    # The dedupe deliberately deactivates duplicate GLOBAL rows. On a DB below this revision the
-    # current db/init (which every migration Job runs before alembic) has already created 0046's
-    # rl_global_release_guard trigger, and that trigger refuses to release a GLOBAL row whose alias
-    # keeps no active row. This is an intended release, so lift the guard for this transaction
-    # only. Without the trigger the setting is inert.
-    op.execute("SET LOCAL rl.allow_global_release = 'on'")
     op.execute(DEDUPE_RATE_LIMIT_CONFIGS)
 
     op.execute(
