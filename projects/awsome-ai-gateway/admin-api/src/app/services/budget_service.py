@@ -166,11 +166,18 @@ class BudgetService:
 
                 # Per-app seed must also refresh the total key (client=None) so
                 # enforcement sees the correct aggregate.
+                # ⚠️ 그 사용자 행 전부를 더하면 안 된다. 총합 행(client NULL)은 앱별 지출을 **이미 포함한다**
+                #    (cost-recorder-worker 가 총합 행과 앱별 행을 둘 다 쓴다). 예전엔 SUM 전부라 총액 → 앱 순서로
+                #    시드하면 앱 지출이 두 번 들어갔고(100 + 30 = 130) 게이트웨이가 개인 예산을 일찍 막았다.
+                #    총합 행이 있으면 그 값(게이트웨이가 키를 잃었을 때 DB 에서 복원하는 값과 같다), 없으면 시드된
+                #    앱별 행의 합이다.
                 if client is not None and scope == "USER":
                     from sqlalchemy import text as sa_text
                     total_row = await session.execute(
                         sa_text(
-                            "SELECT COALESCE(SUM(used_usd), 0) "
+                            "SELECT COALESCE("
+                            "MAX(used_usd) FILTER (WHERE client IS NULL), "
+                            "SUM(used_usd) FILTER (WHERE client IS NOT NULL), 0) "
                             "FROM budget.budget_usages "
                             "WHERE scope = 'USER' AND scope_id = :sid AND period = :period"
                         ),
