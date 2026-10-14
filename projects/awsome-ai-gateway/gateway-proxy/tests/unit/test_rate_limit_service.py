@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -521,7 +522,14 @@ async def test_check_multi_scope_tpm_tpm_exceeded(mock_redis):
 
 @pytest.mark.asyncio
 async def test_settle_tpm_refund(mock_redis):
-    """예약 > 실제 사용 → 차액만큼 환불 (음수 INCRBY). 파이프라인으로 묶어 실행."""
+    """예약 > 실제 사용 → 예약한 스코프마다 rate_limit_tpm_settle EVAL 한 번(차액, 예약 버킷).
+
+    파이프라인 1회. 키를 직접 만들 수 있는 INCRBY 는 쓰지 않는다.
+    """
+    from app.services.lua_loader import LuaScriptLoader
+    from app.services.rate_limit_scope import build_tpm_key_group
+
+    LuaScriptLoader._scripts["rate_limit_tpm_settle"] = "-- mock"
     descriptors = build_scope_descriptors(
         user_id="u1",
         team_id="t1",
@@ -534,16 +542,65 @@ async def test_settle_tpm_refund(mock_redis):
         global_tpm=1000000,
     )
 
+    keys = tuple(
+        (*build_tpm_key_group(d.scope, d.scope_id, d.model_alias), 29_000_000)
+        for d in descriptors
+    )
     svc = RateLimitService()
     await svc.settle_tpm(
-        mock_redis, descriptors, reserved_tokens=5000, actual_tokens=3500
+        mock_redis, descriptors, reserved_tokens=5000, actual_tokens=3500, reserved_keys=keys
     )
-    # 3 스코프 × 환불 (-1500) — 파이프라인에 적재 후 1회 execute.
     pipe = mock_redis.pipeline.return_value
-    assert pipe.incrby.call_count == 3
-    for call in pipe.incrby.call_args_list:
-        assert call.args[1] == -1500
+    assert pipe.incrby.call_count == 0
+    assert [c.args[2:] for c in pipe.eval.call_args_list] == [
+        (cur, prev, win, "-1500", "29000000", "180") for cur, prev, win, _b in keys
+    ]
     pipe.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_settle_tpm_without_reserved_keys_writes_nothing(mock_redis):
+    """예약 키가 없는(옛 모양의) 정산 상태 → Redis 에 아무것도 보내지 않는다."""
+    descriptors = build_scope_descriptors(
+        user_id="u1", team_id="t1", model_alias="m1",
+        user_rpm=None, user_tpm=10000, team_rpm=None, team_tpm=100000,
+        global_rpm=None, global_tpm=1000000,
+    )
+    for keys in (None, ()):
+        await RateLimitService().settle_tpm(
+            mock_redis, descriptors, reserved_tokens=5000, actual_tokens=0, reserved_keys=keys
+        )
+    mock_redis.pipeline.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_check_multi_scope_tpm_records_the_reserved_scopes_and_bucket(
+    mock_redis, monkeypatch
+):
+    """통과한 스코프만 (cur, prev, window, 버킷)으로 기록한다. eval 이 실패해 fail-open 한
+    스코프는 빠진다. 버킷 = 예약 시각 // 60(Lua 의 current_bucket 과 같은 값)."""
+    from app.services import rate_limit_service as rls
+    from app.services.lua_loader import LuaScriptLoader
+    from app.services.rate_limit_scope import build_tpm_key_group
+
+    LuaScriptLoader._scripts["rate_limit_tpm_check"] = "-- mock"
+    monkeypatch.setattr(rls, "time", SimpleNamespace(time=lambda: 1_740_000_059.9))
+    ok = json.dumps({"allowed": True, "limit": -1, "remaining": -1}).encode()
+    mock_redis.eval = AsyncMock(side_effect=[ok, ConnectionError("shard down"), ok])
+    descriptors = build_scope_descriptors(
+        user_id="u1", team_id="t1", model_alias="m1",
+        user_rpm=None, user_tpm=10000, team_rpm=None, team_tpm=100000,
+        global_rpm=None, global_tpm=1000000,
+    )
+    result = await RateLimitService().check_multi_scope_tpm(
+        mock_redis, descriptors, reserved_tokens=500
+    )
+    assert result.allowed
+    bucket = 1_740_000_059 // 60
+    assert result.reserved_keys == (
+        (*build_tpm_key_group(RateLimitScope.USER, "u1", "m1"), bucket),
+        (*build_tpm_key_group(RateLimitScope.GLOBAL, None, "m1"), bucket),
+    )
 
 
 @pytest.mark.asyncio

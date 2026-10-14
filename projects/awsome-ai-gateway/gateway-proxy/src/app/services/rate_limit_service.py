@@ -21,6 +21,9 @@ from app.services.rate_limit_scope import (
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_WINDOW_MS = 60_000
+#: TPM 키의 TTL — rate_limit_tpm_check.lua 의 ``window_sec * 2 + 60`` (enforce 가 쓰는 60초 창).
+#: 정산이 이 수정 이전 코드가 TTL 없이 남긴 키를 만났을 때만 쓴다.
+_TPM_KEY_TTL = 60 * 2 + 60
 
 # 관측성 hook(deepdive Q50 Phase 3) — rate-limit eval 이 예외로 fail-open(집행 못함)
 # 한 횟수를 셀 카운터. main.py lifespan 에서 set_fail_open_metric(metrics.rl_fail_open_total)
@@ -221,14 +224,21 @@ class RateLimitService:
 
         `reserved_tokens`는 `estimate_reserved_tokens()`로 사전 계산 (input +
         cache_creation 추정 + max_output). 응답 완료 후 `settle_tpm()`으로 차액 조정.
+
+        통과 결과의 ``reserved_keys`` 는 **실제로 예약한** 스코프마다 (cur, prev, window 키,
+        예약한 버킷 번호)다. eval 이 실패해 fail-open 한 스코프는 들어가지 않는다. 정산은 이것만,
+        그 버킷에서만 조정한다(:meth:`settle_tpm`).
         """
         effective = [d for d in descriptors if d.tpm_limit and d.tpm_limit > 0]
         if not effective or reserved_tokens <= 0:
             return RateLimitResult(allowed=True, remaining=-1, limit=-1)
 
         now_sec = int(time.time())
+        # rate_limit_tpm_check.lua 의 current_bucket = floor(now / window_sec) 와 같은 값.
+        bucket = now_sec // window_sec
         script = LuaScriptLoader.get("rate_limit_tpm_check")
 
+        reserved: list[tuple[str, str, str, int]] = []
         last: dict | None = None
         for d in effective:
             cur, prev, win = build_tpm_key_group(d.scope, d.scope_id, d.model_alias)
@@ -261,6 +271,8 @@ class RateLimitService:
                     scope=result.get("scope"),
                     limit_type=result.get("limit_type"),
                 )
+            # 통과 — 이 scope 의 eval 이 cur 에 reserved_tokens 를 INCRBY 했다(그 버킷에).
+            reserved.append((cur, prev, win, bucket))
             last = result
 
         if last is not None:
@@ -269,6 +281,7 @@ class RateLimitService:
                 remaining=last.get("remaining", -1),
                 limit=last.get("limit", -1),
                 window_reset=last.get("window_reset") or 0,
+                reserved_keys=tuple(reserved),
             )
         return RateLimitResult(allowed=True, remaining=-1, limit=-1)
 
@@ -278,36 +291,63 @@ class RateLimitService:
         descriptors: list[ScopeDescriptor],
         reserved_tokens: int,
         actual_tokens: int,
+        reserved_keys: tuple[tuple[str, str, str, int], ...] | None = None,
     ) -> None:
-        """TPM 사후 정산 — 실제 토큰과 예약분 차이 조정 (설계 §D2).
+        """TPM 사후 정산 — 실제 토큰과 예약분의 차액을 **예약한 버킷에만** 반영한다 (설계 §D2).
 
-        차액이 음수면 환불 (예약 > 실제), 양수면 추가 차감 (예약 < 실제).
-        adjustment == 0 이면 Redis 호출 생략.
-        실패 시 경고만 남기고 무시 — rate limit 의 정확도는 다음 윈도우에서 자연 보정됨.
+        ``reserved_keys`` = :meth:`check_multi_scope_tpm` 이 돌려준 ``reserved_keys``(스코프마다
+        cur·prev·window 키와 예약한 버킷 번호). 스코프마다 EVAL 한 번(rate_limit_tpm_settle.lua,
+        같은 hash tag 의 세 키 — 다른 스코프와 한 EVAL 에 섞으면 Redis Cluster CROSSSLOT 이다).
+
+        ⚠️ 예전 구현은 TPM 한도가 있는 스코프마다 지금의 cur 를 INCRBY 했다. 그래서 (1) 그 사이
+           버킷이 회전했으면 **다른 분의** 카운터에서 환불해 음수로 만들었고 예약한 분(이제 prev)은
+           그대로 남았으며, (2) cur 키가 만료된 뒤(스트림이 180초 TTL 을 넘긴 경우)에는 TTL 없는
+           음수 키를 새로 만들었고(실측 −3800, TTL −1), (3) eval 이 실패해 예약하지 않은 스코프도
+           조정했다.
+
+        ``descriptors`` 는 하위 호환으로 받기만 한다(조정할 키는 ``reserved_keys`` 뿐이다).
+        ``reserved_keys`` 가 None(이 필드 이전 모양의 정산 상태)이면 아무것도 쓰지 않는다 —
+        settle_cost 와 같은 이유다. 실패는 경고만 남긴다.
         """
         adjustment = int(actual_tokens) - int(reserved_tokens)
         if adjustment == 0:
             return
-
-        effective = [d for d in descriptors if d.tpm_limit and d.tpm_limit > 0]
-        if not effective:
+        if reserved_keys is None:
+            logger.warning("tpm_settle_skipped_no_reserved_keys", adjustment=adjustment)
             return
+        await self._settle_tpm_keys(redis, reserved_keys, adjustment)
 
-        # 파이프라이닝(deepdive Q50): N 스코프 incrby 를 순차 await(왕복 N) 대신 한
-        # 파이프라인으로 묶어 응답완료 경로 지연을 줄인다. 비트랜잭션 파이프라인은
-        # cluster 모드에서 키별로 노드 라우팅되므로 서로 다른 슬롯이어도 안전.
+    async def _settle_tpm_keys(
+        self, redis, reserved_keys: tuple[tuple[str, str, str, int], ...], adjustment: int
+    ) -> None:
+        if not reserved_keys:
+            return
+        script = LuaScriptLoader.get("rate_limit_tpm_settle")
+        # 파이프라이닝(deepdive Q50): 스코프별 EVAL 을 순차 await 대신 한 파이프라인으로.
+        # 비트랜잭션 파이프라인은 cluster 에서 명령마다 그 키의 노드로 라우팅된다.
         try:
             pipe = redis.pipeline(transaction=False)
-            for d in effective:
-                cur, _prev, _win = build_tpm_key_group(d.scope, d.scope_id, d.model_alias)
-                pipe.incrby(cur, adjustment)
-            await pipe.execute()
+            for cur, prev, win, bucket in reserved_keys:
+                pipe.eval(
+                    script, 3, cur, prev, win, str(adjustment), str(bucket), str(_TPM_KEY_TTL)
+                )
+            results = await pipe.execute(raise_on_error=False)
         except Exception:
-            logger.warning(
-                "tpm_settle_failed",
-                adjustment=adjustment,
-                scopes=[d.scope.value for d in effective],
-            )
+            logger.warning("tpm_settle_failed", adjustment=adjustment)
+            return
+        for (cur, _prev, _win, bucket), res in zip(reserved_keys, results):
+            if isinstance(res, Exception):
+                logger.warning(
+                    "tpm_settle_failed",
+                    key=cur,
+                    adjustment=adjustment,
+                    error=type(res).__name__,
+                )
+            elif res == 0:
+                # 예약한 버킷이 이미 회전해 나갔거나 만료됐다 — 아무것도 쓰지 않았다(스크립트 참조).
+                logger.debug(
+                    "tpm_settle_bucket_gone", key=cur, bucket=bucket, adjustment=adjustment
+                )
 
     async def check_rpm(
         self,

@@ -200,6 +200,7 @@ class CostRecorder:
                         rate_limit_state.get("tpm_descriptors", []),
                         rate_limit_state.get("tpm_reserved", 0),
                         0,  # actual=0 → 전액 환불
+                        reserved_keys=rate_limit_state.get("tpm_reserved_keys"),
                     )
                 except Exception:
                     logger.warning(
@@ -366,7 +367,11 @@ class CostRecorder:
 
                 actual_tpm = compute_tpm_incr(usage)
                 await RateLimitService().settle_tpm(
-                    redis, tpm_descriptors, tpm_reserved, actual_tpm
+                    redis,
+                    tpm_descriptors,
+                    tpm_reserved,
+                    actual_tpm,
+                    reserved_keys=rate_limit_state.get("tpm_reserved_keys"),
                 )
             except Exception:
                 logger.warning("tpm_settle_failed", user_id=auth_context.user_id)

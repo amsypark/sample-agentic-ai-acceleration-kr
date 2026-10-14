@@ -53,6 +53,12 @@ for i = 1, num_scopes do
             end
             redis.call('SET', cur_key, 0)
             redis.call('SET', win_key, current_bucket)
+            -- ⚠️ SET 은 TTL 을 지운다. 세 키 모두 여기서 다시 건다 — 예전에는 아래 Phase 2 에서 cur 와
+            --    window 만, 그것도 통과할 때만 걸어서 prev 는 처음 만들어질 때부터 TTL 이 없었고, 회전
+            --    직후 거부되면 세 키가 모두 TTL 없이 남았다(volatile-lru 가 축출하지 못한다).
+            redis.call('EXPIRE', cur_key, ttl_sec)
+            redis.call('EXPIRE', prev_key, ttl_sec)
+            redis.call('EXPIRE', win_key, ttl_sec)
         end
 
         local cur_tokens  = tonumber(redis.call('GET', cur_key) or '0')

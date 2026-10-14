@@ -221,6 +221,7 @@ class TestFallsBackOn502ThenSucceeds:
         settle_cost_calls = []
 
         reserved_keys = (("rl:cost:user:{u}:cpm:60", "rl:cost:user:{u}:cph:0"),)
+        tpm_keys = (("{USER:u:m}:tpm:cur", "{USER:u:m}:tpm:prev", "{USER:u:m}:tpm:window", 1),)
 
         async def _fake_enforce(*, redis, auth_context, model_config, body, state, request_id, budget_status):
             state["rate_limit_state"] = {
@@ -228,11 +229,19 @@ class TestFallsBackOn502ThenSucceeds:
                 "tpm_reserved": 500,
                 "cost_reserved": Decimal("0.01"),
                 "cost_reserved_keys": reserved_keys,
+                "tpm_reserved_keys": tpm_keys,
             }
             return None
 
-        async def _fake_settle_tpm(redis, descriptors, reserved, actual):
-            settle_tpm_calls.append({"descriptors": descriptors, "reserved": reserved, "actual": actual})
+        async def _fake_settle_tpm(redis, descriptors, reserved, actual, reserved_keys=None):
+            settle_tpm_calls.append(
+                {
+                    "descriptors": descriptors,
+                    "reserved": reserved,
+                    "actual": actual,
+                    "keys": reserved_keys,
+                }
+            )
 
         async def _fake_settle_cost(
             redis, *, user_id, actual_cost, reserved_cost, team_id, reserved_keys=None
@@ -276,6 +285,7 @@ class TestFallsBackOn502ThenSucceeds:
         assert len(settle_tpm_calls) >= 1
         assert settle_tpm_calls[0]["actual"] == 0
         assert settle_tpm_calls[0]["reserved"] == 500
+        assert settle_tpm_calls[0]["keys"] == tpm_keys  # 예약한 버킷만 되돌린다
 
         # settle_cost called once for the failed original (actual_cost=0)
         assert len(settle_cost_calls) >= 1

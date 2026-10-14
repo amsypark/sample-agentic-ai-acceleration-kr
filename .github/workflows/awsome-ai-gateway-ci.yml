@@ -341,12 +341,13 @@ jobs:
             tests/regression/test_critical_stream_disconnect_ledger_gap.py \
             tests/regression/test_high_alias_account_real_db.py \
             tests/regression/test_medium_websearch_nonstream_reservation_release.py \
-            tests/regression/test_medium_cost_settle_reserved_scope.py > /tmp/proof3.txt 2>&1
+            tests/regression/test_medium_cost_settle_reserved_scope.py \
+            tests/regression/test_medium_tpm_settle_reserved_bucket.py > /tmp/proof3.txt 2>&1
           status=$?
           tail -30 /tmp/proof3.txt
           if [ "$status" -ne 0 ]; then exit "$status"; fi
           passed=$(grep -oE "[0-9]+ passed" /tmp/proof3.txt | tail -1 | grep -oE "[0-9]+" || echo 0)
-          # 로컬 실측 기준선: 128 passed (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
+          # 로컬 실측 기준선: 139 passed (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
           #   + long-context 티어 27: calculate_cost/tier/감사 16 + 웹서치 턴별 티어 9
           #     + 실 PG 마이그레이션 2
           #   + 스트림 끊김 원장 공백 10: 실 uvicorn 8 + 실 Redis 대사 2
@@ -357,18 +358,21 @@ jobs:
           #   + 비용 정산 스코프·창 11: 한도 구성 3(user/team/둘 다) + 한도 없음 1 + 분·시 경계를
           #     넘긴 정산 1 + 만료된 cpm 키 1 + zero-usage 환불 2 + 추가 청구 1 + release 1
           #     + 옛 모양의 정산 상태 1. 같은 시나리오의 클러스터 변형 12 는 REDIS_CLUSTER_URL 이
-          #     없어 skip 된다(로컬 3 primary + 3 replica 클러스터로 따로 증명).
+          #     없어 skip 된다(로컬 3 primary + 3 replica 클러스터로 따로 증명)
+          #   + TPM 정산 버킷 11: 같은 버킷 3(부분·zero-usage·추가 청구) + 한 번 회전 1 + 두 번
+          #     회전 1 + 키 만료 1 + 회전 직후 거부의 TTL 1 + release 1 + 옛 모양의 상태 1
+          #     + fail-open 스코프 1 + 옛 정산이 남긴 음수 1. 클러스터 변형 11 은 skip.
           #   예약 해제 14 중 4건(비-2xx 스트림 이중 환불: 메커니즘 1 + 라우터 2 + /v1/messages 1)이
           #   실 Redis 를 요구한다.
           # ⚠️ 예약 해제 파일은 REDIS_PROOF_URL 을 요구한다 — 환불은 incrbyfloat 로
           #    카운터를 움직이는 것이라, 가짜 Redis 로는 부호가 반대인 환불도 통과한다.
           #    원장 공백 파일의 대사 2건도 REDIS_PROOF_URL 이 없으면 skip 된다 — "카운터는 맞고
           #    원장만 짧다" 는 같은 실 Redis 에서 차감과 XADD 를 대사해야만 드러난다.
-          #    웹서치 예약 정산 20건과 비용 정산 스코프·창 11건도 전부 REDIS_PROOF_URL 이 없으면
-          #    skip 된다.
+          #    웹서치 예약 정산 20건, 비용 정산 스코프·창 11건, TPM 정산 버킷 11건도 전부
+          #    REDIS_PROOF_URL 이 없으면 skip 된다.
           #    두 env 중 하나라도 안 걸리면 통과 수가 떨어져 여기서 실패한다.
-          if [ "${passed:-0}" -lt 128 ]; then
-            echo "::error::통과 ${passed} 건(기대 128) — PROOF_DSN/REDIS_PROOF_URL 이 안 걸려 skip 됐다."
+          if [ "${passed:-0}" -lt 139 ]; then
+            echo "::error::통과 ${passed} 건(기대 139) — PROOF_DSN/REDIS_PROOF_URL 이 안 걸려 skip 됐다."
             exit 1
           fi
 

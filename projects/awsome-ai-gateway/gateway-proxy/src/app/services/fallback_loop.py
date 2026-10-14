@@ -229,7 +229,13 @@ async def release_reservations(
     tpm_reserved = rls.get("tpm_reserved", 0)
     if tpm_descriptors and tpm_reserved > 0:
         try:
-            await svc.settle_tpm(redis, tpm_descriptors, tpm_reserved, 0)
+            await svc.settle_tpm(
+                redis,
+                tpm_descriptors,
+                tpm_reserved,
+                0,
+                reserved_keys=rls.get("tpm_reserved_keys"),
+            )
         except Exception:
             logger.warning("fallback_unwind_tpm_failed")
 
@@ -251,6 +257,7 @@ async def release_reservations(
     # (docstring 참조: 미리 잡아 둔 사본이 있으면 pop 만으로는 그 사본이 예약을 계속 들고 있다.)
     rls["tpm_descriptors"] = []
     rls["tpm_reserved"] = 0
+    rls["tpm_reserved_keys"] = ()
     rls["cost_reserved"] = Decimal("0")
     rls["cost_reserved_keys"] = ()
     state.pop("rate_limit_state", None)
