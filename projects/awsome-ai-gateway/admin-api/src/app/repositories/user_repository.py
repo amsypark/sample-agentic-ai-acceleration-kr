@@ -169,6 +169,14 @@ class UserRepository:
         result = await self._session.execute(stmt)
         return list(result.scalars().unique().all())
 
+    async def team_member_ids(self, team_id: uuid.UUID, user_ids: list[uuid.UUID]) -> set[uuid.UUID]:
+        """``user_ids`` 중 **지금** ``team_id`` 소속인 사용자 id 집합(그 밖의 id 는 빠진다)."""
+        if not user_ids:
+            return set()
+        stmt = select(User.id).where(User.id.in_(user_ids), User.team_id == team_id)
+        result = await self._session.execute(stmt)
+        return set(result.scalars().all())
+
     async def list_teamless_users(self) -> list[User]:
         """팀이 없는 사용자(``auth.users.team_id IS NULL``) — 활성/비활성 모두, 이름순.
 

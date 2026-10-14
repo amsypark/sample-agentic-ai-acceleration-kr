@@ -129,7 +129,8 @@ class TestSetUserBudget:
 
 
 def _members(session: AsyncMock, *user_ids: str) -> None:
-    """allocate 의 팀 멤버십 조회가 이 사용자들을 **그 팀의 멤버**로 돌려주게 한다."""
+    """allocate 의 팀 멤버십 조회(UserRepository.team_member_ids)가 이 사용자들을 그 팀의 멤버로
+    돌려주게 한다 — 실제 SELECT 는 이 리포지토리 메서드가 한다(실 PG 증명은 console 계약 파일)."""
     result = MagicMock()
     result.scalars.return_value.all.return_value = [uuid.UUID(u) for u in user_ids]
     session.execute = AsyncMock(return_value=result)

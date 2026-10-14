@@ -588,17 +588,7 @@ class BudgetService:
                 user_ids.append(uuid.UUID(alloc.user_id))
             except ValueError:
                 raise ValidationError(f"Invalid user_id: {alloc.user_id!r}") from None
-        from sqlalchemy import select
-
-        from app.models.auth import User
-
-        members = set(
-            (
-                await session.execute(
-                    select(User.id).where(User.id.in_(user_ids), User.team_id == team_id)
-                )
-            ).scalars().all()
-        )
+        members = await UserRepository(session).team_member_ids(team_id, user_ids)
         outsiders = sorted(str(u) for u in user_ids if u not in members)
         if outsiders:
             message = f"Users are not members of team {team_id}: {', '.join(outsiders)}"
