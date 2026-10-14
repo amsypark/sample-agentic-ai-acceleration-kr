@@ -255,6 +255,8 @@ async def test_the_memory_is_per_role_and_external_id(path, monkeypatch):
     assert await p.request() == "fallback"  # 실패한 키 자신은 기억 안이다
     assert await p.request(ext="other-ext") == "account"
     assert await p.request(role=OTHER_ROLE) == "account"
+    # 같은 역할의 다른 ExternalId 가 방금 받은 자격증명을 실패한 키에 내주지도 않는다(캐시도 키별).
+    assert await p.request() == "fallback"
     assert [(c[1], c[2]) for c in sts.calls] == [
         (ROLE, EXT),
         (ROLE, "other-ext"),

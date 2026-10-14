@@ -79,7 +79,11 @@ class SigV4Signer:
         self._sts = sts_client
         self._service = service_name
         self._now = now
-        self._creds: dict[str, _CachedCreds] = {}
+        # 프로필 역할의 자격증명 — 키 (역할, ExternalId, gw-bedrock-openai). alias 경로(공유
+        # provider)와 같은 키다. 역할만으로 키를 잡으면 같은 역할을 다른 ExternalId 로 지목한
+        # 프로필이 앞 프로필의 ExternalId 로 assume 한 자격증명을 캐시 적중으로 받는다 —
+        # confused-deputy 검사(신뢰 정책의 ExternalId 조건)가 매 적중마다 건너뛰어진다.
+        self._creds: dict[tuple[str, str, str], _CachedCreds] = {}
         self._lock = asyncio.Lock()
         # 프로필 경로의 짧은 AssumeRole 실패 기억 — 키 (역할, ExternalId, gw-bedrock-openai).
         self._profile_failures = ProfileFailureMemory(now)
@@ -152,14 +156,14 @@ class SigV4Signer:
         # 재시도가 진행 중이면 STS 를 기다리지 않고 실패한다 — 어댑터가 오늘처럼 502 로 답한다
         # (ProfileFailureMemory).
         key = (role_arn, external_id or "", SESSION_NAME_RUNTIME)
-        cached = self._creds.get(role_arn)
+        cached = self._creds.get(key)
         if cached and cached.expires_at - _CRED_REFRESH_SKEW > self._now():
             return cached.creds
         if self._profile_failures.blocked(key):
             raise ProfileAssumeBackoff(role_arn)
         async with self._lock:
             now = self._now()
-            cached = self._creds.get(role_arn)
+            cached = self._creds.get(key)
             if cached and cached.expires_at - _CRED_REFRESH_SKEW > now:
                 return cached.creds
             if self._sts is None:
@@ -173,7 +177,7 @@ class SigV4Signer:
                 creds, expires_at = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: self._assume(role_arn, external_id)
                 )
-            self._creds[role_arn] = _CachedCreds(creds=creds, expires_at=expires_at)
+            self._creds[key] = _CachedCreds(creds=creds, expires_at=expires_at)
             logger.info("sigv4_xacct_creds_assumed", role_arn=role_arn)
             return creds
 
