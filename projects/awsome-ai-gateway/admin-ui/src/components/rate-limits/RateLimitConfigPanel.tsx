@@ -97,6 +97,8 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
   // GLOBAL 도 폴링한다: proxy 는 GLOBAL 스코프에도 카운터를 쌓고(키의 scope_id 자리는 리터럴
   // '*', 모델은 model_alias 자리) GLOBAL 노드 id 가 곧 model alias 다.
   // 노드 객체가 아니라 (scope, id) 에 건다 — 트리를 새로 받을 때마다 즉시 다시 부르고 주기를 처음부터 시작했다.
+  // 다만 이 노드의 자기 RPM 저장값과 상속 여부가 바뀌면 바로 다시 부른다 — 게이지 분모(limit_rpm)와 measured 는 그
+  // 값에서 나온다. 저장 뒤 다음 주기(최대 10초)까지 기다리면 입력칸은 999 인데 게이지는 옛 "/ 60" 을 보였다.
   const nodeScope = node?.scope ?? null;
   useEffect(() => {
     if (nodeScope == null || nodeId == null) {
@@ -111,7 +113,7 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
     load();
     const t = setInterval(load, 10_000);
     return () => { alive = false; clearInterval(t); };
-  }, [nodeScope, nodeId]);
+  }, [nodeScope, nodeId, inheritedFrom, ownRpm]);
 
   if (!node) {
     return (

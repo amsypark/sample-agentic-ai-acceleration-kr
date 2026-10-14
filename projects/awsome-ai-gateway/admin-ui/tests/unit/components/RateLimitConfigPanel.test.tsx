@@ -397,6 +397,24 @@ describe('트리를 새로 받아도(revalidatePath) 운영자의 입력과 에�
     await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenLastCalledWith('USER', ownUserNode.id));
   });
 
+  it('저장으로 이 노드의 RPM 이 바뀌면 사용량을 바로 다시 불러 게이지 분모가 새 한도를 따른다', async () => {
+    // 폴링이 (scope, id) 에만 걸려 있던 동안, 저장 뒤 입력칸은 999 인데 게이지는 다음 주기(최대 10초)까지 서버의
+    // 옛 limit_rpm 으로 "/ 60" 을 보였다.
+    fetchRateLimitUsage.mockResolvedValue(usage({ measured: true, limit_rpm: 60, rpm_used_total: 12 }));
+    const { rerender } = render(<RateLimitConfigPanel node={ownUserNode} />);
+    await waitFor(() => expect(screen.getByText(/\/ 60/)).toBeInTheDocument());
+
+    fetchRateLimitUsage.mockResolvedValue(usage({ measured: true, limit_rpm: 999, rpm_used_total: 12 }));
+    const saved = fresh(ownUserNode.id);
+    saved.config = { ...saved.config!, rpm: 999 };
+    rerender(<RateLimitConfigPanel node={saved} />);
+
+    expect(rpmInput()).toHaveValue(999);
+    await waitFor(() => expect(screen.getByText(/\/ 999/)).toBeInTheDocument());
+    expect(screen.queryByText(/\/ 60/)).toBeNull();
+    expect(fetchRateLimitUsage).toHaveBeenCalledTimes(2);
+  });
+
   it('같은 노드를 새로 받은 트리로 다시 그려도 사용량 폴링을 처음부터 다시 시작하지 않는다', async () => {
     const { rerender } = render(<RateLimitConfigPanel node={ownUserNode} />);
     await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalledTimes(1));
