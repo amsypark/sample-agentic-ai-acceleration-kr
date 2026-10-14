@@ -50,6 +50,11 @@ describe('setRateLimitAction', () => {
     });
   });
 
+  it("'/' 가 든 alias 는 %2F 로 보낸다 — admin-api 는 `{model_alias:path}` 로 받는다", async () => {
+    await setRateLimitAction({ target_id: 'us.anthropic/claude-x', scope: 'GLOBAL', rpm: 1 });
+    expect(putMock.mock.calls[0][0]).toBe('/admin/rate-limits/global/us.anthropic%2Fclaude-x');
+  });
+
   it('GLOBAL 슬롯 해제 동의를 release_alias 쿼리로 보낸다 (alias 는 인코딩)', async () => {
     await setRateLimitAction({
       target_id: 'claude-opus-4-7',

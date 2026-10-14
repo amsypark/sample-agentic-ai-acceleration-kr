@@ -135,3 +135,15 @@ async def test_colon_in_alias_survives_key_parsing(redis_client):
 
     out = await _service(redis_client).get_live_usage("USER", uid)
     assert out["by_model"] == [{"model_alias": alias, "rpm_used": 2}]
+
+
+async def test_slash_alias_usage_is_found(redis_client):
+    """'/' 가 든 alias(provider 접두 형식) — 라우트는 이제 `{scope_id:path}` 로 받는다. 키 빌더·SCAN 패턴·
+    파싱이 '/' 를 그대로 다루는지 실 Redis 로 본다('/' 는 glob 메타문자가 아니다)."""
+    proxy = _proxy()
+    alias = f"us.anthropic/claude-proof-{uuid.uuid4().hex[:8]}"
+    await _zset(redis_client, proxy.build_rl_key(proxy.RateLimitScope.GLOBAL, None, alias, "rpm"), 5)
+
+    out = await _service(redis_client).get_live_usage("GLOBAL", alias)
+    assert out["rpm_used_total"] == 5
+    assert out["by_model"] == [{"model_alias": alias, "rpm_used": 5}]

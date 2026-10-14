@@ -33,7 +33,9 @@ async def get_rate_limit_tree(
     return await svc.get_rate_limit_tree(session)
 
 
-@router.get("/usage/{scope}/{scope_id}")
+# ⚠️ `:path` — GLOBAL 의 scope_id 는 model alias 이고 alias 에는 '/' 가 들어갈 수 있다(제약 없음,
+#    VARCHAR(128)). ASGI 는 '%2F' 를 디코딩한 뒤 라우팅하므로 기본 변환기(`[^/]+`)로는 404 였다.
+@router.get("/usage/{scope}/{scope_id:path}")
 async def get_rate_limit_usage(
     request: Request,
     scope: str,
@@ -129,7 +131,7 @@ async def set_team_rate_limit(
     return result
 
 
-@router.put("/global/{model_alias}", response_model=RateLimitResponse)
+@router.put("/global/{model_alias:path}", response_model=RateLimitResponse)  # '/' 든 alias(usage 주석)
 async def set_global_rate_limit(
     request: Request,
     model_alias: str,

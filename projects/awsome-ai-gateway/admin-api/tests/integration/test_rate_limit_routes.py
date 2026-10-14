@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import quote
 
 import pytest
 from fastapi import Request
 from httpx import AsyncClient
 
 from app.core.db import SESSION_STATE_ATTR, get_db_session
+from app.schemas.rate_limits import RateLimitResponse
 
 USER_ID = uuid.UUID("33333333-3333-4333-8333-333333333333")
 
@@ -183,3 +185,50 @@ async def test_global_save_that_would_release_another_model_is_409(
     resp, upsert = await _put_global(client, admin_headers, holder, "?release_alias=claude-sonnet-4-6")
     assert resp.status_code == 200, resp.text  # 대조군 — 주인을 명시하면 저장된다
     upsert.assert_awaited_once()
+
+
+# ── alias 에 URL 메타문자('/', '[', ']') ──────────────────────────────────────
+#
+# GLOBAL 의 target 은 model alias 다. alias 에는 제약이 없고(VARCHAR(128)) 이 레포에는 `[1m]` alias 가
+# 실제로 있으며, provider 접두 형식(`us.anthropic/...`)은 '/' 를 담는다. admin-ui 는 encodeURIComponent 로
+# '%2F' 를 보내지만 ASGI 는 경로를 디코딩한 뒤 라우팅하므로, 기본 `{model_alias}`(= `[^/]+`)는 '/' 가 든
+# alias 에 **404** 였다 — 그 모델의 GLOBAL 한도는 콘솔·API 어디서도 설정할 수 없었다.
+
+ODD_ALIASES = ["us.anthropic/claude-x", "claude-sonnet-4-6[1m]", "a%b"]
+
+
+@pytest.mark.parametrize("alias", ODD_ALIASES)
+async def test_global_put_reaches_aliases_with_url_metacharacters(
+    client: AsyncClient, admin_headers: dict, test_app, alias
+):
+    seen: dict = {}
+
+    async def fake_set(session, *, model_alias, **_kw):
+        seen["alias"] = model_alias
+        return RateLimitResponse(
+            scope="GLOBAL", scope_id=None, model_alias=model_alias, rpm_limit=5, tpm_limit=None,
+            cpm_limit_usd=None, cph_limit_usd=None, is_active=True,
+        )
+
+    svc = test_app.state.rate_limit_service
+    with patch.object(svc, "set_global_rate_limit", fake_set), patch.object(
+        svc, "invalidate_after_commit", AsyncMock()
+    ):
+        resp = await client.put(
+            f"/admin/rate-limits/global/{quote(alias, safe='')}", json={"rpm": 5}, headers=admin_headers
+        )
+    assert resp.status_code == 200, resp.text
+    assert seen["alias"] == alias
+
+
+@pytest.mark.parametrize("alias", ODD_ALIASES)
+async def test_global_usage_reaches_aliases_with_url_metacharacters(
+    client: AsyncClient, admin_headers: dict, test_app, alias
+):
+    svc = test_app.state.rate_limit_service
+    with patch.object(svc, "get_live_usage", AsyncMock(return_value={"available": False})) as usage:
+        resp = await client.get(
+            f"/admin/rate-limits/usage/GLOBAL/{quote(alias, safe='')}", headers=admin_headers
+        )
+    assert resp.status_code == 200, resp.text
+    assert usage.await_args.args[:2] == ("GLOBAL", alias)
