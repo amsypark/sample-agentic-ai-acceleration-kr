@@ -1,0 +1,226 @@
+{
+  "_about": "GET /admin/my/budget responses. 'main' = what admin-api at main (e7a1588) sent, produced by that route's own code (and cross-checked on real PostgreSQL rows); fixed record, main's code is not on this branch. 'head' = this branch's route; admin-api tests/unit/test_my_budget_wire_fixture.py asserts an exact match. Do not edit by hand.",
+  "main": {
+    "no_budget": {
+      "user_id": "44444444-4444-4444-8444-000000000001",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0,
+        "used_usd": 12.34,
+        "remaining_usd": -12.34,
+        "usage_pct": 0,
+        "policy": "HARD_BLOCK"
+      }
+    },
+    "zero_hard_block": {
+      "user_id": "44444444-4444-4444-8444-000000000002",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0.0,
+        "used_usd": 1.0,
+        "remaining_usd": -1.0,
+        "usage_pct": 0,
+        "policy": "HARD_BLOCK"
+      }
+    },
+    "zero_throttle": {
+      "user_id": "44444444-4444-4444-8444-000000000003",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0.0,
+        "used_usd": 0.0,
+        "remaining_usd": 0.0,
+        "usage_pct": 0,
+        "policy": "THROTTLE"
+      }
+    },
+    "zero_soft_warning": {
+      "user_id": "44444444-4444-4444-8444-000000000004",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0.0,
+        "used_usd": 0.0,
+        "remaining_usd": 0.0,
+        "usage_pct": 0,
+        "policy": "SOFT_WARNING"
+      }
+    },
+    "normal": {
+      "user_id": "44444444-4444-4444-8444-000000000005",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 100.0,
+        "used_usd": 25.0,
+        "remaining_usd": 75.0,
+        "usage_pct": 25.0,
+        "policy": "SOFT_WARNING"
+      }
+    },
+    "over_limit": {
+      "user_id": "44444444-4444-4444-8444-000000000006",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 50.0,
+        "used_usd": 60.0,
+        "remaining_usd": -10.0,
+        "usage_pct": 120.0,
+        "policy": "HARD_BLOCK"
+      }
+    }
+  },
+  "head": {
+    "no_budget": {
+      "user_id": "44444444-4444-4444-8444-000000000001",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0,
+        "used_usd": 12.34,
+        "remaining_usd": -12.34,
+        "usage_pct": 0,
+        "policy": "HARD_BLOCK",
+        "configured": false
+      },
+      "team": {
+        "assigned": true,
+        "budget_configured": true,
+        "budget_exhausted": false
+      }
+    },
+    "zero_hard_block": {
+      "user_id": "44444444-4444-4444-8444-000000000002",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0.0,
+        "used_usd": 1.0,
+        "remaining_usd": -1.0,
+        "usage_pct": 0,
+        "policy": "HARD_BLOCK",
+        "configured": true
+      },
+      "team": {
+        "assigned": true,
+        "budget_configured": true,
+        "budget_exhausted": false
+      }
+    },
+    "zero_throttle": {
+      "user_id": "44444444-4444-4444-8444-000000000003",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0.0,
+        "used_usd": 0.0,
+        "remaining_usd": 0.0,
+        "usage_pct": 0,
+        "policy": "THROTTLE",
+        "configured": true
+      },
+      "team": {
+        "assigned": true,
+        "budget_configured": true,
+        "budget_exhausted": false
+      }
+    },
+    "zero_soft_warning": {
+      "user_id": "44444444-4444-4444-8444-000000000004",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0.0,
+        "used_usd": 0.0,
+        "remaining_usd": 0.0,
+        "usage_pct": 0,
+        "policy": "SOFT_WARNING",
+        "configured": true
+      },
+      "team": {
+        "assigned": true,
+        "budget_configured": true,
+        "budget_exhausted": false
+      }
+    },
+    "normal": {
+      "user_id": "44444444-4444-4444-8444-000000000005",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 100.0,
+        "used_usd": 25.0,
+        "remaining_usd": 75.0,
+        "usage_pct": 25.0,
+        "policy": "SOFT_WARNING",
+        "configured": true
+      },
+      "team": {
+        "assigned": true,
+        "budget_configured": true,
+        "budget_exhausted": false
+      }
+    },
+    "over_limit": {
+      "user_id": "44444444-4444-4444-8444-000000000006",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 50.0,
+        "used_usd": 60.0,
+        "remaining_usd": -10.0,
+        "usage_pct": 120.0,
+        "policy": "HARD_BLOCK",
+        "configured": true
+      },
+      "team": {
+        "assigned": true,
+        "budget_configured": true,
+        "budget_exhausted": false
+      }
+    },
+    "teamless": {
+      "user_id": "44444444-4444-4444-8444-000000000007",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0,
+        "used_usd": 3.21,
+        "remaining_usd": -3.21,
+        "usage_pct": 0,
+        "policy": "HARD_BLOCK",
+        "configured": false
+      },
+      "team": {
+        "assigned": false,
+        "budget_configured": false,
+        "budget_exhausted": false
+      }
+    },
+    "team_without_budget": {
+      "user_id": "44444444-4444-4444-8444-000000000008",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0,
+        "used_usd": 0.0,
+        "remaining_usd": 0.0,
+        "usage_pct": 0,
+        "policy": "HARD_BLOCK",
+        "configured": false
+      },
+      "team": {
+        "assigned": true,
+        "budget_configured": false,
+        "budget_exhausted": false
+      }
+    },
+    "team_exhausted": {
+      "user_id": "44444444-4444-4444-8444-000000000009",
+      "period": "2026-10",
+      "budget": {
+        "limit_usd": 0,
+        "used_usd": 0.0,
+        "remaining_usd": 0.0,
+        "usage_pct": 0,
+        "policy": "HARD_BLOCK",
+        "configured": false
+      },
+      "team": {
+        "assigned": true,
+        "budget_configured": true,
+        "budget_exhausted": true
+      }
+    }
+  }
+}

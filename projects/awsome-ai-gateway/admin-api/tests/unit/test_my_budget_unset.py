@@ -2,15 +2,18 @@
 
 """``GET /admin/my/budget`` — 개인 예산 행이 없으면 '미설정' 이다, '$0 하드 차단' 이 아니다.
 
-예전에는 행이 없을 때 ``limit_usd=0`` · ``policy="HARD_BLOCK"`` 으로 접었다. 그래서 지출이
-있는 사용자(OIDC 자동 프로비저닝 사용자는 개인 예산 행이 없는 것이 정상)에게 콘솔이
-"한도 $0 / 잔여 $-N / 하드 차단" 을 보였다. 게이트웨이는 같은 사용자를 **통과**시킨다
-(gateway-proxy budget_service: "Q 정책: USER 예산 미설정 → pass-through") — 콘솔만 거짓말을 했다.
+행이 없을 때 응답은 ``limit_usd=0`` · ``policy="HARD_BLOCK"`` 이다. 지출이 있는 사용자(OIDC 자동 프로비저닝
+사용자는 개인 예산 행이 없는 것이 정상)에게 그 값을 그대로 그리면 "한도 $0 / 잔여 $-N / 하드 차단" 이 된다.
+게이트웨이는 같은 사용자를 **통과**시킨다(gateway-proxy budget_service: "Q 정책: USER 예산 미설정 →
+pass-through"). 그래서 '미설정' 은 더하는 필드 ``configured`` 로 낸다.
+
+⚠️ 그 0 · HARD_BLOCK 은 그대로 둔다(하위 호환). 이전 카드가 그 넷을 ``.toFixed()`` 한다 — null 로 바꾸면
+   admin-api 를 먼저 배포한 동안 카드가 죽는다(test_my_budget_wire_fixture.py 가 main 의 실제 응답과 대조한다).
 
 여기서 고정하는 3-state:
-  * 설정됨   — limit/remaining/usage_pct/policy 가 숫자·문자열
-  * 미설정   — 그 넷이 null, used_usd 는 여전히 숫자(실지출)
-  * 한도 0   — "미설정" 과 다르다: 0 은 실재하는 한도라 숫자로 나간다
+  * 설정됨   — configured=true, limit/remaining/usage_pct/policy 는 그 행의 값
+  * 미설정   — configured=false, 이전 값(0 · HARD_BLOCK · usage_pct 0 · remaining=-used), used_usd 는 실지출
+  * 한도 0   — "미설정" 과 다르다: configured=true 이고 0 은 실재하는 한도다
 """
 from __future__ import annotations
 
@@ -78,10 +81,9 @@ async def _budget(config, used="12.34") -> dict:
 
 async def test_no_budget_row_is_reported_as_unset_not_hard_block():
     b = await _budget(None)
-    assert b["limit_usd"] is None, "없는 한도를 $0 으로 지어냈다"
-    assert b["remaining_usd"] is None, "없는 한도로 음수 잔여를 계산했다"
-    assert b["usage_pct"] is None
-    assert b["policy"] is None, "게이트웨이가 통과시키는 사용자를 HARD_BLOCK 으로 표시했다"
+    assert b["configured"] is False, "개인 예산 행이 없는 사용자를 설정됨으로 보냈다"
+    # 이전 카드용 값은 예전 그대로다 — 숫자·문자열이어야 이전 카드가 죽지 않는다(하위 호환).
+    assert (b["limit_usd"], b["remaining_usd"], b["usage_pct"], b["policy"]) == (0, -12.34, 0, "HARD_BLOCK")
     # 실지출은 미설정이어도 사실이다 — 숫자로 남는다.
     assert b["used_usd"] == 12.34
 
@@ -96,20 +98,19 @@ async def test_configured_budget_is_reported_as_numbers():
         "remaining_usd": 75.0,
         "usage_pct": 25.0,
         "policy": "SOFT_WARNING",
+        "configured": True,
     }
 
 
 async def test_zero_limit_is_a_real_limit_not_unset():
-    """0 원 한도는 '미설정' 과 다른 사실이다 — null 로 접으면 실재하는 차단을 숨긴다.
+    """0 원 한도는 '미설정' 과 다른 사실이다 — HARD_BLOCK 의 $0 한도는 모든 요청을 막는다(used >= 0).
 
-    ⚠️ 사용률은 null 이다(0 으로 나눈 비율은 없다). 예전엔 0.0% 를 보내 카드가 초록 막대와 "0.0%" 로
-       '아직 안 씀' 처럼 그렸는데, HARD_BLOCK 의 $0 한도는 모든 요청을 막는다(used >= 0)."""
+    ⚠️ 이전 필드만 보면 미설정과 **같다**(limit 0 · HARD_BLOCK · usage_pct 0). 사용률은 정의되지 않지만 이전
+       카드가 숫자를 기대해 0 을 보낸다 — 새 카드는 configured=true · limit 0 을 보고 '--' 와 차단을 그린다."""
     cfg = SimpleNamespace(max_budget_usd=Decimal("0"), policy=BudgetPolicy.HARD_BLOCK)
     b = await _budget(cfg, used="1.00")
-    assert b["limit_usd"] == 0
-    assert b["usage_pct"] is None
-    assert b["remaining_usd"] == -1.0
-    assert b["policy"] == "HARD_BLOCK"
+    assert b["configured"] is True
+    assert (b["limit_usd"], b["usage_pct"], b["remaining_usd"], b["policy"]) == (0, 0, -1.0, "HARD_BLOCK")
 
 
 # ── 팀 예산 — 게이트웨이는 팀 예산이 없으면 거부한다(C-1, team_budget_unset) ─────────

@@ -1085,8 +1085,9 @@ async def test_my_budget_reports_the_team_budget_the_gateway_will_check(session)
     }
 
 
-async def test_my_budget_zero_limit_has_no_usage_ratio(session):
-    """$0 HARD_BLOCK 은 모든 요청을 막는다 — 사용률 0.0% 가 아니라 null 이고 한도는 0 으로 남는다."""
+async def test_my_budget_zero_limit_is_configured_not_unset(session):
+    """$0 HARD_BLOCK 은 모든 요청을 막는다 — 이전 필드로는 미설정과 같아 보이므로(하위 호환으로 사용률도 0)
+    configured=true 가 그 차이를 실어야 한다."""
     from unittest.mock import AsyncMock, MagicMock
 
     from app.core.auth import CurrentUser
@@ -1104,7 +1105,70 @@ async def test_my_budget_zero_limit_has_no_usage_ratio(session):
     await session.commit()
 
     b = (await _my_budget(session, U_TEAMLESS))["budget"]
-    assert (b["limit_usd"], b["usage_pct"], b["policy"]) == (0, None, "HARD_BLOCK")
+    assert (b["limit_usd"], b["usage_pct"], b["policy"], b["configured"]) == (0, 0, "HARD_BLOCK", True)
+
+
+async def test_my_budget_keeps_mains_values_on_real_rows(session):
+    """하위 호환을 실제 행으로 — 이전 카드(main)가 읽는 값이 main 의 실제 응답과 같다(admin-api 를 먼저 배포한
+    동안 이전 카드가 그대로 그린다). 기준은 admin-ui 픽스처의 ``main`` — main(e7a1588)의 라우트가 낸 값이다.
+    새 의미는 configured 로만 갈린다: 미설정과 $0 하드 차단은 이전 필드로는 같아 보인다."""
+    import json
+    from pathlib import Path
+
+    from sqlalchemy import text
+
+    fixture = Path(__file__).resolve().parents[3] / "admin-ui" / "tests" / "fixtures" / "my-budget.json"
+    if not fixture.exists():
+        pytest.skip(f"sibling admin-ui not in this checkout: {fixture}")
+    main = json.loads(fixture.read_text(encoding="utf-8"))["main"]
+
+    cases = {  # 상태 → (개인 예산 (한도, 정책) | None, 이번 달 지출) — 픽스처의 같은 상태와 같은 입력
+        "no_budget": (None, "12.34"),
+        "zero_hard_block": (("0", "HARD_BLOCK"), "1.00"),
+        "normal": (("100", "SOFT_WARNING"), "25.00"),
+    }
+    dept_id = (await session.execute(text("SELECT dept_id FROM auth.teams WHERE id = :t"), {"t": SEED_TEAM_ID})).scalar_one()
+    provider = (
+        await session.execute(text("SELECT provider::text FROM model.model_aliases WHERE alias = :a"), {"a": ALIAS})
+    ).scalar_one()
+    seen = {}
+    try:
+        for state, (cfg, used) in cases.items():
+            uid = uuid.uuid4()
+            await session.execute(
+                text(
+                    "INSERT INTO auth.users (id, team_id, email, display_name, role, sso_subject) "
+                    "VALUES (:u, :t, :e, :e, 'DEVELOPER', :sub)"
+                ),
+                {"u": uid, "t": SEED_TEAM_ID, "e": f"compat-{state}@example.com", "sub": f"sub-{uid}"},
+            )
+            if cfg is not None:
+                await session.execute(
+                    text(
+                        "INSERT INTO budget.budget_configs "
+                        "(scope, scope_id, max_budget_usd, policy, allocated_by, effective_from) "
+                        "VALUES ('USER', :u, :l, CAST(:p AS budget.budget_policy), :a, CURRENT_DATE)"
+                    ),
+                    {"u": uid, "l": Decimal(cfg[0]), "p": cfg[1], "a": SEED_ADMIN_ID},
+                )
+            await session.execute(
+                text(
+                    "INSERT INTO usage.usage_logs (id, request_id, user_id, team_id, dept_id, model_alias, provider, "
+                    "status, requested_at, completed_at, cost_usd, input_tokens, output_tokens, cache_read_tokens, "
+                    "cache_creation_tokens, latency_ms) VALUES (gen_random_uuid(), gen_random_uuid()::text, :u, :t, "
+                    ":d, :m, :pv, 'SUCCESS', now(), now(), :c, 10, 20, 0, 0, 100)"
+                ),
+                {"u": uid, "t": SEED_TEAM_ID, "d": dept_id, "m": ALIAS, "pv": provider, "c": Decimal(used)},
+            )
+            seen[state] = (await _my_budget(session, uid))["budget"]
+    finally:
+        await session.rollback()
+
+    for state, budget in seen.items():
+        legacy = {k: budget[k] for k in main[state]["budget"]}
+        assert legacy == main[state]["budget"], f"{state}: 이전 카드가 읽는 값이 main 과 다르다 {legacy}"
+        assert all(isinstance(budget[k], (int, float)) for k in ("limit_usd", "used_usd", "remaining_usd", "usage_pct"))
+    assert (seen["no_budget"]["configured"], seen["zero_hard_block"]["configured"]) == (False, True)
 
 
 def _previous_period(period: str) -> str:

@@ -54,18 +54,17 @@ async def get_my_budget(
     result = await session.execute(stmt)
     config = result.scalar_one_or_none()
 
-    # ⚠️ 개인 예산 행이 없으면 값을 **지어내지 않는다**(3-state: 설정됨 / 미설정 / 지출).
-    #    예전엔 limit 0 · policy "HARD_BLOCK" 으로 접어, 지출이 있는 사용자에게
-    #    "한도 $0 / 잔여 $-N / 하드 차단" 이라는 실재하지 않는 강제를 보였다. 게이트웨이는
-    #    개인 예산이 없으면 통과시킨다(gateway-proxy budget_service "Q 정책: USER 예산 미설정 →
-    #    pass-through", 팀 예산은 계속 적용) — 콘솔만 거짓말을 했다. 그래서 limit/remaining/
-    #    usage_pct/policy 는 null 로 내보내고 used_usd(진짜 지출)만 채운다.
-    if config is not None:
-        limit_usd: float | None = float(config.max_budget_usd)
-        policy: str | None = config.policy.value
-    else:
-        limit_usd = None
-        policy = None
+    # 개인 예산 행이 있는가(3-state: 설정됨 / 미설정 / 지출). 게이트웨이는 행이 없으면 그 계층을 통과시킨다
+    # (gateway-proxy budget_service "Q 정책: USER 예산 미설정 → pass-through", 팀 예산은 계속 적용).
+    #
+    # ⚠️ 하위 호환 — `budget` 의 limit_usd · remaining_usd · usage_pct · policy 는 **이전 admin-ui 카드가 그대로
+    #    `.toFixed()` 한다**. 행이 없을 때도 예전과 같은 값(limit 0 · "HARD_BLOCK" · usage_pct 0 · remaining =
+    #    -used)을 계속 보낸다. 한때 이 넷을 null 로 바꿨는데, admin-api 를 먼저 배포하는 동안(admin-api → admin-ui
+    #    가 배포 순서이고, helm 한 번의 롤에서도 두 버전이 몇 분 섞인다) 이전 카드가 TypeError 로 통째로 죽었다.
+    #    '미설정' 이라는 새 의미는 **더하는 필드** `configured` 로만 낸다 — 새 카드는 그것을 보고 미설정을 그린다.
+    configured = config is not None
+    limit_usd = float(config.max_budget_usd) if configured else 0
+    policy = config.policy.value if configured else "HARD_BLOCK"
 
     usage_stmt = select(func.coalesce(func.sum(UsageLog.cost_usd), 0)).where(
         UsageLog.user_id == user.user_id,
@@ -73,14 +72,10 @@ async def get_my_budget(
     )
     used_result = await session.execute(usage_stmt)
     used_usd = float(used_result.scalar_one())
-    if limit_usd is None:
-        remaining: float | None = None
-        usage_pct: float | None = None
-    else:
-        remaining = limit_usd - used_usd
-        # ⚠️ $0 한도의 사용률은 **없다**(null). 예전엔 0.0 을 보내 카드가 초록 막대 "0.0%" 로 '아직 안
-        #    씀' 처럼 그렸는데, HARD_BLOCK 의 $0 은 모든 요청을 막는다(gateway used >= limit).
-        usage_pct = (used_usd / limit_usd * 100) if limit_usd > 0 else None
+    remaining = limit_usd - used_usd
+    # $0 한도의 사용률은 정의되지 않지만 이전 카드가 숫자를 기대하므로 예전처럼 0 을 보낸다. 새 카드는
+    # configured 이고 limit 이 0 이면 사용률 대신 '--' 와 정책별 $0 판정을 그린다(0.0% 는 '아직 안 씀' 으로 읽힌다).
+    usage_pct = (used_usd / limit_usd * 100) if limit_usd > 0 else 0
 
     # 팀 예산 상태 — 게이트웨이는 **팀 예산이 없으면 거부한다**(gateway-proxy budget_service C-1:
     # TEAM config 미설정 → team_budget_unset, 팀 미배정 사용자도 같다). 개인 예산이 없을 때 카드가
@@ -137,11 +132,12 @@ async def get_my_budget(
         "user_id": str(user.user_id),
         "period": period,
         "budget": {
-            "limit_usd": round(limit_usd, 2) if limit_usd is not None else None,
+            "limit_usd": round(limit_usd, 2),
             "used_usd": round(used_usd, 4),
-            "remaining_usd": round(remaining, 4) if remaining is not None else None,
-            "usage_pct": round(usage_pct, 1) if usage_pct is not None else None,
+            "remaining_usd": round(remaining, 4),
+            "usage_pct": round(usage_pct, 1),
             "policy": policy,
+            "configured": configured,
         },
         "team": {
             "assigned": team_id is not None,

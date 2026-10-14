@@ -2,8 +2,9 @@
 
 """예산 화면이 읽고 쓰는 와이어 — HTTP 레이어를 통과시켜 고정한다.
 
-  * ``GET /admin/my/budget`` — 개인 예산 행이 없으면 limit/remaining/usage_pct/policy 가
-    **null**(예전: 0 / 음수 / "HARD_BLOCK"). 콘솔의 MyBudgetCard 가 이 null 로 '미설정' 을 그린다.
+  * ``GET /admin/my/budget`` — 개인 예산 행이 없으면 ``configured`` 가 **false** 이고, 이전 카드가 읽는
+    limit/remaining/usage_pct/policy 는 예전 값(0 / 음수 / 0 / "HARD_BLOCK") 그대로다(하위 호환 — null 이면
+    이전 카드가 `.toFixed()` 에서 죽는다). 콘솔의 MyBudgetCard 는 configured 로 '미설정' 을 그린다.
   * ``PUT /admin/budgets/user/{id}`` — ``max_budget_usd`` 가 NUMERIC(12,4) 를 넘으면 **422**
     (예전: 검증 통과 → asyncpg numeric overflow → 500). 컬럼이 실제로 그 값을 거부한다는 것은
     실 PG 로 test_high_console_contract_real_db.py 가 증명한다.
@@ -25,15 +26,14 @@ TEAM_ID = uuid.UUID("00000000-0000-0000-0000-0000000000a1")
 MEMBER_ID = uuid.UUID("55555555-5555-4555-8555-555555555555")
 
 
-async def test_my_budget_without_a_row_is_null_not_zero(client: AsyncClient, dev_headers: dict):
+async def test_my_budget_without_a_row_is_unset_and_keeps_the_legacy_numbers(client: AsyncClient, dev_headers: dict):
     # conftest 의 mock DB: scalar_one_or_none → None(예산 행 없음), scalar_one → 0(지출)
     resp = await client.get("/admin/my/budget", headers=dev_headers)
     assert resp.status_code == 200, resp.text
     b = resp.json()["budget"]
-    assert b["limit_usd"] is None
-    assert b["remaining_usd"] is None
-    assert b["usage_pct"] is None
-    assert b["policy"] is None
+    assert b["configured"] is False
+    # 와이어(JSON)에서도 이전 카드가 `.toFixed()` 하는 넷은 숫자다 — null 이 아니다.
+    assert (b["limit_usd"], b["remaining_usd"], b["usage_pct"], b["policy"]) == (0, 0, 0, "HARD_BLOCK")
     assert b["used_usd"] == 0  # 실지출은 숫자로 남는다
     # conftest 의 mock DB 에서 사용자의 팀도 None — 팀 미배정은 게이트웨이가 거부하는 상태다.
     assert resp.json()["team"] == {"assigned": False, "budget_configured": False, "budget_exhausted": False}
