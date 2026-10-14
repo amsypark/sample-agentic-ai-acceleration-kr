@@ -1,9 +1,18 @@
 # Copyright 2026 © Amazon.com and Affiliates: This deliverable is considered Developed Content as defined in the AWS Service Terms.
 
-"""자격증명 단계의 실패가 모델의 서킷 브레이커를 올리지 않는다.
+"""모델 서킷 브레이커(``CircuitBreakerService``, 실 Redis) — Redis Cluster 에서도 열리고 닫히며,
+자격증명 단계의 실패는 세지 않는다.
 
-무엇이 문제였나
----------------
+1. 클러스터에서 브레이커가 열리지 않았다
+-----------------------------------------
+브레이커의 키(``cb:<pmid>:fail|total|open`` 과 초 단위 버킷 키)에 hash tag 가 없어, Redis Cluster
+에서는 record EVAL 이 보내기도 전에 클라이언트에서 거부되고(``RedisClusterException``: all keys
+must map to the same key slot) ``cb_record_failed`` 로 삼켜졌다. 운영은 ``REDIS_CLUSTER_MODE=true``
+라 브레이커가 사실상 꺼져 있었다. 이제 한 브레이커의 키는 모두 ``cb:{<pmid>}:…`` 한 슬롯이다.
+배포 중 옛 이름의 키는 서로 독립이고 모두 TTL 이 있다(아래 테스트).
+
+2. 자격증명 단계의 실패가 브레이커를 올렸다
+---------------------------------------------
 라우팅 프로필 X 의 STS 가 멈추거나 신뢰 정책이 깨지면 그 프로필의 Mantle 요청은 502 를 받는다 —
 첫 요청은 STS 가 실패한 뒤, 그다음 5초는 ``ProfileAssumeBackoff`` 로 곧바로. 상류는 한 번도
 호출되지 않는다. 그런데 폴백 루프는 502 를 서킷 브레이커 실패로 셌고, 브레이커 키는 모델 id
@@ -18,14 +27,9 @@ temporarily unavailable" 을 받았다. 파드 계정 폴백이 없는 claude-co
 센다 — 그것은 모델(계정)의 건강이다.
 
 이 파일의 테스트는 **브레이커 상태만** 본다(표지 이름을 import 하지 않는다). 그래서 고치기 전
-코드에 그대로 돌려 대조군으로 쓸 수 있다. 브레이커는 실물(``CircuitBreakerService`` + 실 Redis)이고,
-대역은 STS·bearer 생성기·Mantle HTTP 뿐이다.
-
-⚠️ 단일 노드 Redis 에서만 돈다. 브레이커의 세 키(``cb:<pmid>:fail|total|open``)에는 hash tag 가
-없어 Redis Cluster 에서는 기록 EVAL 이 클라이언트에서 거부되고(``RedisClusterException``: all keys
-must map to the same key slot) ``cb_record_failed`` 로 삼켜진다 — 클러스터에서는 브레이커가 아예
-열리지 않는다(실 클러스터 실측). 그 자체는 이 수정의 범위 밖이고, 클러스터 변형은 열리지 않는
-브레이커를 "닫혀 있다" 로 통과시키는 공허한 테스트가 된다.
+코드에 그대로 돌려 대조군으로 쓸 수 있다. 브레이커는 실물(``CircuitBreakerService`` + 실 Redis,
+단일 노드·클러스터)이고, 대역은 STS·bearer 생성기·Mantle HTTP 뿐이다. 클러스터 변형이 공허하지
+않은 것은 "실제로 열린다" 테스트가 같은 클러스터에서 보인다.
 """
 
 from __future__ import annotations
@@ -40,6 +44,9 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 from botocore.exceptions import ConnectTimeoutError
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
+from structlog.testing import capture_logs
 
 from app.providers.bedrock_adapter import BedrockAdapter
 from app.providers.mantle_adapter import MantleAdapter
@@ -57,6 +64,7 @@ from app.services.circuit_breaker import CircuitBreakerService
 from app.services.fallback_loop import run_fallback_loop
 
 REDIS_PROOF_URL = os.environ.get("REDIS_PROOF_URL")
+REDIS_CLUSTER_URL = os.environ.get("REDIS_CLUSTER_URL")
 
 ROLE_X = "arn:aws:iam::444455556666:role/app-x"
 ROLE_Y = "arn:aws:iam::111122223333:role/app-y"
@@ -65,13 +73,27 @@ ENDPOINT = "https://bedrock-mantle.us-west-2.api.aws/anthropic"
 REQUESTS = 8
 
 
-@pytest.fixture
-async def real_redis():
-    if not REDIS_PROOF_URL:
-        pytest.skip("REDIS_PROOF_URL 미설정 — 실 Redis 필요(브레이커 상태는 Redis Lua 다).")
-    import redis.asyncio as aioredis
+def _client(kind: str):
+    # 재시도를 끄고 30초 — 늦은 응답은 오류로 드러나야 한다(test_medium_tpm_settle_reserved_bucket
+    # 의 _CLIENT_KW 와 같은 이유).
+    kw = {"socket_timeout": 30, "retry": Retry(NoBackoff(), 0)}
+    if kind == "single":
+        if not REDIS_PROOF_URL:
+            pytest.skip("REDIS_PROOF_URL 미설정 — 실 Redis 필요(브레이커 상태는 Redis Lua 다).")
+        import redis.asyncio as aioredis
 
-    client = aioredis.from_url(REDIS_PROOF_URL, socket_timeout=5)
+        return aioredis.from_url(REDIS_PROOF_URL, **kw)
+    if not REDIS_CLUSTER_URL:
+        pytest.skip("REDIS_CLUSTER_URL 미설정 — 진짜 Redis Cluster 필요(가짜/단일노드 폴백 금지).")
+    from redis.asyncio.cluster import RedisCluster
+
+    return RedisCluster.from_url(REDIS_CLUSTER_URL, **kw)
+
+
+@pytest.fixture(params=["single", "cluster"])
+async def real_redis(request):
+    client = _client(request.param)
+    client.kind = request.param
     try:
         yield client
     finally:
@@ -184,8 +206,19 @@ async def _call(redis, cb, adapter, cfg, kwargs: dict, *, stream: bool):
     return result
 
 
+async def _breaker_keys(redis, pmid: str) -> dict[str, int]:
+    """이 브레이커의 키(새 이름 ``cb:{<pmid>}:…``, 옛 이름 ``cb:<pmid>:…``) — {키: TTL}."""
+    out: dict[str, int] = {}
+    for pattern in (f"cb:{{{pmid}}}:*", f"cb:{pmid}:*"):
+        async for raw in redis.scan_iter(match=pattern, count=500):
+            key = raw.decode() if isinstance(raw, bytes) else raw
+            out[key] = int(await redis.ttl(key))
+    return out
+
+
 async def _cleanup(redis, pmid: str) -> None:
-    await redis.delete(*(f"cb:{pmid}:{s}" for s in ("fail", "total", "open", "halfopen")))
+    for key in await _breaker_keys(redis, pmid):
+        await redis.delete(key)
 
 
 def _mantle(monkeypatch, upstream: _Upstream):
@@ -308,3 +341,86 @@ async def test_an_unusable_alias_account_is_not_counted(real_redis):
         assert not await cb.is_open(real_redis, pmid)
     finally:
         await _cleanup(real_redis, pmid)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 브레이커 자체 — 단일 노드와 클러스터에서 같은 동작
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def test_failures_open_the_breaker_one_probe_passes_and_a_success_closes_it(real_redis):
+    """실패 다섯 번(min_calls 5, 오류율 1.0)이면 열린다. 열려 있는 동안 half-open 시험 요청은 파드를
+    통틀어 하나만 뽑히고, 그 시험이 성공하면 닫힌다. 한 브레이커의 키는 모두 한 슬롯이고 TTL 이
+    있다. 고치기 전 코드에서는 클러스터 변형이 첫 단정에서 실패했다(기록이 거부돼 열리지 않는다).
+    """
+    r = real_redis
+    pmid = f"anthropic.cb-life-{uuid.uuid4().hex[:8]}"
+    cb = CircuitBreakerService()
+    try:
+        with capture_logs() as logs:
+            opened = [await cb.record_failure(r, pmid) for _ in range(5)]
+        assert opened == [False] * 4 + [True], (opened, [e["event"] for e in logs])
+        assert not [e for e in logs if e["event"] == "cb_record_failed"]
+        assert await cb.is_open(r, pmid)
+
+        assert await cb.try_acquire_halfopen_probe(r, pmid) is True
+        assert await cb.try_acquire_halfopen_probe(r, pmid) is False  # 다른 요청은 건너뛴다
+
+        await cb.record_success(r, pmid)  # 시험 요청이 성공
+        assert not await cb.is_open(r, pmid)
+
+        keys = await _breaker_keys(r, pmid)
+        assert keys and all(ttl > 0 for ttl in keys.values()), keys
+        if r.kind == "cluster":
+            slots = {r.keyslot(k) for k in keys}
+            assert len(slots) == 1, slots
+    finally:
+        await _cleanup(r, pmid)
+
+
+class _UntaggedKeys(CircuitBreakerService):
+    """이 수정 이전의 키 이름(hash tag 없음) — 배포 중 아직 옛 이미지인 파드가 쓰는 것과 같다."""
+
+    @staticmethod
+    def _keys(pmid: str) -> tuple[str, str, str]:
+        return f"cb:{pmid}:fail", f"cb:{pmid}:total", f"cb:{pmid}:open"
+
+    async def try_acquire_halfopen_probe(self, redis, pmid: str) -> bool:
+        return bool(await redis.set(f"cb:{pmid}:halfopen", "1", nx=True, px=self.halfopen_ttl_ms))
+
+
+async def test_during_a_rolling_deploy_old_and_new_breakers_are_independent_and_expire(real_redis):
+    """배포 중에는 옛 파드(태그 없는 키)와 새 파드(``cb:{<pmid>}:…``)가 같은 모델의 브레이커를 따로
+    갖는다 — 한쪽이 열려도 다른 쪽은 닫혀 있고, 각자 자기 실패로만 열린다. 옛 키는 모두 TTL 이
+    있어(버킷 30초, open PX, halfopen PX) TTL 없이 남는 것이 없다. 클러스터에서는 옛 파드의 기록이
+    거부돼 옛 키가 생기지도 않는다(그 경고가 남는다) — 고치기 전의 상태 그대로다.
+    """
+    r = real_redis
+    pmid = f"anthropic.cb-roll-{uuid.uuid4().hex[:8]}"
+    old, new = _UntaggedKeys(), CircuitBreakerService()
+    try:
+        with capture_logs() as logs:
+            for _ in range(5):
+                await old.record_failure(r, pmid)
+        rejected = [e for e in logs if e["event"] == "cb_record_failed"]
+        if r.kind == "single":
+            assert await old.is_open(r, pmid) and not rejected
+            assert await old.try_acquire_halfopen_probe(r, pmid)
+        else:
+            assert not await old.is_open(r, pmid) and len(rejected) == 5
+        assert not await new.is_open(r, pmid), "옛 파드의 상태가 새 파드의 브레이커를 열었다"
+
+        for _ in range(5):
+            await new.record_failure(r, pmid)
+        assert await new.is_open(r, pmid)
+        await new.record_success(r, pmid)
+        assert not await new.is_open(r, pmid)
+        if r.kind == "single":
+            assert await old.is_open(r, pmid), "새 파드의 회복이 옛 파드의 브레이커를 닫았다"
+
+        keys = await _breaker_keys(r, pmid)
+        stale = {k: t for k, t in keys.items() if not k.startswith(f"cb:{{{pmid}}}:")}
+        assert all(t > 0 for t in keys.values()), keys
+        assert bool(stale) == (r.kind == "single"), stale
+    finally:
+        await _cleanup(r, pmid)
