@@ -17,6 +17,8 @@ pass-through"). 그래서 '미설정' 은 더하는 필드 ``configured`` 로 �
 """
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from decimal import Decimal
 from types import SimpleNamespace
@@ -244,3 +246,20 @@ async def test_redis_down_falls_back_to_budget_usages():
 async def test_no_redis_client_uses_budget_usages():
     """대조군 — Redis 가 없는 배포(app.state.redis None)는 DB 경로다."""
     assert (await _team_with(None, team_used_in_db="100"))["budget_exhausted"] is True
+
+
+class _SilentRedis:
+    """연결은 받고 응답은 영영 하지 않는 Redis — 예외 없이 멈추기만 한다."""
+
+    async def get(self, key: str):
+        await asyncio.Event().wait()
+
+
+async def test_a_redis_that_never_answers_falls_back_to_budget_usages():
+    """admin-api 의 Redis 클라이언트에는 소켓 타임아웃이 없다. 응답 없는 Redis 를 무한정 기다리면 팀 예산이 있는
+    사용자의 /my 카드가 멈춘다 — 상한 뒤에는 'Redis 를 쓸 수 없음' 으로 보고 budget_usages 로 판정한다."""
+    started = time.monotonic()
+    # 바깥 상한은 예전 코드(무한 대기)에서 이 테스트가 멈추지 않고 실패하게 하려는 것이다.
+    team = await asyncio.wait_for(_team_with(_SilentRedis(), team_used_in_db="100"), timeout=3)
+    assert team["budget_exhausted"] is True  # budget_usages 100 / 한도 100 으로 판정했다
+    assert time.monotonic() - started < 2, "응답 없는 Redis 를 상한보다 오래 기다렸다"

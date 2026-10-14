@@ -25,8 +25,10 @@ Redis 에 쓴 키는 지운다.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import time
 import uuid
 from decimal import Decimal
 from pathlib import Path
@@ -239,3 +241,30 @@ async def test_the_float_edge_soft_warning_one_cent(db, redis_client):
     await redis_client.set(team.usage_key, "0.0111")  # 대조군 — 조금 더 쓰면 둘 다 거부
     assert await _gateway_denies(redis_client, team) is True
     assert await _card_says_exhausted(db, team, redis_client) is True
+
+
+async def test_a_redis_that_stops_answering_falls_back_within_the_bound(db, redis_client):
+    """CLIENT PAUSE ALL — 연결은 받지만 명령을 처리하지 않는 실제 Redis. 카드는 상한(0.5s) 뒤 budget_usages 로
+    판정한다. 예전 코드는 일시정지가 끝날 때까지 기다렸다가 카운터를 읽었다(응답이 영영 없으면 영영)."""
+    redis_asyncio = pytest.importorskip("redis.asyncio")
+    team = await _team(db, redis_client, "100", "HARD_BLOCK")
+    await redis_client.incrbyfloat(team.usage_key, 100.0)  # 카운터는 소진
+    await _db_usage(db, team.team_id, "50")  # budget_usages 는 여유 — 어느 쪽으로 판정했는지 갈린다
+    reader = redis_asyncio.from_url(REDIS_PROOF_URL, decode_responses=True)
+    assert await reader.ping() is True  # 연결은 미리 맺는다 — 붙어는 있는데 대답이 없는 상태를 만든다
+
+    pause_s = 2.0
+    await redis_client.execute_command("CLIENT", "PAUSE", int(pause_s * 1000), "ALL")
+    started = time.monotonic()
+    try:
+        exhausted = await asyncio.wait_for(_card_says_exhausted(db, team, reader), timeout=pause_s + 3)
+        elapsed = time.monotonic() - started
+    finally:
+        # 일시정지가 끝날 때까지 기다린다 — 정리와 다음 테스트가 멈춘 Redis 를 만나지 않게.
+        remaining = pause_s - (time.monotonic() - started)
+        if remaining > 0:
+            await asyncio.sleep(remaining + 0.2)
+        await reader.aclose()
+
+    assert elapsed < 1.5, f"응답 없는 Redis 를 {elapsed:.2f}s 기다렸다(상한 0.5s)"
+    assert exhausted is False, "상한 뒤 budget_usages(50/100) 가 아니라 늦게 온 카운터(100)로 판정했다"

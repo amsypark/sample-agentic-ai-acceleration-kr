@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import timedelta
 from decimal import Decimal
@@ -22,6 +23,11 @@ router = APIRouter(prefix="/admin/my", tags=["My Usage"])
 # 게이트웨이 SOFT_WARNING 의 허용 상한(%) — DB 컬럼이 없어 admin-api 는 config 캐시에 쓰지 않는다.
 # budget_check.lua 의 기본값(soft_limit_pct=110)과 gateway-proxy DEFAULT_SOFT_LIMIT_PCT 가 쓰인다.
 _GATEWAY_SOFT_LIMIT_PCT = 110
+
+# 팀 카운터 Redis 읽기의 상한(초). ⚠️ admin-api 의 Redis 클라이언트에는 소켓 타임아웃이 없다
+# (core/redis_client.py) — 연결은 받고 응답하지 않는 Redis 앞에서 이 조회가 끝없이 기다리면, 팀 예산이 있는
+# 모든 사용자의 /my 카드가 멈춘다. 상한을 넘기면 'Redis 를 쓸 수 없음' 으로 보고 DB 로 판정한다.
+_REDIS_READ_TIMEOUT_S = 0.5
 
 
 def _gateway_denies_team(policy: BudgetPolicy, limit: Decimal, used: Decimal) -> bool:
@@ -58,9 +64,11 @@ async def _team_used_usd(redis, session: AsyncSession, team_id: uuid.UUID, perio
     """
     if redis is not None:
         try:
-            raw = await redis.get(f"budget:team:{{{team_id}}}:{period}")
+            raw = await asyncio.wait_for(
+                redis.get(f"budget:team:{{{team_id}}}:{period}"), timeout=_REDIS_READ_TIMEOUT_S
+            )
             return Decimal(raw.decode() if isinstance(raw, bytes) else raw) if raw is not None else Decimal("0")
-        except Exception:  # noqa: BLE001 - 연결 실패·이상한 값이면 게이트웨이처럼 DB 로 판정한다
+        except Exception:  # noqa: BLE001 - 연결 실패·응답 없음(TimeoutError)·이상한 값이면 DB 로 판정한다
             pass
     return Decimal(
         (
