@@ -36,7 +36,7 @@ async def test_my_budget_without_a_row_is_null_not_zero(client: AsyncClient, dev
     assert b["policy"] is None
     assert b["used_usd"] == 0  # 실지출은 숫자로 남는다
     # conftest 의 mock DB 에서 사용자의 팀도 None — 팀 미배정은 게이트웨이가 거부하는 상태다.
-    assert resp.json()["team"] == {"assigned": False, "budget_configured": False}
+    assert resp.json()["team"] == {"assigned": False, "budget_configured": False, "budget_exhausted": False}
 
 
 async def test_budget_over_the_numeric_column_is_a_422(client: AsyncClient, admin_headers: dict):

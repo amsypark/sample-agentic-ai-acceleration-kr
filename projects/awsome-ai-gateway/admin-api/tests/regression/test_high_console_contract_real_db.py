@@ -32,6 +32,8 @@
      이메일까지 화면·CSV 로 나갔다).
   9. 팀 예산 배정(PUT /admin/budgets/team/{id}/allocate)은 그 팀의 멤버에게만 쓴다 — 리더가 자기 팀
      URL 로 다른 팀 사용자의 개인 예산을 덮어쓰지 못한다(예전: user_id 의 소속을 보지 않았다).
+  10. /admin/my/budget 의 팀 예산 상태 — 미배정 / 예산 없음 / 있음, 그리고 예산이 있어도 게이트웨이가
+     거부하는 **소진** 상태(이번 KST 월의 budget_usages TEAM 행으로, 지난달 행은 섞이지 않는다).
 
 실행::
 
@@ -1027,9 +1029,15 @@ async def _my_budget(session, user_id):
 async def test_my_budget_reports_the_team_budget_the_gateway_will_check(session):
     """게이트웨이는 팀 예산이 없으면 거부한다(team_budget_unset). 카드가 "팀 예산 적용" 이라고 말하려면
     그게 사실이어야 한다 — 시드 팀(팀 예산 있음) / TEAM_B(없음) / 팀 미배정을 실제 행으로 가른다."""
-    assert (await _my_budget(session, U_A))["team"] == {"assigned": True, "budget_configured": True}
-    assert (await _my_budget(session, U_B))["team"] == {"assigned": True, "budget_configured": False}
-    assert (await _my_budget(session, U_TEAMLESS))["team"] == {"assigned": False, "budget_configured": False}
+    assert (await _my_budget(session, U_A))["team"] == {
+        "assigned": True, "budget_configured": True, "budget_exhausted": False,
+    }
+    assert (await _my_budget(session, U_B))["team"] == {
+        "assigned": True, "budget_configured": False, "budget_exhausted": False,
+    }
+    assert (await _my_budget(session, U_TEAMLESS))["team"] == {
+        "assigned": False, "budget_configured": False, "budget_exhausted": False,
+    }
 
 
 async def test_my_budget_zero_limit_has_no_usage_ratio(session):
@@ -1052,3 +1060,73 @@ async def test_my_budget_zero_limit_has_no_usage_ratio(session):
 
     b = (await _my_budget(session, U_TEAMLESS))["budget"]
     assert (b["limit_usd"], b["usage_pct"], b["policy"]) == (0, None, "HARD_BLOCK")
+
+
+def _previous_period(period: str) -> str:
+    year, month = map(int, period.split("-"))
+    return f"{year - 1}-12" if month == 1 else f"{year}-{month - 1:02d}"
+
+
+@pytest.mark.parametrize(
+    ("policy", "limit", "used_now", "used_last_month", "exhausted"),
+    [
+        ("HARD_BLOCK", "100", "100", None, True),
+        ("HARD_BLOCK", "100", "99.99", None, False),
+        ("HARD_BLOCK", "0", None, None, True),  # $0 — 사용 행이 아예 없어도 거부된다
+        ("SOFT_WARNING", "100", "110", None, True),
+        ("SOFT_WARNING", "100", "109.99", None, False),
+        ("THROTTLE", "100", "500", None, False),  # THROTTLE 은 거부하지 않는다(속도만 줄인다)
+        ("HARD_BLOCK", "100", None, "500", False),  # 지난달 사용액은 이번 달을 소진시키지 않는다
+    ],
+)
+async def test_my_budget_reports_an_exhausted_team_budget(
+    session, policy, limit, used_now, used_last_month, exhausted
+):
+    """팀 예산 행이 **있어도** 게이트웨이가 거부하는 상태를 카드가 알아야 한다 — 실제 budget_configs ·
+    budget_usages 행(이번 KST 월, TEAM, client IS NULL)으로 가른다. 게이트웨이의 팀 계층 규칙은
+    budget_check.lua 그대로다(HARD_BLOCK used>=limit · SOFT_WARNING used*100>=limit*110 · THROTTLE 거부 없음).
+    행은 이 트랜잭션 안에서만 만들고 되돌린다 — 모듈 공유 DB 의 다른 증명 숫자를 움직이지 않는다."""
+    from sqlalchemy import text
+
+    from app.core.usage_filters import current_kst_period
+
+    period = current_kst_period()
+    team_id, user_id = uuid.uuid4(), uuid.uuid4()
+    try:
+        await session.execute(
+            text(
+                "INSERT INTO auth.teams (id, dept_id, name) "
+                "SELECT :t, dept_id, 'Exhaust Team' FROM auth.teams WHERE id = :seed"
+            ),
+            {"t": team_id, "seed": SEED_TEAM_ID},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO auth.users (id, team_id, email, display_name, role, sso_subject) "
+                "VALUES (:u, :t, 'exhaust@example.com', 'exhaust', 'DEVELOPER', :sub)"
+            ),
+            {"u": user_id, "t": team_id, "sub": f"sub-{user_id}"},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO budget.budget_configs "
+                "(scope, scope_id, max_budget_usd, policy, allocated_by, effective_from) "
+                "VALUES ('TEAM', :t, :limit, CAST(:policy AS budget.budget_policy), :admin, CURRENT_DATE)"
+            ),
+            {"t": team_id, "limit": Decimal(limit), "policy": policy, "admin": SEED_ADMIN_ID},
+        )
+        for p, used in ((period, used_now), (_previous_period(period), used_last_month)):
+            if used is not None:
+                await session.execute(
+                    text(
+                        "INSERT INTO budget.budget_usages (scope, scope_id, period, client, used_usd, limit_usd) "
+                        "VALUES ('TEAM', :t, :p, NULL, :used, :limit)"
+                    ),
+                    {"t": team_id, "p": p, "used": Decimal(used), "limit": Decimal(limit)},
+                )
+
+        team = (await _my_budget(session, user_id))["team"]
+    finally:
+        await session.rollback()
+
+    assert team == {"assigned": True, "budget_configured": True, "budget_exhausted": exhausted}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import timedelta
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
@@ -13,10 +14,14 @@ from app.core.auth import CurrentUser, get_current_user
 from app.core.db import get_db_session
 from app.core.usage_filters import cost_period_filter, current_kst_period
 from app.models.auth import User
-from app.models.budget import BudgetConfig, BudgetScope, BudgetUsage
+from app.models.budget import BudgetConfig, BudgetPolicy, BudgetScope, BudgetUsage
 from app.models.usage import UsageLog
 
 router = APIRouter(prefix="/admin/my", tags=["My Usage"])
+
+# 게이트웨이 SOFT_WARNING 의 허용 상한(%) — DB 컬럼이 없어 admin-api 는 config 캐시에 쓰지 않는다.
+# budget_check.lua 의 기본값(soft_limit_pct=110)과 gateway-proxy DEFAULT_SOFT_LIMIT_PCT 가 쓰인다.
+_GATEWAY_SOFT_LIMIT_PCT = 110
 
 
 @router.get("/budget")
@@ -85,10 +90,20 @@ async def get_my_budget(
         await session.execute(select(User.team_id).where(User.id == user.user_id))
     ).scalar_one_or_none()
     team_budget_configured = False
+    # ⚠️ 팀 예산 행이 **있어도** 게이트웨이가 거부하는 상태가 있다 — 그 팀 예산이 소진됐을 때다. 행이 있다는
+    #    사실(budget_configured)과 따로 낸다: 소진을 "미설정" 으로 접으면 카드가 있는 예산을 없다고 말한다.
+    #    규칙은 게이트웨이 팀 계층 판정(redis_scripts/budget_check.lua) 그대로다 — 실 Redis 에서 확인:
+    #      HARD_BLOCK   used >= limit               ($0 은 항상 거부)
+    #      SOFT_WARNING used * 100 >= limit * 110   ($0 은 항상 거부. Redis 가 죽었을 때의 DB 폴백만
+    #                                                `limit > 0` 조건 때문에 $0 을 통과시킨다 — 평소 경로를 따른다)
+    #      THROTTLE     거부하지 않는다(RPM 만 줄인다)
+    #    used 는 이번 KST 월의 budget_usages TEAM 행이다 — 게이트웨이 DB 폴백이 읽는 행이고, 게이트웨이의 Redis
+    #    카운터와 같은 비용 스트림(cost-recorder-worker)으로 쌓인다(그쪽이 flush 주기만큼 앞설 수 있다).
+    team_budget_exhausted = False
     if team_id is not None:
         team_cfg = (
             await session.execute(
-                select(BudgetConfig.id)
+                select(BudgetConfig)
                 .where(
                     BudgetConfig.scope == BudgetScope.TEAM,
                     BudgetConfig.scope_id == team_id,
@@ -99,6 +114,24 @@ async def get_my_budget(
             )
         ).scalar_one_or_none()
         team_budget_configured = team_cfg is not None
+        if team_cfg is not None:
+            team_used = Decimal(
+                (
+                    await session.execute(
+                        select(func.coalesce(func.sum(BudgetUsage.used_usd), 0)).where(
+                            BudgetUsage.scope == BudgetScope.TEAM,
+                            BudgetUsage.scope_id == team_id,
+                            BudgetUsage.period == period,
+                            BudgetUsage.client.is_(None),
+                        )
+                    )
+                ).scalar_one()
+            )
+            team_limit = team_cfg.max_budget_usd
+            if team_cfg.policy == BudgetPolicy.HARD_BLOCK:
+                team_budget_exhausted = team_used >= team_limit
+            elif team_cfg.policy == BudgetPolicy.SOFT_WARNING:
+                team_budget_exhausted = team_used * 100 >= team_limit * _GATEWAY_SOFT_LIMIT_PCT
 
     return {
         "user_id": str(user.user_id),
@@ -110,7 +143,11 @@ async def get_my_budget(
             "usage_pct": round(usage_pct, 1) if usage_pct is not None else None,
             "policy": policy,
         },
-        "team": {"assigned": team_id is not None, "budget_configured": team_budget_configured},
+        "team": {
+            "assigned": team_id is not None,
+            "budget_configured": team_budget_configured,
+            "budget_exhausted": team_budget_exhausted,
+        },
     }
 
 

@@ -16,7 +16,7 @@ import { MyBudgetCard } from '@/components/my/MyBudgetCard';
 
 function data(
   budget: Partial<MyBudgetResponse['budget']>,
-  team: MyBudgetResponse['team'] = { assigned: true, budget_configured: true },
+  team: MyBudgetResponse['team'] = { assigned: true, budget_configured: true, budget_exhausted: false },
 ): MyBudgetResponse {
   return {
     user_id: 'u1',
@@ -73,14 +73,26 @@ describe('MyBudgetCard', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('한도가 $0 이라 게이트웨이가 요청을 차단합니다');
   });
 
-  it('0 원 THROTTLE 은 차단이 아니라 속도 제한이다', () => {
+  it('0 원 THROTTLE 은 요청을 막지도 늦추지도 않는다 — 빨간 경고로 그리지 않는다', () => {
+    // 게이트웨이 budget_check.lua 는 limit > 0 일 때만 사용률을 계산한다. $0 에서는 0 으로 남아 모든 임계값
+    // (1~100) 아래이므로 통과하고 쓰로틀도 걸리지 않는다(실 Redis 로 확인). 예전 문구 "요청 속도가 제한됩니다" 는 거짓이었다.
     render(
       <MyBudgetCard
         data={data({ limit_usd: 0, usage_pct: null, remaining_usd: 0, used_usd: 0, policy: 'THROTTLE' })}
       />,
     );
-    expect(screen.getByRole('alert')).toHaveTextContent('요청 속도가 제한됩니다');
-    expect(screen.getByRole('alert')).not.toHaveTextContent('차단');
+    expect(screen.getByText(/막거나 늦추지 않습니다/)).toBeInTheDocument();
+    expect(screen.queryByText(/속도가 제한/)).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('0 원 SOFT_WARNING 은 차단이다 (대조군 — $0 에서 used*100 >= limit*110 은 항상 참)', () => {
+    render(
+      <MyBudgetCard
+        data={data({ limit_usd: 0, usage_pct: null, remaining_usd: 0, used_usd: 0, policy: 'SOFT_WARNING' })}
+      />,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent('한도가 $0 이라 게이트웨이가 요청을 차단합니다');
   });
 
   it('팀 미배정 사용자에게 "팀 예산 적용" 이라고 말하지 않는다 — 게이트웨이가 거부한다', () => {
@@ -94,6 +106,15 @@ describe('MyBudgetCard', () => {
     render(<MyBudgetCard data={data({}, { assigned: true, budget_configured: false })} />);
     expect(screen.getByText('한도: $100.00')).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent('팀 예산이 설정되지 않아 게이트웨이가 요청을 거부합니다');
+  });
+
+  it('팀 예산이 소진됐으면 거부된다고 알린다 — 예산 행이 있어도 "팀 예산 적용" 이 아니다', () => {
+    render(
+      <MyBudgetCard data={data(UNSET, { assigned: true, budget_configured: true, budget_exhausted: true })} />,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent('팀 예산이 소진되어 게이트웨이가 요청을 거부합니다');
+    expect(screen.queryByText('개인 예산 미설정 (팀 예산 적용)')).toBeNull();
+    expect(screen.getByText('개인 예산 미설정')).toBeInTheDocument();
   });
 
   it('팀 예산이 있으면 경고하지 않는다 (대조군)', () => {

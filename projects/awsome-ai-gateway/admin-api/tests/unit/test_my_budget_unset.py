@@ -19,6 +19,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from app.core.auth import CurrentUser
 from app.models.auth import UserRole
 from app.models.budget import BudgetPolicy
@@ -44,15 +46,23 @@ def _result(**attrs) -> MagicMock:
     return r
 
 
-def _session(config, used: str, *, team_id=TEAM_ID, team_budget: bool = True) -> AsyncMock:
-    """조회 순서: 개인 예산 행 → 이번 달 지출 → 사용자의 팀 → (팀이 있으면) 팀 활성 예산 행."""
+TEAM_BUDGET = SimpleNamespace(max_budget_usd=Decimal("5000"), policy=BudgetPolicy.HARD_BLOCK)
+
+
+def _session(
+    config, used: str, *, team_id=TEAM_ID, team_budget=TEAM_BUDGET, team_used: str = "0"
+) -> AsyncMock:
+    """조회 순서: 개인 예산 행 → 이번 달 지출 → 사용자의 팀 → (팀이 있으면) 팀 활성 예산 행
+    → (팀 예산이 있으면) 이번 달 팀 사용액(budget_usages)."""
     results = [
         _result(scalar_one_or_none=config),
         _result(scalar_one=Decimal(used)),
         _result(scalar_one_or_none=team_id),
     ]
     if team_id is not None:
-        results.append(_result(scalar_one_or_none=uuid.uuid4() if team_budget else None))
+        results.append(_result(scalar_one_or_none=team_budget))
+        if team_budget is not None:
+            results.append(_result(scalar_one=Decimal(team_used)))
     session = AsyncMock()
     session.execute = AsyncMock(side_effect=results)
     return session
@@ -108,15 +118,44 @@ async def test_zero_limit_is_a_real_limit_not_unset():
 async def test_teamless_user_is_reported_as_without_a_team():
     """팀 미배정 사용자에게 "팀 예산 적용" 은 거짓이다 — 게이트웨이는 팀 예산이 없으니 거부한다."""
     out = await _my(None, team_id=None)
-    assert out["team"] == {"assigned": False, "budget_configured": False}
+    assert out["team"] == {"assigned": False, "budget_configured": False, "budget_exhausted": False}
 
 
 async def test_team_without_a_budget_is_reported():
-    out = await _my(None, team_budget=False)
-    assert out["team"] == {"assigned": True, "budget_configured": False}
+    out = await _my(None, team_budget=None)
+    assert out["team"] == {"assigned": True, "budget_configured": False, "budget_exhausted": False}
 
 
 async def test_team_with_a_budget_is_reported_as_configured():
-    """대조군 — 팀 예산이 있으면 그대로 적용된다."""
+    """대조군 — 팀 예산이 있고 남아 있으면 그대로 적용된다."""
     out = await _my(None)
-    assert out["team"] == {"assigned": True, "budget_configured": True}
+    assert out["team"] == {"assigned": True, "budget_configured": True, "budget_exhausted": False}
+
+
+# ── 팀 예산 소진 — 게이트웨이의 팀 계층 거부 규칙(redis_scripts/budget_check.lua) 그대로 ──────────
+#
+# 팀 예산이 **있어도** 게이트웨이가 거부하는 상태가 있다. 카드가 그때 아무 말도 하지 않으면 모든 요청이
+# 거부되는 사용자에게 쓸 수 있는 것처럼 보인다. 규칙은 실 Redis 에서 Lua 를 돌려 확인한 그대로다:
+#   HARD_BLOCK   used >= limit                 ($0 은 항상 거부)
+#   SOFT_WARNING used * 100 >= limit * 110     ($0 은 항상 거부 — Lua. DB 폴백만 limit > 0 이라 통과)
+#   THROTTLE     거부하지 않는다(속도만 줄인다) — 소진이어도 false
+
+
+@pytest.mark.parametrize(
+    ("policy", "limit", "team_used", "exhausted"),
+    [
+        (BudgetPolicy.HARD_BLOCK, "100", "99.99", False),
+        (BudgetPolicy.HARD_BLOCK, "100", "100", True),
+        (BudgetPolicy.HARD_BLOCK, "0", "0", True),
+        (BudgetPolicy.SOFT_WARNING, "100", "109.99", False),
+        (BudgetPolicy.SOFT_WARNING, "100", "110", True),
+        (BudgetPolicy.SOFT_WARNING, "0", "0", True),
+        (BudgetPolicy.THROTTLE, "100", "500", False),
+        (BudgetPolicy.THROTTLE, "0", "0", False),
+    ],
+)
+async def test_team_budget_exhausted_follows_the_gateway_deny_rule(policy, limit, team_used, exhausted):
+    team_budget = SimpleNamespace(max_budget_usd=Decimal(limit), policy=policy)
+    out = await _my(None, team_budget=team_budget, team_used=team_used)
+    assert out["team"]["budget_configured"] is True, "소진이어도 예산 행은 있다 — '미설정' 이라고 말하면 거짓이다"
+    assert out["team"]["budget_exhausted"] is exhausted

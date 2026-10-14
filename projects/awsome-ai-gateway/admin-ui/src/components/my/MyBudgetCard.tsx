@@ -32,18 +32,26 @@ export function MyBudgetCard({ data }: { data: MyBudgetResponse }) {
   //    없으므로 team 이전과 같게 그린다(거부를 지어내지 않는다). 예전엔 `data.team.assigned` 가 TypeError.
   const teamAssigned = data.team?.assigned ?? true;
   const teamBudgetConfigured = data.team?.budget_configured ?? true;
+  // 팀 예산 행이 있어도 소진됐으면 게이트웨이가 거부한다(HARD_BLOCK used >= limit, SOFT_WARNING 110%).
+  const teamBudgetExhausted = data.team?.budget_exhausted ?? false;
   const teamDenial = !teamAssigned
     ? '팀에 배정되지 않아 게이트웨이가 요청을 거부합니다(팀 예산 필요). 관리자에게 문의하세요.'
     : !teamBudgetConfigured
       ? '팀 예산이 설정되지 않아 게이트웨이가 요청을 거부합니다. 관리자에게 문의하세요.'
-      : null;
-  // ⚠️ $0 한도는 사용률이 없다(서버가 null). HARD_BLOCK/SOFT_WARNING 은 막고(used >= 0) THROTTLE 은
-  //    속도만 줄인다 — 예전엔 초록 막대 "0.0%" 로 '아직 안 씀' 처럼 그렸다.
+      : teamBudgetExhausted
+        ? '팀 예산이 소진되어 게이트웨이가 요청을 거부합니다. 관리자에게 문의하세요.'
+        : null;
+  // ⚠️ $0 한도는 사용률이 없다(서버가 null) — 예전엔 초록 막대 "0.0%" 로 '아직 안 씀' 처럼 그렸다.
+  //    게이트웨이(redis_scripts/budget_check.lua)의 $0 판정은 정책마다 다르다(실 Redis 로 확인):
+  //      HARD_BLOCK   used >= 0          → 항상 차단
+  //      SOFT_WARNING used*100 >= 0*110  → 항상 차단(Redis 가 죽었을 때의 DB 폴백만 limit > 0 조건으로 통과)
+  //      THROTTLE     사용률을 limit > 0 일 때만 계산 → 0 으로 남아 모든 임계값(1~100) 아래 → 막지도 늦추지도 않는다
+  //    예전 THROTTLE 문구 "요청 속도가 제한됩니다" 는 거짓이었다 — 거부가 아니므로 빨간 경고로도 그리지 않는다.
   const zeroLimitNote =
-    b.limit_usd === 0
-      ? b.policy === 'THROTTLE'
-        ? '한도가 $0 이라 요청 속도가 제한됩니다.'
-        : '한도가 $0 이라 게이트웨이가 요청을 차단합니다.'
+    b.limit_usd === 0 && b.policy !== 'THROTTLE' ? '한도가 $0 이라 게이트웨이가 요청을 차단합니다.' : null;
+  const zeroThrottleNote =
+    b.limit_usd === 0 && b.policy === 'THROTTLE'
+      ? '한도가 $0 이지만 쓰로틀링 정책은 이 한도로 요청을 막거나 늦추지 않습니다.'
       : null;
 
   return (
@@ -61,6 +69,7 @@ export function MyBudgetCard({ data }: { data: MyBudgetResponse }) {
             {zeroLimitNote && <p>{zeroLimitNote}</p>}
           </div>
         )}
+        {zeroThrottleNote && <p className="text-sm text-muted-foreground">{zeroThrottleNote}</p>}
 
         {b.limit_usd == null ? (
           // 개인 예산 행이 없음(미설정). 지어낸 $0 한도 / 음수 잔여 / 하드 차단 대신 중립 상태로

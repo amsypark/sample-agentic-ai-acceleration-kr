@@ -25,6 +25,9 @@ export interface MyBudgetResponse {
   team?: {
     assigned: boolean;
     budget_configured: boolean;
+    // 팀 예산 행이 있어도 게이트웨이가 거부하는 상태(HARD_BLOCK 소진 · SOFT_WARNING 110% · $0). THROTTLE 은
+    // 거부하지 않으므로 항상 false. optional — 이 필드 이전의 admin-api 는 보내지 않는다.
+    budget_exhausted?: boolean;
   };
 }
 
