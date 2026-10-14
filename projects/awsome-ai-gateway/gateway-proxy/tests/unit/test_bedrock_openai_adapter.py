@@ -442,3 +442,197 @@ async def test_count_tokens_returns_zero_rather_than_inventing_a_number():
     """The OpenAI wires have no count endpoint and Bedrock CountTokens rejects these models,
     so 0 keeps the (status, input_tokens) contract without fabricating a count."""
     assert await _adapter(MagicMock()).count_tokens(b"{}", MODEL) == (200, 0)
+
+
+# ── chat 스트림의 usage: bedrock-runtime 은 요청하지 않으면 usage 를 싣지 않는다 ───────
+#
+# 측정(2026-10, us-east-2, /openai/v1/chat/completions, stream=true, us.openai.gpt-6-luna):
+#   stream_options 없음                 → 청크 4개, usage 어디에도 없음
+#   stream_options.include_usage=true   → 청크 5개, 마지막(choices: [])에 usage
+# 아래 픽스처는 그 청크 **모양**을 재구성한 것이다(원본 바이트가 아니다). 대역 상류는 측정대로
+# 요청 본문에 include_usage 가 있을 때만 usage 청크를 보낸다.
+
+_CHUNK_HEAD = b'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,'
+_CHAT_ROLE = _CHUNK_HEAD + (
+    b'"model":"openai.gpt-6-luna","choices":[{"index":0,'
+    b'"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n'
+)
+_CHAT_TEXT = _CHUNK_HEAD + (
+    b'"model":"openai.gpt-6-luna","choices":[{"index":0,'
+    b'"delta":{"content":"Hello there"},"finish_reason":null}]}\n\n'
+)
+_CHAT_STOP = _CHUNK_HEAD + (
+    b'"model":"openai.gpt-6-luna","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+)
+_CHAT_USAGE = _CHUNK_HEAD + (
+    b'"model":"openai.gpt-6-luna","choices":[],"usage":{"prompt_tokens":12,'
+    b'"completion_tokens":6,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":0},'
+    b'"completion_tokens_details":{"reasoning_tokens":0}}}\n\n'
+)
+_CHAT_DONE = b"data: [DONE]\n\n"
+CHAT_WITHOUT_USAGE = [_CHAT_ROLE, _CHAT_TEXT, _CHAT_STOP, _CHAT_DONE]
+CHAT_WITH_USAGE = [_CHAT_ROLE, _CHAT_TEXT, _CHAT_STOP, _CHAT_USAGE, _CHAT_DONE]
+
+
+def _measured_runtime_http():
+    """요청 본문의 include_usage 에 따라 측정된 청크를 돌려주는 bedrock-runtime 대역."""
+    sent: list[bytes] = []
+
+    def _stream(method, url, content=None, headers=None):
+        sent.append(content)
+        opts = json.loads(content).get("stream_options") or {}
+        chunks = CHAT_WITH_USAGE if opts.get("include_usage") else CHAT_WITHOUT_USAGE
+        return _FakeStream(200, {"x-amzn-requestid": REQ_ID}, chunks=chunks)
+
+    http = MagicMock()
+    http.stream = MagicMock(side_effect=_stream)
+    return http, sent
+
+
+_CHAT_REQ = {"model": MODEL, "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stream_options",
+    [None, {"include_usage": False}, {"continuous_usage_stats": True}],
+    ids=["absent", "false", "other-keys"],
+)
+async def test_chat_stream_forces_include_usage_before_signing(stream_options):
+    """⚠️ 본문은 SigV4 서명 대상이다 — 강제는 서명 **전에**, 서명한 그 바이트를 보낸다."""
+    req = dict(_CHAT_REQ)
+    if stream_options is not None:
+        req["stream_options"] = stream_options
+    http, sent = _measured_runtime_http()
+    signer = _signer()
+    await _adapter(http, signer).invoke_stream(
+        json.dumps(req).encode(), MODEL, profile=_profile(), endpoint=ENDPOINT, wire="chat"
+    )
+    signed = signer.sign.await_args.kwargs["body"]
+    assert sent == [signed], "서명한 바이트와 보낸 바이트가 다르다(서명 불일치)"
+    opts = json.loads(signed)["stream_options"]
+    assert opts["include_usage"] is True
+    if stream_options and "continuous_usage_stats" in stream_options:
+        assert opts["continuous_usage_stats"] is True, "클라이언트의 다른 stream_options 를 지웠다"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_already_asking_for_usage_is_sent_byte_for_byte():
+    raw = json.dumps({**_CHAT_REQ, "stream_options": {"include_usage": True}}).encode()
+    http, sent = _measured_runtime_http()
+    await _adapter(http).invoke_stream(
+        raw, MODEL, profile=_profile(), endpoint=ENDPOINT, wire="chat"
+    )
+    assert sent == [raw]
+
+
+@pytest.mark.asyncio
+async def test_responses_wire_body_is_not_touched():
+    raw = json.dumps({"model": MODEL, "stream": True, "input": "hi"}).encode()
+    stream = _FakeStream(200, {"x-amzn-requestid": REQ_ID}, lines=SSE_LINES)
+    http = _streaming_http(stream)
+    await _adapter(http).invoke_stream(
+        raw, MODEL, profile=_profile(), endpoint=ENDPOINT, wire="responses"
+    )
+    assert http.stream.call_args.kwargs["content"] == raw
+
+
+async def _route_chat(monkeypatch, *, client_asks_usage: bool):
+    """실제 _handle_openai + 실제 BedrockOpenAIAdapter(대역 HTTP·서명기)로 런타임 chat 스트림."""
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from starlette.datastructures import Headers
+
+    from app.routers import openai_compat
+    from app.schemas.domain import (
+        ApiFormat,
+        AuthContext,
+        AuthType,
+        ModelConfigSchema,
+        ModelPricingSchema,
+        ModelStatus,
+        ProviderType,
+        Role,
+    )
+
+    cfg = ModelConfigSchema(
+        provider_model_id="us.openai.gpt-6-luna",
+        alias="gpt-6-luna",
+        provider=ProviderType.BEDROCK_RUNTIME_OPENAI,
+        api_format=ApiFormat.OPENAI_RESPONSES,
+        endpoint=ENDPOINT,
+        pricing=ModelPricingSchema(input_per_1k=Decimal("0.0002"), output_per_1k=Decimal("0.0012")),
+        status=ModelStatus.ACTIVE,
+    )
+
+    async def _resolve(redis, db, alias):
+        return cfg
+
+    async def _no_limits(**_k):
+        return None
+
+    monkeypatch.setattr(openai_compat._router_service, "resolve_openai_model", _resolve)
+    monkeypatch.setattr("app.services.rate_limit_enforcement.enforce_rate_limits", _no_limits)
+    http, sent = _measured_runtime_http()
+    adapter = _adapter(http)
+    usages: list = []
+
+    class _Recorder:
+        async def finalize(self, redis, auth_context, model_config, usage, *a, **k):
+            usages.append(usage)
+
+    async def _load(*_a, **_k):
+        return _profile()
+
+    app_state = SimpleNamespace(
+        provider_registry=SimpleNamespace(get=lambda _p: adapter),
+        cost_recorder=_Recorder(),
+        tokenizer=None,
+        body_logger=None,
+        metrics=None,
+        agentcore_mcp_client=None,
+        routing_profile_loader=SimpleNamespace(load=_load),
+    )
+    body = {"model": "gpt-6-luna", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+    if client_asks_usage:
+        body["stream_options"] = {"include_usage": True}
+    auth = AuthContext(user_id="u-1", team_id="t-1", dept_id="d-1", roles=[Role.USER],
+                       auth_type=AuthType.VIRTUAL_KEY)
+    state = {"auth_context": auth, "client": "codex", "_redis": None,
+             "_session_factory": None, "request_id": "req-chat"}
+
+    class _Req:
+        scope = {"state": state}
+        app = SimpleNamespace(state=app_state)
+        headers = Headers()
+
+        async def body(self) -> bytes:
+            return json.dumps(body).encode()
+
+    resp = await openai_compat._handle_openai(_Req(), "/v1/chat/completions")
+    client_bytes = b"".join([c async for c in resp.body_iterator])
+    from app.services import bg_tasks
+
+    await bg_tasks.drain(timeout=2.0)
+    return client_bytes, usages, sent
+
+
+@pytest.mark.asyncio
+async def test_runtime_chat_stream_is_billed_from_real_usage(monkeypatch):
+    """⚠️ 고치기 전: 상류가 usage 를 아예 안 보내 실제 usage 없이 청구됐다(여기서는 0)."""
+    client_bytes, usages, _sent = await _route_chat(monkeypatch, client_asks_usage=False)
+    (usage,) = usages
+    assert (usage.input_tokens, usage.output_tokens) == (12, 6), usage
+    assert not usage.estimated
+    # 클라이언트는 요청하지 않은 usage 청크를 받지 않는다(OpenAI 계약과 같은 모양).
+    assert b'"choices":[]' not in client_bytes and b'"usage"' not in client_bytes
+    assert b"Hello there" in client_bytes and client_bytes.endswith(_CHAT_DONE)
+
+
+@pytest.mark.asyncio
+async def test_runtime_chat_stream_forwards_usage_the_client_asked_for(monkeypatch):
+    client_bytes, usages, _sent = await _route_chat(monkeypatch, client_asks_usage=True)
+    (usage,) = usages
+    assert (usage.input_tokens, usage.output_tokens) == (12, 6)
+    assert _CHAT_USAGE in client_bytes, "클라이언트가 요청한 usage 청크를 지웠다"

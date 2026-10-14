@@ -123,6 +123,32 @@ def _region_for(endpoint: str, profile) -> str:
     return region
 
 
+def with_chat_usage(request_body: bytes) -> bytes:
+    """chat 스트림 본문에 ``stream_options.include_usage=true`` 를 강제한다.
+
+    ⚠️ 측정(us-east-2, /openai/v1/chat/completions, stream=true): bedrock-runtime 은 이것이
+       없으면 usage 를 **어디에도** 싣지 않는다(청크 4개). 켜면 마지막 청크(``choices: []``)에
+       usage 가 온다(청크 5개). 없으면 모든 chat 스트림이 실제 usage 없이 청구된다. vLLM 경로
+       (openmodel_adapter._build_request_body)와 같은 강제다.
+
+    ⚠️ 본문은 SigV4 서명 대상이므로 **서명 전에** 바꾸고, 서명한 그 바이트를 보내야 한다.
+       이미 켜져 있으면 바이트를 그대로 둔다. 다른 stream_options 키는 보존한다. 클라이언트가
+       요청하지 않았으면 usage 청크는 라우터가 클라이언트 스트림에서 감춘다
+       (openai_sse_stream ``strip_usage_chunk``).
+    """
+    try:
+        body = json.loads(request_body)
+    except (ValueError, TypeError):
+        return request_body
+    if not isinstance(body, dict):
+        return request_body
+    opts = body.get("stream_options")
+    if isinstance(opts, dict) and opts.get("include_usage") is True:
+        return request_body
+    body["stream_options"] = {**(opts if isinstance(opts, dict) else {}), "include_usage": True}
+    return json.dumps(body).encode()
+
+
 def _error_chunk(wire: str, message: str) -> bytes:
     """One error frame, in whatever framing the wire's downstream consumer expects.
 
@@ -252,6 +278,10 @@ class BedrockOpenAIAdapter(ProviderAdapter):
         wire: str = "responses",
         **kwargs,
     ) -> tuple[int, AsyncIterator[bytes], dict, str | None]:
+        if wire == "chat":
+            # usage 를 받으려면 서명 전에 요청해야 한다(with_chat_usage). 아래 서명과 전송이 같은
+            # request_body 를 쓴다.
+            request_body = with_chat_usage(request_body)
         try:
             url, headers = await self._prepare(request_body, model_id, endpoint, profile, wire)
         except Exception:

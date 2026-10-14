@@ -156,6 +156,12 @@ async def responses(request: Request) -> StreamingResponse | JSONResponse:
     return await _handle_responses(request)
 
 
+def _client_wants_usage(req_data) -> bool:
+    """클라이언트 스스로 ``stream_options.include_usage`` 를 요청했는지(라우터가 본 원래 body)."""
+    opts = req_data.get("stream_options") if isinstance(req_data, dict) else None
+    return isinstance(opts, dict) and opts.get("include_usage") is True
+
+
 async def _handle_openai(request: Request, path: str):
     state = request.scope.get("state", {})
     auth_context = state.get("auth_context")
@@ -392,6 +398,10 @@ async def _handle_openai(request: Request, path: str):
                 # 잘린 스트림의 프롬프트(usage 가 마지막 청크에만 온다). 비-2xx 는 상류가 받지
                 # 않은 요청이라 프롬프트를 청구하지 않는다.
                 prompt_usage_hook=_estimate_prompt if 200 <= status < 300 else None,
+                # 런타임 plane 은 usage 를 받으려고 include_usage 를 강제로 켠다
+                # (bedrock_openai_adapter.with_chat_usage). 클라이언트가 요청하지 않았으면 그
+                # usage 청크(choices: [])는 클라이언트 스트림에서 감춘다.
+                strip_usage_chunk=is_bedrock_runtime and not _client_wants_usage(req_data),
             ),
             status_code=status,
             media_type="text/event-stream",

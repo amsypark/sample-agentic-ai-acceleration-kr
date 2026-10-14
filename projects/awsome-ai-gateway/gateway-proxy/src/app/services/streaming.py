@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
@@ -58,6 +59,26 @@ async def _with_prompt_estimate(usage: TokenUsage, hook: PromptUsageHook) -> Tok
             "total_tokens": prompt + usage.output_tokens,
             "estimated": True,
         }
+    )
+
+
+#: SSE 프레임 경계(빈 줄). strip_usage_chunk 모드가 네트워크 청크를 프레임 단위로 다시 묶는다.
+_SSE_FRAME_END = re.compile(rb"\r?\n\r?\n")
+
+
+def _is_usage_only_frame(frame: bytes) -> bool:
+    """``data: {..., "choices": [], "usage": {...}}`` — include_usage 가 붙이는 마지막 청크."""
+    line = frame.strip()
+    if not line.startswith(b"data:"):
+        return False
+    try:
+        data = json.loads(line[len(b"data:"):].strip())
+    except (ValueError, TypeError):
+        return False
+    return (
+        isinstance(data, dict)
+        and data.get("choices") == []
+        and isinstance(data.get("usage"), dict)
     )
 
 
@@ -397,6 +418,7 @@ async def openai_sse_stream(
     tokenizer_hook: TokenizerHook = None,
     on_complete: OnComplete = None,
     prompt_usage_hook: PromptUsageHook = None,
+    strip_usage_chunk: bool = False,
 ) -> AsyncIterator[bytes]:
     """OpenAI-compatible SSE chunks → passthrough bytes (no re-formatting).
 
@@ -404,6 +426,11 @@ async def openai_sse_stream(
     `data: [DONE]\\n\\n`). A single httpx chunk may contain one or many
     frames. We yield chunks as-is and scan each chunk for a `usage` object
     (vLLM emits it on the final chunk when `stream_options.include_usage`).
+
+    ``strip_usage_chunk``: usage 를 게이트웨이가 강제로 켰는데(bedrock-runtime chat —
+    bedrock_openai_adapter.with_chat_usage) 클라이언트는 요청하지 않았을 때. 청크를 완결된 프레임
+    단위로 다시 묶어 usage 를 읽고, usage 전용 프레임(``choices: []``)만 클라이언트에서 뺀다.
+    기본(False)은 지금까지와 바이트 단위로 같다(vLLM 경로).
 
     Edge case handling mirrors `bedrock_anthropic_sse_stream`:
     - Client disconnect: stop, background-drain so usage is still recorded.
@@ -424,6 +451,8 @@ async def openai_sse_stream(
     complete_fired = False
     #: 상류가 생성 청크(choices)를 하나라도 보냈는지 — 요청을 받아들였다는 뜻(PromptUsageHook).
     upstream_started = False
+    #: strip_usage_chunk 모드에서 아직 끝나지 않은 프레임 조각(네트워크 청크는 프레임 경계와 무관).
+    pending_tail = b""
 
     def _emit_error_chunk(err_type: str, message: str) -> bytes:
         payload = {"error": {"type": err_type, "message": message}}
@@ -465,6 +494,36 @@ async def openai_sse_stream(
                 # sends them and would otherwise be billed as if nothing were cached.
                 found = extract_chat_usage(u)
         return found
+
+    def _scan_chunk(chunk: bytes) -> bytes:
+        """usage 를 읽고 클라이언트에 보낼 바이트를 돌려준다(strip_usage_chunk docstring)."""
+        nonlocal latest_usage, pending_tail
+        if not strip_usage_chunk or not isinstance(chunk, bytes):
+            if u := _scan_usage(chunk):
+                latest_usage = u
+            return chunk
+        buf = pending_tail + chunk
+        out: list[bytes] = []
+        start = 0
+        for m in _SSE_FRAME_END.finditer(buf):
+            frame = buf[start:m.end()]
+            start = m.end()
+            if u := _scan_usage(frame):
+                latest_usage = u
+            if not _is_usage_only_frame(frame):
+                out.append(frame)
+        pending_tail = buf[start:]
+        return b"".join(out)
+
+    def _flush_tail() -> bytes:
+        """끝에 남은(빈 줄로 닫히지 않은) 프레임 조각 — strip 모드에서만 생긴다."""
+        nonlocal latest_usage, pending_tail
+        tail, pending_tail = pending_tail, b""
+        if not tail:
+            return b""
+        if u := _scan_usage(tail):
+            latest_usage = u
+        return b"" if _is_usage_only_frame(tail) else tail
 
     async def _estimate_if_needed(usage: TokenUsage | None) -> TokenUsage | None:
         """KI-08: usage 없고 누적 텍스트 있으면 tokenizer 역산."""
@@ -557,8 +616,8 @@ async def openai_sse_stream(
                 if time.monotonic() > deadline:
                     logger.warning("stream_drain_timeout")
                     break
-                if u := _scan_usage(chunk):
-                    latest_usage = u
+                _scan_chunk(chunk)  # usage 만 읽는다(클라이언트는 이미 없다)
+            _flush_tail()
         except Exception:
             logger.exception("stream_drain_error")
         finally:
@@ -577,6 +636,8 @@ async def openai_sse_stream(
             try:
                 chunk = await asyncio.wait_for(iterator.__anext__(), timeout=idle_timeout)
             except StopAsyncIteration:
+                if tail := _flush_tail():  # try 안에서 — 끊김 핸들러가 이 yield 도 덮는다
+                    yield tail
                 break
             except TimeoutError:
                 logger.warning("stream_idle_timeout", idle_timeout=idle_timeout)
@@ -587,8 +648,9 @@ async def openai_sse_stream(
                 )
                 return
 
-            if u := _scan_usage(chunk):
-                latest_usage = u
+            chunk = _scan_chunk(chunk)
+            if not chunk:
+                continue  # usage 전용 프레임만 있었다(strip 모드)
             if on_complete is not None:
                 accumulated_frames.append(
                     chunk.decode("utf-8", errors="replace")
