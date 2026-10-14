@@ -120,17 +120,17 @@ cd deployment/terraform/environments/llm-gateway-dev
 모듈에 기본값이 **없는 필수 변수**입니다. 애플리케이션이 `global.anthropic.*` cross-region inference profile 로 호출하므로 **inference-profile ARN 과 foundation-model ARN 을 모두** 넣어야 합니다.
 
 ```hcl
-# deployment/terraform/environments/llm-gateway-<env>/variables.tf 기본값 (6개)
-"arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-4-*",
-"arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-*",
-"arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-*",
+# deployment/terraform/environments/llm-gateway-<env>/variables.tf 기본값 중 Anthropic 부분
+"arn:aws:bedrock:*::foundation-model/anthropic.claude-*",            # 계열·세대별로 좁히지 말 것(아래)
 "arn:aws:bedrock:*::inference-profile/global.anthropic.claude-*",
 "arn:aws:bedrock:*:*:inference-profile/global.anthropic.claude-*",   # 계정 스코프 형태도 필요
 "arn:aws:bedrock:ap-northeast-2::inference-profile/apac.anthropic.claude-*",
 ```
-([llm-gateway-dev/variables.tf:123-138](../../deployment/terraform/environments/llm-gateway-dev/variables.tf#L123-L138))
+(전체 목록은 `llm-gateway-<env>/variables.tf` 의 `bedrock_allowed_model_arns` — GPT runtime 평면 줄과 `project/default` 포함)
 
 - **한쪽만 넣으면 403** 입니다. IAM 이 inference-profile 리소스와 그 아래 foundation-model 을 **둘 다** 평가합니다.
+- foundation-model 줄을 `claude-opus-4-*` 처럼 계열·세대별로 적으면 **신모델마다 조용한 AccessDenied** 가 납니다
+  (Claude 5, Haiku 5.5 에서 실제로 났다). 프로파일 줄은 세대와 무관하게 매칭되므로 막히는 쪽은 foundation-model 이다.
 - AWS 소유 형태(`:*::inference-profile/`)와 **계정 스코프 형태(`:*:*:inference-profile/`)가 둘 다** 필요합니다.
 - `bedrock:CountTokens` 도 같은 리소스 목록을 씁니다 → 목록이 좁으면 토큰 카운트 preflight 도 같이 깨집니다.
 - **GPT 는 평면에 따라 다릅니다.** Mantle(`codex-gpt-*`)은 `bedrock-mantle:` 네임스페이스라 이 목록과 무관하지만,
