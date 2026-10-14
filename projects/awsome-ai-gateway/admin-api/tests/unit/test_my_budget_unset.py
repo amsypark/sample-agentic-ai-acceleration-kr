@@ -183,7 +183,8 @@ async def test_team_budget_exhausted_follows_the_gateway_deny_rule(policy, limit
 #
 # budget_usages 는 cost-recorder-worker 가 배치로 쌓아 카운터보다 늦다. 게이트웨이는 카운터로 거부하므로, DB 만
 # 보면 이미 거부되는 팀을 '여유 있음' 으로 보인다. 키가 없으면 게이트웨이는 0 으로 읽고(팀 카운터는 DB 에서
-# 복원하지 않는다) 통과시킨다. Redis 를 쓸 수 없을 때만 budget_usages 로 판정한다(게이트웨이의 DB 폴백과 같은 행).
+# 복원하지 않는다) 통과시킨다. Redis 를 쓸 수 없을 때만 budget_usages 로 판정한다 — 게이트웨이의 DB 폴백과 같은
+# 행이지만 판정은 Lua 규칙이다(게이트웨이 폴백의 판정과는 3칸이 다르다 — routers/my.py _team_used_usd).
 
 TEAM_100 = SimpleNamespace(max_budget_usd=Decimal("100"), policy=BudgetPolicy.HARD_BLOCK)
 
@@ -238,7 +239,7 @@ async def test_a_missing_counter_reads_as_zero_like_the_gateway():
 
 
 async def test_redis_down_falls_back_to_budget_usages():
-    """Redis 를 쓸 수 없으면 게이트웨이처럼 budget_usages 로 판정한다."""
+    """Redis 를 쓸 수 없으면 budget_usages(게이트웨이 DB 폴백이 읽는 행)로 판정한다 — 규칙은 Lua 의 것이다."""
     assert (await _team_with(_FakeRedis(down=True), team_used_in_db="100"))["budget_exhausted"] is True
     assert (await _team_with(_FakeRedis(down=True), team_used_in_db="50"))["budget_exhausted"] is False
 

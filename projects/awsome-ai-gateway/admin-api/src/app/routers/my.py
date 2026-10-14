@@ -59,8 +59,15 @@ async def _team_used_usd(redis, session: AsyncSession, team_id: uuid.UUID, perio
       거부되는 팀을 '여유 있음' 으로 보였다.
     * 키가 없으면 **0** 이다. budget_check.lua 는 ``GET … or '0'`` 으로 읽고, 게이트웨이는 팀 카운터를 DB 에서
       복원하지 않는다 — 카운터가 사라진 직후(장애·재시작) 게이트웨이는 실제로 그 팀을 통과시킨다.
-    * Redis 를 쓸 수 없을 때만 budget_usages 다(게이트웨이도 그때 DB 폴백으로 같은 행을 읽는다). 모델은
+    * Redis 를 쓸 수 없을 때(클라이언트 없음·연결 실패·응답 없음·이상한 값)만 budget_usages 다. 모델은
       budget_service.get_budget_summary 의 Redis 우선 조회다.
+
+    ⚠️ 그 폴백에서 게이트웨이와 같은 것은 **행**이지 **판정**이 아니다. 여기서는 그 값에도 Lua 규칙
+       (_gateway_denies_team, float64)을 쓰고, 게이트웨이의 DB 폴백은 자기 규칙(gateway-proxy
+       budget_service._evaluate_layer — Decimal, SOFT_WARNING 은 limit > 0 일 때만)을 쓴다. 리뷰 그리드 135칸 중
+       3칸에서 갈린다: SOFT_WARNING 한도 $0·사용 $0 과 $0·$0.0001 은 여기서 '소진'(게이트웨이 폴백은 통과),
+       $0.01·$0.0110 은 여기서 '여유'(게이트웨이 폴백은 거부). 평소 경로(Lua)를 따르기로 한 것이고, Redis 가
+       없을 때의 단위 테스트(test_my_budget_unset.py 의 정책 표)가 이 규칙을 고정한다.
     """
     if redis is not None:
         try:
@@ -153,7 +160,8 @@ async def get_my_budget(
     #                                                `limit > 0` 조건 때문에 $0 을 통과시킨다 — 평소 경로를 따른다)
     #      THROTTLE     거부하지 않는다(RPM 만 줄인다)
     #    used 는 게이트웨이가 판정에 쓰는 Redis 팀 카운터다(gateway-proxy 가 직접 올린다). Redis 를 쓸 수 없을 때만
-    #    budget_usages(게이트웨이 DB 폴백이 읽는 행 — cost-recorder-worker 가 배치로 쌓아 카운터보다 늦다) — _team_used_usd.
+    #    budget_usages(게이트웨이 DB 폴백이 읽는 행 — cost-recorder-worker 가 배치로 쌓아 카운터보다 늦다)이고, 그때도
+    #    판정은 위 Lua 규칙이다 — 게이트웨이 DB 폴백의 판정과는 3칸이 다르다(_team_used_usd).
     team_budget_exhausted = False
     if team_id is not None:
         team_cfg = (

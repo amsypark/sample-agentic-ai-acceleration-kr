@@ -8,7 +8,8 @@ Redis 카운터 ``budget:team:{<team_id>}:<period>`` 와 admin-api 가 쓰는 co
 
   * 워커 지연 — budget_usages(cost-recorder-worker 가 배치로 쌓는다)가 카운터보다 뒤처진 동안에도 카운터를 따른다.
   * 키 없음 = 0 — budget_check.lua 는 ``GET … or '0'`` 이고, 게이트웨이는 팀 카운터를 DB 에서 복원하지 않는다.
-  * Redis 를 쓸 수 없으면 budget_usages 로(게이트웨이도 그때 DB 폴백으로 같은 행을 읽는다).
+  * Redis 를 쓸 수 없으면 budget_usages 로 — 게이트웨이 DB 폴백이 읽는 행과 같지만 판정은 Lua 규칙이다(게이트웨이
+    폴백의 판정과는 그리드 3칸이 다르다 — routers/my.py _team_used_usd).
 
 비교 대상은 손으로 옮긴 규칙이 아니라 **gateway-proxy 의 budget_check.lua 그 자체**다. config 캐시도 admin-api 의
 실제 writer(``BudgetService._write_team_config_cache``)로 쓴다 — 두 배포물의 규약이 갈라지면 여기서 드러난다.
@@ -174,7 +175,7 @@ async def test_a_missing_counter_is_zero_for_both(db, redis_client):
 
 
 async def test_redis_down_falls_back_to_budget_usages(db, redis_client):
-    """Redis 에 붙지 못하면 budget_usages 로 판정한다 — 게이트웨이도 그때 DB 폴백으로 같은 행을 읽는다."""
+    """Redis 에 붙지 못하면 budget_usages(게이트웨이 DB 폴백이 읽는 행)로 판정한다 — 규칙은 Lua 의 것이다."""
     redis_asyncio = pytest.importorskip("redis.asyncio")
     team = await _team(db, redis_client, "100", "HARD_BLOCK")
     await _db_usage(db, team.team_id, "100")
