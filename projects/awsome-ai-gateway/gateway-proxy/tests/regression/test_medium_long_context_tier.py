@@ -25,6 +25,7 @@ import os
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -44,6 +45,7 @@ _IN, _OUT, _CW, _CR = Decimal("0.0022"), Decimal("0.0132"), Decimal("0.00275"), 
 # 1h 컬럼을 읽는지 증명하려면 테스트에서는 5m 과 다른 값을 준다(_CW=0.00275 vs 1h=0.0033).
 _CW1H = Decimal("0.0033")
 _THRESHOLD = 272000
+_SRC = Path(__file__).resolve().parents[2] / "src" / "app"
 
 
 def _cfg(*, tier: bool, partial_long: bool = False) -> ModelConfigSchema:
@@ -322,3 +324,236 @@ async def test_only_published_long_tier_models_are_tiered_in_the_migrated_db():
         assert not rows, f"long 요율이 게시되지 않은 모델에 티어가 켜졌다: {rows}"
     finally:
         await engine.dispose()
+
+
+# ── 웹서치 루프: 임계는 **상류 호출 단위**다 ─────────────────────────────────────
+#
+# 웹서치 루프는 N 번의 상류 호출(검색 턴들 + 최종 턴)을 한 usage 로 합쳐 usage_logs 한 행으로
+# 남긴다. 그런데 272K 임계는 **호출마다** 적용된다 — AWS 는 각 호출을 자기 프롬프트 크기로
+# 청구한다. 합계를 임계와 비교하면 각자 short 인 턴들이 long 으로 청구된다: 100K × 3 턴이
+# $0.6996 대신 $1.3794 로, context_tier=long 으로 기록됐다(리뷰 프로브로 실측).
+
+_PER_SHORT_TURN = Decimal("0.2332")  # 100K × 0.0022/1k + 1K × 0.0132/1k
+
+
+def _merged(turns):
+    from app.services.web_search_loop import _merge_usage
+
+    merged = TokenUsage()
+    for t in turns:
+        _merge_usage(merged, t)
+    return merged
+
+
+def test_merged_web_search_usage_bills_each_turn_at_its_own_tier():
+    cfg = _cfg(tier=True)
+    merged = _merged([_u(inp=100_000, out=1_000) for _ in range(3)])
+    assert merged.input_tokens == 300_000, "토큰 합계는 그대로 한 행에 남는다"
+    assert resolve_context_tier(merged, cfg) == "short"
+    assert calculate_cost(merged, cfg) == _PER_SHORT_TURN * 3  # 0.6996, not 1.3794
+
+
+def test_one_long_turn_bills_only_that_turn_long_and_records_long():
+    cfg = _cfg(tier=True)
+    merged = _merged([_u(inp=100_000, out=1_000), _u(inp=300_000, out=1_000)])
+    # 0.2332 + (300 × 0.0044 + 1 × 0.0198)
+    assert calculate_cost(merged, cfg) == Decimal("1.573000")
+    assert resolve_context_tier(merged, cfg) == "long", "한 턴이라도 long 이면 감사 기록은 long"
+
+
+def test_turn_breakdown_bills_with_the_request_cache_ttl():
+    """``cache_ttl_1h`` 는 라우터가 **루프가 끝난 뒤** 합계 usage 에 세운다(_ws_record).
+
+    턴별로 나눠 청구할 때 그 값이 턴에 전달되지 않으면 1h 캐시 쓰기가 5m 단가로 청구된다.
+    """
+    cfg = _cfg(tier=True)
+    merged = _merged([_u(inp=1_000, cw=10_000), _u(inp=1_000, cw=10_000)])
+    merged.cache_ttl_1h = True
+    # 턴마다 1 × 0.0022 + 10 × 0.0033(1h) = 0.0352
+    assert calculate_cost(merged, cfg) == Decimal("0.070400")
+
+
+def test_untiered_model_is_unchanged_by_the_breakdown():
+    cfg = _cfg(tier=False)
+    merged = _merged([_u(inp=200_000, out=1_000) for _ in range(3)])
+    assert resolve_context_tier(merged, cfg) is None
+    assert calculate_cost(merged, cfg) == calculate_cost(_u(inp=600_000, out=3_000), cfg)
+
+
+class _Search:
+    async def search(self, query, max_results):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(raw_text="result")
+
+
+def _anthropic_turn(*, search: bool, idx: int) -> list[bytes]:
+    events = [{"type": "message_start", "message": {"usage": {"input_tokens": 100_000}}}]
+    if search:
+        events += [
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "tool_use", "id": f"tu_{idx}", "name": "web_search"}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "input_json_delta", "partial_json": '{"query": "q"}'}},
+            {"type": "content_block_stop", "index": 0},
+        ]
+        stop = "tool_use"
+    else:
+        events += [
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "text_delta", "text": "answer"}},
+            {"type": "content_block_stop", "index": 0},
+        ]
+        stop = "end_turn"
+    events += [
+        {"type": "message_delta", "delta": {"stop_reason": stop},
+         "usage": {"output_tokens": 1_000}},
+        {"type": "message_stop"},
+    ]
+    return [json.dumps(e).encode() for e in events]
+
+
+def _responses_turn(*, search: bool, idx: int) -> list[bytes]:
+    events = [{"type": "response.created", "response": {"id": "resp_1"}}]
+    if search:
+        item = {"type": "function_call", "name": "web_search", "call_id": f"c_{idx}"}
+        events += [
+            {"type": "response.output_item.added", "output_index": 0, "item": item},
+            {"type": "response.function_call_arguments.delta", "output_index": 0,
+             "delta": '{"query": "q"}'},
+            {"type": "response.output_item.done", "output_index": 0,
+             "item": {**item, "arguments": '{"query": "q"}'}},
+        ]
+    else:
+        events.append({"type": "response.output_text.delta", "output_index": 0, "delta": "answer"})
+    events.append({
+        "type": "response.completed",
+        "response": {"id": "resp_1", "output": [],
+                     "usage": {"input_tokens": 100_000, "output_tokens": 1_000,
+                               "total_tokens": 101_000}},
+    })
+    return [json.dumps(e).encode() for e in events]
+
+
+def _aiter(items):
+    async def _gen():
+        for item in items:
+            yield item
+
+    return _gen()
+
+
+def _base_body(dialect: str) -> dict:
+    if dialect == "anthropic":
+        return {"messages": [{"role": "user", "content": "hi"}]}
+    return {"input": "hi"}
+
+
+class _NoRequest:
+    async def is_disconnected(self) -> bool:  # pragma: no cover - 호출되면 안 된다
+        raise AssertionError
+
+
+@pytest.mark.parametrize("dialect", ["anthropic", "responses"])
+async def test_stream_stitchers_bill_each_upstream_call_at_its_own_tier(dialect):
+    """실제 스티처로 검색 2턴 + 최종 1턴(각 100K)을 돌린다 — 각 호출은 AWS 에서 short 다."""
+    import time
+
+    from app.services import web_search_loop as wsl
+
+    make = _anthropic_turn if dialect == "anthropic" else _responses_turn
+    turns = iter([make(search=True, idx=1), make(search=True, idx=2), make(search=False, idx=3)])
+    seen = []
+
+    async def invoke_stream(body):
+        return 200, _aiter(next(turns)), {}, None
+
+    async def on_usage(usage):
+        seen.append(usage)
+
+    stitch = wsl._anthropic_stream if dialect == "anthropic" else wsl._responses_stream
+    base = _base_body(dialect)
+    async for _ in stitch(
+        invoke_stream=invoke_stream, base_body=base, mcp_client=_Search(), request=_NoRequest(),
+        on_usage=on_usage, max_iterations=5, deadline=time.monotonic() + 60,
+        default_max_results=10,
+    ):
+        pass
+
+    (merged,) = seen
+    cfg = _cfg(tier=True)
+    assert (merged.input_tokens, merged.web_search_count) == (300_000, 2)
+    assert resolve_context_tier(merged, cfg) == "short"
+    assert calculate_cost(merged, cfg) == _PER_SHORT_TURN * 3
+
+
+@pytest.mark.parametrize("dialect", ["anthropic", "responses"])
+async def test_nonstream_loops_bill_each_upstream_call_at_its_own_tier(dialect):
+    import time
+
+    from app.services import web_search_loop as wsl
+
+    def _body(search: bool, idx: int) -> bytes:
+        if dialect == "anthropic":
+            content = (
+                [{"type": "tool_use", "id": f"tu_{idx}", "name": "web_search",
+                  "input": {"query": "q"}}]
+                if search else [{"type": "text", "text": "answer"}]
+            )
+            return json.dumps({"content": content, "usage": {"input_tokens": 1, "output_tokens": 1},
+                               "stop_reason": "tool_use" if search else "end_turn"}).encode()
+        output = (
+            [{"type": "function_call", "name": "web_search", "call_id": f"c_{idx}",
+              "arguments": '{"query": "q"}'}]
+            if search else [{"type": "message", "content": [{"type": "output_text", "text": "a"}]}]
+        )
+        usage = {"input_tokens": 1, "output_tokens": 1}
+        return json.dumps({"output": output, "usage": usage}).encode()
+
+    plan = iter([(True, 1), (True, 2), (False, 3)])
+    seen = []
+
+    async def invoke(body):
+        search, idx = next(plan)
+        return 200, _body(search, idx), {}, _u(inp=100_000, out=1_000)
+
+    async def on_usage(usage):
+        seen.append(usage)
+
+    loop = wsl._anthropic_nonstream if dialect == "anthropic" else wsl._responses_nonstream
+    base = _base_body(dialect)
+    await loop(
+        invoke=invoke, base_body=base, mcp_client=_Search(), on_usage=on_usage,
+        max_iterations=5, deadline=time.monotonic() + 60, default_max_results=10,
+    )
+    (merged,) = seen
+    cfg = _cfg(tier=True)
+    assert merged.input_tokens == 300_000
+    assert resolve_context_tier(merged, cfg) == "short"
+    assert calculate_cost(merged, cfg) == _PER_SHORT_TURN * 3
+
+
+async def test_finalize_records_one_row_with_the_per_turn_cost_and_tier():
+    """usage_logs 는 여전히 **한 행**이다 — 토큰은 합계, 비용은 턴별 합, 티어는 턴 판정."""
+    from unittest.mock import AsyncMock
+
+    from app.schemas.domain import AuthContext, AuthType, Role
+    from app.services.cost_recorder import CostRecorder
+    from app.services.lua_loader import LuaScriptLoader
+
+    LuaScriptLoader.load_all(_SRC / "redis_scripts")
+    redis = AsyncMock()
+    redis.eval = AsyncMock(return_value='{"threshold_triggered": null}')
+    redis.xadd = AsyncMock()
+    auth = AuthContext(user_id="u-1", team_id="t-1", dept_id="d-1", roles=[Role.USER],
+                       auth_type=AuthType.VIRTUAL_KEY)
+    merged = _merged([_u(inp=100_000, out=1_000) for _ in range(3)])
+    cost = await CostRecorder().finalize(redis, auth, _cfg(tier=True), merged, "req-ws", True, 10)
+
+    assert cost == _PER_SHORT_TURN * 3
+    assert redis.xadd.await_count == 1, "웹서치 요청 하나는 원장 한 행"
+    payload = json.loads(redis.xadd.await_args.args[1]["payload"])
+    assert (payload["input_tokens"], payload["output_tokens"]) == (300_000, 3_000)
+    assert Decimal(payload["cost_usd"]) == _PER_SHORT_TURN * 3
+    assert payload["context_tier"] == "short"

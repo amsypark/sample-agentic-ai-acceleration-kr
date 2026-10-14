@@ -294,6 +294,9 @@ def _merge_usage(acc: TokenUsage, turn: TokenUsage) -> TokenUsage:
     acc.total_tokens = acc.input_tokens + acc.output_tokens
     acc.cache_ttl_1h = acc.cache_ttl_1h or turn.cache_ttl_1h
     acc.estimated = acc.estimated or turn.estimated
+    # ⚠️ 호출별 내역도 남긴다 — 272K 티어는 **상류 호출 단위**로 판정·청구된다. 합계만 남기면
+    #    각자 short 인 턴들이 합쳐져 long 으로 청구된다(100K × 3 턴 = $0.6996 이 $1.3794 로).
+    acc.turns.append(turn.model_copy(update={"turns": []}))
     return acc
 
 
@@ -468,6 +471,10 @@ async def _anthropic_stream(
             stop_reason_final = "end_turn"
             saw_message_delta = False
             turn_delta = {}
+            # 이 상류 호출의 usage(TokenUsage.turns — 272K 티어는 호출 단위로 청구된다). 턴
+            # **시작**에 등록한다: 턴 도중 취소돼도 finally 의 회계가 이 턴의 토큰을 포함한다.
+            turn_usage = TokenUsage()
+            merged.turns.append(turn_usage)
             assistant_content: list[dict] = []
             local_to_global: dict[int, int] = {}   # local block idx → emitted global idx
             suppressed: dict[int, dict] = {}        # local idx → {kind, buffer, block}
@@ -485,9 +492,13 @@ async def _anthropic_stream(
 
                 if etype == "message_start":
                     u = (ev.get("message") or {}).get("usage") or {}
-                    merged.input_tokens += int(u.get("input_tokens", 0) or 0)
-                    merged.cache_creation_input_tokens += int(u.get("cache_creation_input_tokens", 0) or 0)
-                    merged.cache_read_input_tokens += int(u.get("cache_read_input_tokens", 0) or 0)
+                    inp = int(u.get("input_tokens", 0) or 0)
+                    cw = int(u.get("cache_creation_input_tokens", 0) or 0)
+                    cr = int(u.get("cache_read_input_tokens", 0) or 0)
+                    for acc in (merged, turn_usage):  # 합계(한 행)와 이 호출의 내역
+                        acc.input_tokens += inp
+                        acc.cache_creation_input_tokens += cw
+                        acc.cache_read_input_tokens += cr
                     if not envelope_open:
                         envelope_open = True
                         yield _sse("message_start", ev)
@@ -612,8 +623,9 @@ async def _anthropic_stream(
                     turn_delta = dict(d)
                     if d.get("stop_reason"):
                         stop_reason_final = d["stop_reason"]
-                    u = ev.get("usage") or {}
-                    merged.output_tokens += int(u.get("output_tokens", 0) or 0)
+                    out = int((ev.get("usage") or {}).get("output_tokens", 0) or 0)
+                    merged.output_tokens += out
+                    turn_usage.output_tokens += out
                     # captured; do NOT emit here (emitted once at envelope close)
 
                 elif etype == "message_stop":

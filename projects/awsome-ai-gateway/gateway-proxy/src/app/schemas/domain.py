@@ -279,6 +279,11 @@ class TokenUsage(BaseModel):
     # reasoning_tokens, it is excluded from total_tokens/cost/TPM. Set by web_search_loop
     # (one increment per successful AgentCore WebSearch tools/call). 0 = no search / feature off.
     web_search_count: int = 0
+    # 한 요청이 여러 상류 호출(웹서치 루프의 턴)을 합친 것일 때의 **호출별** 내역. 비어 있으면
+    # 단일 호출이다. ⚠️ 272K 티어는 호출 단위로 판정·청구된다 — 합계를 임계와 비교하면 각자 short
+    # 인 턴들이 long 으로 청구된다. 그래서 calculate_cost / resolve_context_tier 가 이것을 쓴다.
+    # 위 토큰 필드는 여전히 합계다(usage_logs 한 행). 웹서치 루프만 채운다(_merge_usage 등).
+    turns: list[TokenUsage] = Field(default_factory=list)
 
 
 class BudgetThresholdEvent(BaseModel):
