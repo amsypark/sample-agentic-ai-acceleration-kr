@@ -181,6 +181,78 @@ describe('CreateModelDialog — target AWS account', () => {
   });
 });
 
+describe('CreateModelDialog — aliases of the same model id', () => {
+  // 게이트웨이는 alias 정확 매칭이 먼저다. 시드는 모델 id 와 이름이 같은 alias 를 두므로, 한 alias
+  // 에만 계정을 걸면 모델 id 로 부르는 요청이 그 계정을 건너뛴다. 서버는 409 로 막고, 다이얼로그는
+  // 그 alias 들을 보여 주며 "모두 적용" 을 고르게 한다.
+  const SIBLING = model({ alias: 'global.anthropic.claude-x' });
+
+  function editWith(models: ModelListItem[], over: Partial<ModelListItem> = {}) {
+    render(
+      <CreateModelDialog
+        isOpen
+        onClose={() => {}}
+        accounts={ACCOUNTS}
+        editModel={model(over)}
+        models={[model(over), ...models]}
+      />,
+    );
+  }
+
+  it('names the active siblings that would keep another account', () => {
+    editWith([SIBLING]);
+    expect(screen.queryByText('accountSiblingsWarning')).not.toBeInTheDocument();
+    fireEvent.change(select(), { target: { name: 'account_name', value: 'inregion-seoul' } });
+    expect(screen.getByText('accountSiblingsWarning')).toBeInTheDocument();
+    expect(screen.getByText(/global\.anthropic\.claude-x/)).toBeInTheDocument();
+    expect(screen.getByLabelText('accountApplyToSiblings')).not.toBeChecked();
+  });
+
+  it('sends apply_to_siblings only when the operator ticks apply to all', async () => {
+    editWith([SIBLING]);
+    fireEvent.change(select(), { target: { name: 'account_name', value: 'inregion-seoul' } });
+    submit();
+    await waitFor(() => expect(updateModelAction).toHaveBeenCalledTimes(1));
+    expect(updateModelAction.mock.calls[0][1]).not.toHaveProperty('apply_to_siblings');
+
+    fireEvent.click(screen.getByLabelText('accountApplyToSiblings'));
+    submit();
+    await waitFor(() => expect(updateModelAction).toHaveBeenCalledTimes(2));
+    expect(updateModelAction.mock.calls[1][1].apply_to_siblings).toBe(true);
+  });
+
+  it('ignores siblings that already agree, are inactive, are OPENMODEL or use another model id', () => {
+    editWith(
+      [
+        model({ alias: 'agrees', account_name: 'inregion-seoul' }),
+        model({ alias: 'inactive', is_active: false }),
+        model({ alias: 'vllm', provider: 'OPENMODEL' }),
+        model({ alias: 'other-model', model_id: 'global.anthropic.claude-y' }),
+      ],
+    );
+    fireEvent.change(select(), { target: { name: 'account_name', value: 'inregion-seoul' } });
+    expect(screen.queryByText('accountSiblingsWarning')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('accountApplyToSiblings')).not.toBeInTheDocument();
+  });
+
+  it('warns on create too, when a new alias joins siblings that call an account', () => {
+    render(
+      <CreateModelDialog
+        isOpen
+        onClose={() => {}}
+        accounts={ACCOUNTS}
+        models={[model({ account_name: 'inregion-seoul' })]}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText(/Provider/), { target: { name: 'provider', value: 'BEDROCK' } });
+    fireEvent.change(screen.getByLabelText(/Model ID/), {
+      target: { name: 'model_id', value: 'global.anthropic.claude-x' },
+    });
+    expect(screen.getByText('accountSiblingsWarning')).toBeInTheDocument();
+    expect(screen.getByText(/claude-x \(inregion-seoul\)/)).toBeInTheDocument();
+  });
+});
+
 describe('ModelsTable — AWS account column', () => {
   it('shows Default (with its meaning) for a model without an account', () => {
     render(<ModelsTable models={[model()]} accounts={ACCOUNTS} />);

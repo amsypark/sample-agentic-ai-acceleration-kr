@@ -214,6 +214,12 @@ describe('AwsAccountSchema — mirrors the admin-api / DB rules', () => {
     '111122223333',
     'arn:aws:iam::12345:role/x',
     'arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude',
+    // 와일드카드·가짜 파티션·비 ASCII — terraform 에서는 같은 문법이 IAM 정책 Resource 가 된다.
+    'arn:aws:iam::111122223333:role/*',
+    'arn:aws:iam::111122223333:role/gw-*',
+    'arn:awsfoo:iam::111122223333:role/x',
+    'arn:aws:iam::111122223333:role/역할',
+    'arn:aws:iam::111122223333:role/a b',
   ])('refuses the non-role ARN %s', (role_arn) => {
     expect(AwsAccountSchema.safeParse({ ...base, role_arn }).success).toBe(false);
   });
@@ -228,7 +234,17 @@ describe('AwsAccountSchema — mirrors the admin-api / DB rules', () => {
     ).toBe(true);
   });
 
-  it.each(['x', 'has space'])('refuses the External ID %s', (external_id) => {
+  it('accepts the full IAM role charset and the full STS External ID charset', () => {
+    expect(
+      AwsAccountSchema.safeParse({
+        ...base,
+        role_arn: 'arn:aws-iso-b:iam::111122223333:role/team/a+b=c,d.e@f_g-h',
+        external_id: 'Ab0_+=,.@:/-',
+      }).success,
+    ).toBe(true);
+  });
+
+  it.each(['x', 'has space', '외부아이디', 'ext*', 'üext'])('refuses the External ID %s', (external_id) => {
     expect(AwsAccountSchema.safeParse({ ...base, external_id }).success).toBe(false);
   });
 });

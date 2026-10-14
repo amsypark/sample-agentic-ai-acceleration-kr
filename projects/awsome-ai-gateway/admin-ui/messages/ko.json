@@ -402,6 +402,8 @@
     "accountDefaultOption": "기본값 (앱 라우팅 프로필 계정, 없으면 게이트웨이 계정)",
     "accountNoneRegistered": "등록된 계정이 없습니다. 아래 'AWS 계정' 패널에서 먼저 등록하세요.",
     "accountOpenmodelNote": "OPENMODEL 모델은 AWS 가 서빙하지 않으므로 계정을 고를 수 없습니다.",
+    "accountSiblingsWarning": "이 모델 ID 를 쓰는 다른 활성 alias {count}개가 다른 AWS 계정을 부릅니다. 게이트웨이는 모델 ID 보다 alias 이름을 먼저 맞추므로, 모델 ID 나 아래 alias 로 부른 요청은 여기서 고른 계정을 쓰지 않습니다. 모두 같은 계정이 될 때까지 저장은 거부됩니다:",
+    "accountApplyToSiblings": "같은 저장에서 이 {count}개 alias 에도 같은 계정을 적용",
     "accountColumnHeader": "AWS 계정",
     "accountColumnDefault": "기본값",
     "accountColumnDefaultTitle": "그 경로가 앱 라우팅 프로필 계정을 쓰면 그 계정, 아니면 게이트웨이 자신의 계정",

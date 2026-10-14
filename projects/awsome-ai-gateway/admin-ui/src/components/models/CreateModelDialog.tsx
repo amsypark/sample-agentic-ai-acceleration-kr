@@ -18,6 +18,8 @@ interface CreateModelDialogProps {
   editModel?: ModelListItem;
   /** 등록된 AWS 계정(0044) — 계정 선택 칸의 선택지. */
   accounts?: AwsAccount[];
+  /** 모델 목록 — 같은 모델 id 의 다른 alias(형제)를 찾는다(아래 siblings). */
+  models?: ModelListItem[];
 }
 
 interface FormState {
@@ -70,7 +72,13 @@ function getInitialState(editModel?: ModelListItem): FormState {
   };
 }
 
-export function CreateModelDialog({ isOpen, onClose, editModel, accounts = [] }: CreateModelDialogProps) {
+export function CreateModelDialog({
+  isOpen,
+  onClose,
+  editModel,
+  accounts = [],
+  models = [],
+}: CreateModelDialogProps) {
   const t = useTranslations('models');
   const tCommon = useTranslations('common');
   const { toast } = useToast();
@@ -78,6 +86,7 @@ export function CreateModelDialog({ isOpen, onClose, editModel, accounts = [] }:
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [form, setForm] = useState<FormState>(() => getInitialState(editModel));
+  const [applyToSiblings, setApplyToSiblings] = useState(false);
 
   const isEditMode = !!editModel;
   // OPENMODEL 은 AWS 가 서빙하지 않는다 — 계정을 고를 수 없다(admin-api 도 400 으로 거부한다).
@@ -88,10 +97,27 @@ export function CreateModelDialog({ isOpen, onClose, editModel, accounts = [] }:
     form.account_name && !accounts.some((a) => a.name === form.account_name)
       ? [...accounts, { name: form.account_name, display_name: form.account_name, account_id: '' } as AwsAccount]
       : accounts;
+  // 같은 모델 id 의 다른 ACTIVE alias 중 다른 계정을 부르는 것. 게이트웨이는 요청의 모델 이름을
+  // alias 정확 매칭으로 먼저 찾으므로(시드는 모델 id 와 이름이 같은 alias 를 둔다), 여기서 고른 계정은
+  // 모델 id 나 그 alias 로 부른 요청에는 쓰이지 않는다. admin-api 는 그런 저장을 409 로 막고
+  // apply_to_siblings 로 함께 옮기게 한다(services/model_service._align_account_siblings).
+  const selfAlias = editModel?.alias ?? form.alias;
+  const siblings =
+    isOpenModel || !form.model_id
+      ? []
+      : models.filter(
+          (m) =>
+            m.alias !== selfAlias &&
+            m.model_id === form.model_id &&
+            m.is_active &&
+            m.provider.toUpperCase() !== 'OPENMODEL' &&
+            (m.account_name ?? '') !== form.account_name,
+        );
 
   useEffect(() => {
     if (editModel) {
       setForm(getInitialState(editModel));
+      setApplyToSiblings(false);
     }
   }, [editModel]);
 
@@ -128,6 +154,8 @@ export function CreateModelDialog({ isOpen, onClose, editModel, accounts = [] }:
       display_name: form.display_name || undefined,
       // '' = 기본값 → null. OPENMODEL 이면 언제나 기본값이다.
       account_name: isOpenModel ? null : form.account_name || null,
+      // 운영자가 고른 경우에만 보낸다 — 구 admin-api 는 모르는 키를 422 로 거부한다.
+      ...(siblings.length > 0 && applyToSiblings ? { apply_to_siblings: true } : {}),
     };
 
     startTransition(async () => {
@@ -433,6 +461,29 @@ export function CreateModelDialog({ isOpen, onClose, editModel, accounts = [] }:
               accounts.length === 0 && (
                 <p className="text-xs text-muted-foreground">{t('accountNoneRegistered')}</p>
               )
+            )}
+            {siblings.length > 0 && (
+              <div
+                role="alert"
+                className="mt-2 space-y-1 rounded-md border border-amber-500/50 bg-amber-500/10 p-2"
+              >
+                <p className="text-xs">{t('accountSiblingsWarning', { count: siblings.length })}</p>
+                <ul className="list-disc pl-4 text-xs">
+                  {siblings.map((m) => (
+                    <li key={m.alias}>
+                      {m.alias} ({m.account_name || t('accountColumnDefault')})
+                    </li>
+                  ))}
+                </ul>
+                <label className="flex items-center gap-2 text-xs font-medium">
+                  <input
+                    type="checkbox"
+                    checked={applyToSiblings}
+                    onChange={(e) => setApplyToSiblings(e.target.checked)}
+                  />
+                  {t('accountApplyToSiblings', { count: siblings.length })}
+                </label>
+              </div>
             )}
             {fieldErrors.account_name && <FormError error={fieldErrors.account_name} />}
           </div>

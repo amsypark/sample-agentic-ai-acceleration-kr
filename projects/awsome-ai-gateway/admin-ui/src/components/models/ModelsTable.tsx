@@ -213,6 +213,7 @@ export function ModelsTable({ models, accounts = [] }: ModelsTableProps) {
         }}
         editModel={selectedModel ?? undefined}
         accounts={accounts}
+        models={models}
       />
 
       <DeactivateModelDialog

@@ -92,7 +92,7 @@ export default async function ModelsPage() {
           <h1 className="text-2xl font-bold">{t('title')}</h1>
           <div className="flex items-center gap-2">
             <AwsPriceSyncButton />
-            <CreateModelButton accounts={awsAccounts} />
+            <CreateModelButton accounts={awsAccounts} models={models} />
           </div>
         </div>
         <ModelsTable models={models} accounts={awsAccounts} />

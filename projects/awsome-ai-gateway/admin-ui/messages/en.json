@@ -402,6 +402,8 @@
     "accountDefaultOption": "Default (app routing-profile account, else the gateway's own account)",
     "accountNoneRegistered": "No accounts registered yet. Register one in the 'AWS accounts' panel below.",
     "accountOpenmodelNote": "OPENMODEL models are not served by AWS, so no account can be selected.",
+    "accountSiblingsWarning": "Other active aliases of this model ID ({count}) call a different AWS account. The gateway matches an alias name before a model ID, so a request that names the model ID or one of these aliases would not use the account selected here. The save is refused until they all use the same account:",
+    "accountApplyToSiblings": "Apply this account to all {count} of them in the same save",
     "accountColumnHeader": "AWS account",
     "accountColumnDefault": "Default",
     "accountColumnDefaultTitle": "The app's routing-profile account where that path uses one, otherwise the gateway's own account.",

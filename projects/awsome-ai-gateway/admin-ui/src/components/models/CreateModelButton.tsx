@@ -5,10 +5,16 @@
 
 import { useState } from 'react';
 import { useTranslations } from 'next-intl';
-import type { AwsAccount } from '@/types/entities';
+import type { AwsAccount, ModelListItem } from '@/types/entities';
 import { CreateModelDialog } from './CreateModelDialog';
 
-export function CreateModelButton({ accounts = [] }: { accounts?: AwsAccount[] }) {
+export function CreateModelButton({
+  accounts = [],
+  models = [],
+}: {
+  accounts?: AwsAccount[];
+  models?: ModelListItem[];
+}) {
   const t = useTranslations('models');
   const [isOpen, setIsOpen] = useState(false);
 
@@ -20,7 +26,12 @@ export function CreateModelButton({ accounts = [] }: { accounts?: AwsAccount[] }
       >
         {t('addModelButton')}
       </button>
-      <CreateModelDialog isOpen={isOpen} onClose={() => setIsOpen(false)} accounts={accounts} />
+      <CreateModelDialog
+        isOpen={isOpen}
+        onClose={() => setIsOpen(false)}
+        accounts={accounts}
+        models={models}
+      />
     </>
   );
 }
