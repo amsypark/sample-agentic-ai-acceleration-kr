@@ -151,15 +151,17 @@ class MantleCredentialBroker:
         # STS 왕복은 브로커의 전역 lock **밖에서** 한다(provider 가 키별 lock 을 갖는다). 안에서
         # 하면 느리거나 실패하는 alias 계정 하나가 라이브 프로필 경로(cowork)의 bearer mint 까지
         # 그 왕복 뒤에 줄 세운다.
-        creds = await self._account_provider.credentials(account, session_name=SESSION_NAME_MANTLE)
+        # 만료는 **이** 자격증명의 것이다(provider 가 한 lock 안에서 함께 돌려준다). 캐시를 따로
+        # 다시 읽으면 그 사이 다른 요청이 갱신한 새 항목의 만료를 받아, 옛 자격증명으로 만든
+        # bearer 가 옛 자격증명이 끝난 뒤에도 _BEARER_TTL 까지 남아 401 이 된다.
+        creds, cred_expiry = await self._account_provider.credentials(
+            account, session_name=SESSION_NAME_MANTLE
+        )
         async with self._lock:
             now = self._now()
             cached_bearer = self._bearers.get(bearer_key)
             if cached_bearer and cached_bearer.expires_at > now:
                 return cached_bearer.token
-            cred_expiry = self._account_provider.expires_at(
-                account, session_name=SESSION_NAME_MANTLE
-            ) or (now + _ASSUME_DURATION)
             token = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: BedrockTokenGenerator().get_token(creds, profile.region),

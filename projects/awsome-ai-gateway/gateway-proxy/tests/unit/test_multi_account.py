@@ -172,8 +172,8 @@ async def test_assume_role_once_per_target_with_the_external_id_and_session_name
     sts, calls = _sts()
     prov = _provider(sts)
     t = AccountTarget(ROLE_ALIAS, "ext-1")
-    c1 = await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
-    c2 = await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    c1, _ = await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    c2, _ = await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
     assert c1 is c2 and len(calls) == 1
     assert calls[0] == {
         "RoleArn": ROLE_ALIAS,
@@ -196,10 +196,10 @@ async def test_a_target_without_the_external_id_never_reuses_credentials_assumed
     한 자격증명을 캐시 적중으로 받는다 — 그 검사가 매 적중마다 건너뛰어진다."""
     sts, calls = _sts()
     prov = _provider(sts)
-    a = await prov.credentials(
+    a, _ = await prov.credentials(
         AccountTarget(ROLE_ALIAS, "secret"), session_name=SESSION_NAME_NATIVE
     )
-    b = await prov.credentials(AccountTarget(ROLE_ALIAS, None), session_name=SESSION_NAME_NATIVE)
+    b, _ = await prov.credentials(AccountTarget(ROLE_ALIAS, None), session_name=SESSION_NAME_NATIVE)
     assert a is not b and len(calls) == 2
     assert calls[0]["ExternalId"] == "secret" and "ExternalId" not in calls[1]
 
@@ -260,7 +260,7 @@ async def test_concurrent_first_requests_share_one_assume_role():
             for _ in range(5)
         )
     )
-    assert len(calls) == 1 and all(r is results[0] for r in results)
+    assert len(calls) == 1 and all(r[0] is results[0][0] for r in results)
 
 
 async def test_a_slow_role_does_not_block_a_different_role():
@@ -294,13 +294,14 @@ async def test_a_slow_role_does_not_block_a_different_role():
     assert order == ["fast", "slow"]
 
 
-async def test_expires_at_reports_the_cached_hard_expiry_only():
+async def test_credentials_come_with_the_hard_expiry_of_those_credentials():
+    now = [1000.0]
     sts, _ = _sts(base=1000.0, expires_in=3600)
-    prov = _provider(sts)
+    prov = _provider(sts, now=lambda: now[0])
     t = AccountTarget(ROLE_ALIAS)
-    assert prov.expires_at(t, session_name=SESSION_NAME_MANTLE) is None
-    await prov.credentials(t, session_name=SESSION_NAME_MANTLE)
-    assert prov.expires_at(t, session_name=SESSION_NAME_MANTLE) == 1000.0 + 3600
+    creds, expiry = await prov.credentials(t, session_name=SESSION_NAME_MANTLE)
+    assert creds.access_key == "ASIA1" and expiry == 1000.0 + 3600
+    assert not hasattr(prov, "expires_at"), "만료를 따로 읽는 API 는 갱신과 경합한다(한 쌍으로만)"
 
 
 # ── 프로필 경로(get_client) 는 오늘 그대로 ──────────────────────────────────────────
@@ -752,3 +753,142 @@ async def test_the_fixed_body_names_neither_the_role_nor_the_sts_error():
     text = ACCOUNT_UNAVAILABLE_BODY.decode()
     assert json.loads(text)["error"]["type"] == "api_error"
     assert "arn:" not in text and "AccessDenied" not in text
+
+
+# ── 갱신 실패·실패 기억·자격증명/만료 한 쌍·빌드 직렬화 ────────────────────────────────
+
+
+class _FlakySTS:
+    """성공하면 호출마다 다른 키, ``fail`` 이 켜져 있으면 Throttling."""
+
+    def __init__(self, base=1000.0, expires_in=3600):
+        self.calls = 0
+        self.fail = False
+        self.base = base
+        self.expires_in = expires_in
+
+    def assume_role(self, **kw):
+        self.calls += 1
+        if self.fail:
+            raise ClientError(
+                {"Error": {"Code": "Throttling", "Message": "Rate exceeded"}}, "AssumeRole"
+            )
+        return {
+            "Credentials": {
+                "AccessKeyId": f"ASIA{self.calls}",
+                "SecretAccessKey": "s",
+                "SessionToken": "t",
+                "Expiration": dt.datetime.fromtimestamp(self.base + self.expires_in, dt.UTC),
+            }
+        }
+
+
+async def test_a_refresh_failure_keeps_serving_credentials_that_are_still_valid():
+    """갱신 창(만료 300초 전)의 STS 오류 한 번이 아직 유효한 자격증명을 버리고 30초 동안 그 계정의
+    모든 요청을 500 으로 만들면 안 된다 — 남은 시간이 충분하면 그 자격증명으로 계속 서명한다."""
+    now = [1000.0]
+    sts = _FlakySTS()
+    prov = _provider(sts, now=lambda: now[0])
+    t = AccountTarget(ROLE_ALIAS, "ext")
+    first, expiry = await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    assert expiry == 1000.0 + 3600
+    sts.fail = True
+    for at in (0, 20, 29):
+        now[0] = 1000.0 + 3600 - 299 + at
+        creds, exp = await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+        assert creds is first and exp == expiry, f"t+{at}s: 아직 유효한 자격증명을 버렸다"
+    assert sts.calls == 2, "갱신 재시도는 백오프 간격으로만 — 요청마다 STS 왕복을 쓰지 않는다"
+    now[0] = 1000.0 + 3600 - 299 + FAILURE_BACKOFF + 1
+    await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    assert sts.calls == 3, "백오프가 지나면 다시 갱신을 시도한다"
+    sts.fail = False
+    now[0] += FAILURE_BACKOFF + 1
+    fresh, _ = await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    assert fresh is not first, "STS 가 돌아오면 새 자격증명으로 바뀐다"
+
+
+async def test_a_refresh_failure_close_to_expiry_is_still_a_typed_failure():
+    """남은 시간이 60초 미만이면 그 자격증명으로 서명한 호출이 도중에 만료될 수 있다 — 거절한다."""
+    now = [1000.0]
+    sts = _FlakySTS()
+    prov = _provider(sts, now=lambda: now[0])
+    t = AccountTarget(ROLE_ALIAS)
+    await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    sts.fail = True
+    now[0] = 1000.0 + 3600 - 59
+    with pytest.raises(AccountCredentialsUnavailable, match="Throttling"):
+        await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+
+
+async def test_a_profile_path_failure_does_not_block_an_alias_on_the_same_role():
+    """claude-code 프로필과 alias 가 같은 (역할, ExternalId) 를 쓰면(레지스트리가 같은 ExternalId 를
+    강제한다) 자격증명 키가 같다. 프로필 경로의 일시 실패가 그 키에 실패를 기억시키면 같은 역할의
+    alias 요청이 30초 동안 500 이 된다 — 프로필 경로는 실패를 기억하지 않는다."""
+    sts = _FlakySTS()
+    prov = _provider(sts)
+    sts.fail = True
+    with pytest.raises(AccountCredentialsUnavailable):
+        await prov.get_client(ROLE_PROFILE, "ap-northeast-2", "shared-ext")
+    sts.fail = False
+    creds, _ = await prov.credentials(
+        AccountTarget(ROLE_PROFILE, "shared-ext"), session_name=SESSION_NAME_NATIVE
+    )
+    assert creds.access_key == "ASIA2" and sts.calls == 2
+
+
+async def test_mantle_bearer_expiry_comes_from_the_credentials_it_was_minted_from(_token_gen):
+    """bearer 는 그것을 mint 한 자격증명보다 오래 살면 안 된다. 만료를 provider 의 **현재** 캐시
+    항목에서 따로 읽으면, 그 사이 다른 요청이 갱신한 새 자격증명의 만료(1시간 뒤)를 옛 자격증명으로
+    mint 한 bearer 에 붙인다 — 옛 자격증명이 끝난 뒤 bearer TTL 이 다할 때까지 401 이다."""
+    old = Credentials("ASIA_OLD", "s", "t")
+
+    class _Interleaved:
+        async def credentials(self, target, *, session_name, remember_failure=True):
+            return old, 1000.0 + 301  # 이 자격증명의 만료
+
+        def expires_at(self, target, *, session_name):  # 그 사이 다른 요청이 갱신한 항목
+            return 1000.0 + 3600
+
+    broker = mc.MantleCredentialBroker(
+        sts_client=MagicMock(), now=lambda: 1000.0, account_provider=_Interleaved()
+    )
+    await broker.bearer_token(_profile(region="us-west-2"), AccountTarget(ROLE_ALIAS))
+    entry = broker._bearers[(("account", ROLE_ALIAS, ""), "us-west-2")]
+    assert _token_gen == [("ASIA_OLD", "us-west-2")]
+    assert entry.expires_at == 1000.0 + 301 - mc._BEARER_CRED_SKEW
+
+
+async def test_account_clients_are_never_built_concurrently():
+    """boto3 의 기본 세션은 스레드 안전하지 않다. 키별 lock 은 서로 다른 키의 빌드를 동시에
+    executor 스레드에서 돌리므로, 빌드 자체를 직렬화한다."""
+    import threading
+
+    active = [0]
+    peak = [0]
+    guard = threading.Lock()
+
+    def _slow_build(svc, **kw):
+        with guard:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.15)
+        with guard:
+            active[0] -= 1
+        return object()
+
+    sts, _ = _sts(per_role_keys=True)
+    prov = _provider(sts)
+    with patch("app.services.bedrock_account_client.boto3.client", _slow_build):
+        await asyncio.gather(
+            prov.get_account_client(AccountTarget(ROLE_ALIAS), "ap-northeast-2"),
+            prov.get_account_client(AccountTarget(ROLE_PROFILE), "us-east-1"),
+            prov.get_account_client(AccountTarget(ROLE_ALIAS), "us-west-2"),
+        )
+    assert peak[0] == 1
+
+
+def test_the_external_id_never_appears_in_a_target_repr():
+    """AccountTarget 은 로그·예외 메시지에 repr 로 섞이기 쉽다. ExternalId 는 공유 비밀이다."""
+    t = AccountTarget(ROLE_ALIAS, "ext-secret-value")
+    assert "ext-secret-value" not in repr(t) and ROLE_ALIAS in repr(t)
+

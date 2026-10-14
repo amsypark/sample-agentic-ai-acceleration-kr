@@ -125,7 +125,10 @@ class SigV4Signer:
                 "alias requests a target AWS account but no account provider is wired into "
                 "SigV4Signer; refusing to sign with the pod's own credentials",
             )
-        return await self._account_provider.credentials(account, session_name=SESSION_NAME_RUNTIME)
+        creds, _expires_at = await self._account_provider.credentials(
+            account, session_name=SESSION_NAME_RUNTIME
+        )
+        return creds
 
     async def _resolve_creds(
         self, role_arn: Optional[str], external_id: Optional[str]

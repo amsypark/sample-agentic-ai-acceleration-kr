@@ -47,7 +47,7 @@ alias 계정이 없는 요청에만 걸린다.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 #: RoleSessionName — 경로(transport)마다 **이미 쓰던 이름**을 alias 계정에도 쓴다. 대상 계정의
 #: CloudTrail·메트릭 필터·``sts:RoleSessionName`` 조건이 계정 출처(alias/프로필)와 무관하게
@@ -93,7 +93,9 @@ class AccountTarget:
     """
 
     role_arn: str
-    external_id: str | None = None
+    #: repr 에서 뺀다 — confused-deputy 를 막는 공유 비밀이고, 이 객체는 로그·예외에 repr 로 섞이기
+    #: 쉽다. 동등 비교·해시에는 그대로 들어간다(캐시 키가 ExternalId 로 갈려야 한다).
+    external_id: str | None = field(default=None, repr=False)
     #: 로그용 출처. ``"alias"`` 또는 ``"profile"``.
     source: str = "alias"
 
