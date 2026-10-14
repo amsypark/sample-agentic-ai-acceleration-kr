@@ -275,3 +275,97 @@ def test_the_openai_handlers_put_the_alias_account_into_the_shared_kwargs():
             )
         ]
         assert sets, f"{fn_name}: invoke_kwargs['account'] 를 채우는 지점이 없다"
+
+
+# ── /model/* 스트림 패스스루: 보호된 finalize(services/bg_tasks.py) 도 서명 계정을 기록한다 ──
+
+
+@pytest.mark.asyncio
+async def test_the_passthrough_stream_signs_and_records_the_alias_account_through_a_disconnect(
+    monkeypatch, mock_redis, auth_context_vk, model_config_bedrock
+):
+    """서명은 alias 계정으로, 원장 행도 그 계정으로 — 클라이언트가 finalize 도중에 끊어도.
+
+    끊김은 종결 청크 직후, finalize 가 예산 차감과 원장 XADD 사이에 있을 때 떨어뜨린다. finalize 가
+    보호 태스크가 아니면 XADD 가 잘려 원장 행이 없다. 패스스루는 라우팅 프로필을 보지 않으므로
+    profile_account 를 넘기지 않는다 — 기록 계정은 finalize 가 model_config(서명 계정을 고른 바로 그
+    설정)에서 읽는다(account_credentials.effective_account_id).
+    """
+    import asyncio
+
+    from app.routers import bedrock
+    from app.services import rate_limit_enforcement
+    from app.services.cost_recorder import CostRecorder
+
+    _mock_budget(mock_redis)
+    in_xadd, release, written = asyncio.Event(), asyncio.Event(), []
+
+    async def _parked_xadd(stream, fields, *args, **kwargs):
+        in_xadd.set()
+        await release.wait()
+        written.append(json.loads(fields["payload"]))
+
+    mock_redis.xadd = AsyncMock(side_effect=_parked_xadd)
+    model = model_config_bedrock.model_copy(update={"account_role_arn": ALIAS_ROLE})
+    signed_with = []
+
+    class _Adapter:
+        async def invoke_stream(self, body, model_id, path_suffix=None, account=None):
+            signed_with.append(account)
+
+            async def chunks():
+                usage = {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
+                yield f"data: {json.dumps({'usage': usage})}\n\n".encode()
+
+            return 200, chunks(), {"Content-Type": "application/octet-stream"}, "rid"
+
+    async def _resolve(*_a, **_k):
+        return model
+
+    async def _no_limit(**_k):
+        return None
+
+    monkeypatch.setattr(bedrock._router_service, "resolve_bedrock_model", _resolve)
+    monkeypatch.setattr(bedrock._router_service, "check_key_scope", lambda *a, **k: None)
+    monkeypatch.setattr(bedrock._router_service, "check_client_model_scope", lambda *a, **k: None)
+    monkeypatch.setattr(rate_limit_enforcement, "enforce_rate_limits", _no_limit)
+
+    class _Request:
+        scope = {"state": {"auth_context": auth_context_vk, "_redis": mock_redis,
+                           "request_id": "req-pt"}}
+        app = SimpleNamespace(state=SimpleNamespace(
+            provider_registry=SimpleNamespace(get=lambda _p: _Adapter()),
+            cost_recorder=CostRecorder(),
+            metrics=None,
+        ))
+
+        async def body(self) -> bytes:
+            return b'{"max_tokens": 16}'
+
+    resp = await bedrock._handle_bedrock(
+        _Request(), model.alias, "invoke-with-response-stream", stream=True
+    )
+
+    async def consume():
+        async for _ in resp.body_iterator:
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(in_xadd.wait(), timeout=2.0)
+    task.cancel()  # = 종결 청크를 읽자마자 닫는 클라이언트(StreamingResponse 의 http.disconnect)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert written == [], "XADD 가 끊김보다 먼저 끝났다 — 이 테스트가 창을 못 맞췄다"
+    release.set()
+    await asyncio.wait_for(_until_written(written), timeout=2.0)
+
+    assert [account_id_of(a.role_arn) for a in signed_with] == ["111122223333"]
+    assert (written[0]["request_id"], written[0]["aws_account_id"]) == ("req-pt", "111122223333")
+    assert (written[0]["input_tokens"], written[0]["output_tokens"]) == (5, 7)
+
+
+async def _until_written(written: list) -> None:
+    import asyncio
+
+    while not written:
+        await asyncio.sleep(0.005)
