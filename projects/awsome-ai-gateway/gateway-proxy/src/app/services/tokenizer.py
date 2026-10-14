@@ -9,7 +9,7 @@ from typing import Any
 
 import structlog
 
-from app.schemas.domain import ProviderType
+from app.schemas.domain import ModelConfigSchema, ProviderType, TokenUsage
 
 logger = structlog.get_logger(__name__)
 
@@ -113,3 +113,68 @@ class TokenizerService:
         except Exception:
             logger.warning("tiktoken_encode_failed")
             return None
+
+
+# ── 잘린 스트림의 프롬프트 추정 (KI-08 의 입력 쪽) ───────────────────────────────
+
+#: 값이 base64 페이로드인 필드(Chat input_audio.data, Anthropic source.data, Converse bytes,
+#: Responses/Chat file_data). data URL 은 접두사로 따로 거른다.
+_MEDIA_KEYS = frozenset({"data", "bytes", "file_data"})
+#: 프롬프트를 이루는 최상위 필드(Responses / Chat / Anthropic). model·max_tokens 등은 아니다.
+_PROMPT_KEYS = ("instructions", "system", "messages", "input", "tools")
+
+
+def prompt_text(body: dict) -> str:
+    """프롬프트 토큰 역산용 텍스트 — 대화·지시·도구 정의의 문자열 값만 모은다.
+
+    ⚠️ base64 미디어는 뺀다. 이미지는 해상도 기반 수백~수천 토큰인데 base64 를 토크나이저에
+       넣으면 수십만 토큰으로 부풀어 과청구가 된다. 대가로 이미지 토큰과 JSON 구조 토큰은
+       0 으로 센다 — 추정은 아래쪽으로 기운다(estimate_prompt_usage 의 하한 원칙과 같은 방향).
+    """
+    parts: list[str] = []
+
+    def walk(node: Any, key: str | None) -> None:
+        if isinstance(node, str):
+            if key not in _MEDIA_KEYS and not node.startswith("data:"):
+                parts.append(node)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, key)
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, k)
+
+    for key in _PROMPT_KEYS:
+        if key in body:
+            walk(body[key], key)
+    return "\n".join(parts)
+
+
+async def estimate_prompt_usage(
+    tokenizer: TokenizerService | None, body: Any, model_config: ModelConfigSchema
+) -> TokenUsage | None:
+    """usage 이벤트 없이 끊긴 스트림의 프롬프트 usage 추정 — **하한**으로 청구한다.
+
+    Responses / chat 방언은 usage 를 종결 이벤트에만 싣는다. 그 전에 끊기면(ESC, SIGTERM
+    셧다운, 상류 절단) 이미 처리돼 AWS 가 청구한 프롬프트가 0 으로 남는다.
+
+    ⚠️ 어느 버킷으로 청구하나: 캐시 히트가 얼마였는지는 종결 이벤트에만 있다. 전부 비캐시 입력으로
+       잡으면 캐시가 대부분인 프롬프트(Codex 같은 에이전트 루프)가 최대 ~10배 과청구된다. 그래서
+       모델이 캐시 읽기 단가를 매기면 그 버킷으로 잡는다 — 어떤 프롬프트 토큰도 캐시 읽기보다
+       싸게 청구되지 않으므로 실제 청구의 **하한**이다. 캐시 단가가 없는 모델은 캐시될 수 없으니
+       입력으로 잡는다.
+    """
+    if tokenizer is None or not isinstance(body, dict):
+        return None
+    text = prompt_text(body)
+    if not text:
+        return None
+    # estimate_output_tokens 는 "텍스트 → 토큰 수" 일 뿐이다(이름은 KI-08 의 출력 쪽 용도에서 왔다).
+    n = await tokenizer.estimate_output_tokens(
+        text, provider=model_config.provider, model_id=model_config.provider_model_id
+    )
+    if not n or n <= 0:
+        return None
+    if model_config.pricing.cache_read_per_1k > 0:
+        return TokenUsage(cache_read_input_tokens=n)
+    return TokenUsage(input_tokens=n)

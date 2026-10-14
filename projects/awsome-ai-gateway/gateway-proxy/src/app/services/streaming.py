@@ -23,6 +23,42 @@ OnUsage = Callable[[TokenUsage, float | None], Awaitable[None]] | None
 # None 반환 시 추정 불가 (cost_recorder는 0 토큰 + estimated=True로 기록).
 TokenizerHook = Callable[[str], Awaitable[int | None]] | None
 
+#: 잘린 스트림의 프롬프트 usage 추정 — 인자 없음, ``TokenUsage``(입력 버킷만) 또는 None.
+#: Responses / chat 방언은 usage 를 종결 이벤트에만 실어서, 그 전에 끊기면 입력이 0 으로 남는다.
+#: 라우터가 요청 body 로 만들어 넘긴다(tokenizer.estimate_prompt_usage). 비-2xx 스트림에는 넘기지
+#: 않는다 — 상류가 받지 않은 요청의 프롬프트를 청구하면 안 된다.
+PromptUsageHook = Callable[[], Awaitable[TokenUsage | None]] | None
+
+
+async def _with_prompt_estimate(usage: TokenUsage, hook: PromptUsageHook) -> TokenUsage:
+    """usage 이벤트 없이 끊긴 스트림의 입력 0 을 추정으로 채운다(KI-08 의 입력 쪽).
+
+    호출자는 "usage 이벤트를 하나도 못 받았고, 생성된 텍스트는 있다" 일 때만 부른다 — 텍스트가
+    있으면 상류가 프롬프트를 처리한 것이 확실하다. 실패하면 원래 usage 그대로(크래시 없음).
+    """
+    if hook is None:
+        return usage
+    try:
+        est = await hook()
+    except Exception:
+        logger.warning("prompt_usage_hook_failed")
+        return usage
+    if est is None:
+        return usage
+    prompt = est.input_tokens + est.cache_read_input_tokens + est.cache_creation_input_tokens
+    if prompt <= 0:
+        return usage
+    return usage.model_copy(
+        update={
+            "input_tokens": est.input_tokens,
+            "cache_read_input_tokens": est.cache_read_input_tokens,
+            "cache_creation_input_tokens": est.cache_creation_input_tokens,
+            "total_tokens": prompt + usage.output_tokens,
+            "estimated": True,
+        }
+    )
+
+
 #: 스트림 종료 훅 — ``(누적된 원본 SSE 프레임 전문, status)``.
 #: status 는 ``"success"`` 또는 ``"partial"``(disconnect / timeout / 중간 예외).
 #:
@@ -358,6 +394,7 @@ async def openai_sse_stream(
     drain_timeout: float | None = None,
     tokenizer_hook: TokenizerHook = None,
     on_complete: OnComplete = None,
+    prompt_usage_hook: PromptUsageHook = None,
 ) -> AsyncIterator[bytes]:
     """OpenAI-compatible SSE chunks → passthrough bytes (no re-formatting).
 
@@ -482,6 +519,9 @@ async def openai_sse_stream(
             cache_creation_input_tokens=0,
             cache_read_input_tokens=0,
         )
+        if latest_usage is None and accumulated_text:
+            # usage 는 마지막 청크에만 온다 — 그 전에 끊기면 입력이 0 이다(PromptUsageHook).
+            usage = await _with_prompt_estimate(usage, prompt_usage_hook)
         try:
             await on_usage(usage, first_token_time)
         except Exception:
@@ -583,6 +623,7 @@ async def responses_sse_stream(
     drain_timeout: float | None = None,
     on_complete: OnComplete = None,
     tokenizer_hook: TokenizerHook = None,
+    prompt_usage_hook: PromptUsageHook = None,
 ) -> AsyncIterator[bytes]:
     """OpenAI **Responses API** → re-framed SSE (`event: {type}\\ndata: {json}\\n\\n`).
 
@@ -722,6 +763,9 @@ async def responses_sse_stream(
         estimated_usage = await _estimate_output_tokens()
         if estimated_usage is not None:
             usage = estimated_usage
+        if latest_usage is None and accumulated_text:
+            # usage 는 종결 이벤트에만 온다 — 그 전에 끊기면 입력이 0 이다(PromptUsageHook).
+            usage = await _with_prompt_estimate(usage, prompt_usage_hook)
         try:
             await on_usage(usage, first_token_time)
         except Exception:

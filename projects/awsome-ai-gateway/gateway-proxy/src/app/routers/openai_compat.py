@@ -23,6 +23,7 @@ from app.services.fallback_loop import release_reservations
 from app.services.router_service import ModelInactiveError, RouterService
 from app.services.service_tier_gate import reject_unpriced_service_tier
 from app.services.streaming import openai_sse_stream
+from app.services.tokenizer import estimate_prompt_usage
 
 logger = structlog.get_logger(__name__)
 
@@ -378,6 +379,9 @@ async def _handle_openai(request: Request, path: str):
             else None
         )
 
+        async def _estimate_prompt() -> TokenUsage | None:
+            return await estimate_prompt_usage(tokenizer, req_data, model_config)
+
         return StreamingResponse(
             openai_sse_stream(
                 request,
@@ -385,6 +389,9 @@ async def _handle_openai(request: Request, path: str):
                 on_usage=_record,
                 tokenizer_hook=_estimate,
                 on_complete=_on_complete,
+                # 잘린 스트림의 프롬프트(usage 가 마지막 청크에만 온다). 비-2xx 는 상류가 받지
+                # 않은 요청이라 프롬프트를 청구하지 않는다.
+                prompt_usage_hook=_estimate_prompt if 200 <= status < 300 else None,
             ),
             status_code=status,
             media_type="text/event-stream",
@@ -899,6 +906,9 @@ async def _handle_responses(request: Request):
 
         from app.services.streaming import responses_sse_stream
 
+        async def _estimate_prompt() -> TokenUsage | None:
+            return await estimate_prompt_usage(_tokenizer, req_data, model_config)
+
         return StreamingResponse(
             responses_sse_stream(
                 request,
@@ -908,6 +918,8 @@ async def _handle_responses(request: Request):
                 # KI-08 역산 — 이 방언은 usage 가 종결 이벤트 안에만 있어서, 그 전에
                 # 끊기면 역산이 없으면 usage_logs 행이 아예 만들어지지 않는다.
                 tokenizer_hook=_estimate,
+                # 같은 이유로 프롬프트도 — 없으면 끊긴 턴의 입력이 0 으로 청구된다. 비-2xx 제외.
+                prompt_usage_hook=_estimate_prompt if 200 <= status < 300 else None,
             ),
             status_code=status,
             media_type="text/event-stream",
