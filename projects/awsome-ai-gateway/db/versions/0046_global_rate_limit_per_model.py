@@ -20,6 +20,29 @@ Create Date: 2026-10-15
     scope = 'GLOBAL'``. 모델 alias 당 활성 GLOBAL 행 1개. COALESCE 는 0024 와 같은 NULL 규칙이다 —
     유니크 인덱스에서 NULL 은 서로 다르므로, alias 없는 GLOBAL 행(콘솔은 만들지 않지만 SQL 로는
     가능하다)도 한 칸으로 묶지 않으면 아무 제약도 받지 않는다.
+  * ``rl_global_release_guard`` — 아래 지연 제약 트리거.
+
+## 이전 릴리스의 저장이 다른 모델의 한도를 지우지 못하게 — 지연 제약 트리거
+
+이 리비전이 적용된 DB 에 이전 admin-api 가 붙는 시간이 있다: 롤링 배포 동안, 그리고 이미지만 되돌린
+``helm rollback``(또는 ``--atomic`` 의 자동 롤백) 뒤 — 롤백은 마이그레이션 훅을 돌리지 않아 DB 는 0046 에
+남는다. 이전 admin-api 의 GLOBAL upsert 는 alias 와 무관하게 활성 GLOBAL 행을 **전부** 비활성화한다. 그
+저장 한 번이 모델 N 개 중 N−1 개의 한도를 감사 기록도 없이 해제한다.
+
+``rl_global_release_guard`` 는 활성 GLOBAL 행이 비활성화되는 행마다 커밋 시점에 같은 alias 의 활성
+GLOBAL 행이 있는지 본다. 없으면 ``check_violation`` 으로 커밋을 거부한다 — 그 트랜잭션은 통째로 롤백되고
+아무것도 바뀌지 않는다. 이 릴리스의 경로는 모두 통과한다: GLOBAL 저장·비우기는 같은 트랜잭션에서 같은
+alias 의 대체 행을 넣는다. 이전 admin-api 의 GLOBAL 저장은 다른 모델의 활성 GLOBAL 행이 하나라도 있으면
+조용한 해제 대신 **500** 이 된다(다른 모델의 활성 GLOBAL 행이 없으면 그대로 저장된다).
+
+  * ``DEFERRABLE INITIALLY DEFERRED`` — upsert 는 비활성화 **다음에** 대체 행을 넣는다. 행 단위 즉시
+    검사면 정상 저장도 막힌다.
+  * 의도된 해제는 그 트랜잭션에서만 ``SET LOCAL rl.allow_global_release = 'on'`` 으로 우회한다(세션
+    단위 ``SET`` 은 쓰지 않는다 — 풀링된 연결에 남는다). 이 리비전의 downgrade 와 문서의 정리 SQL 이
+    그렇게 하고, 감사 로그를 남긴다.
+  * ``DELETE`` 는 막지 않는다(``AFTER UPDATE OF is_active``). GLOBAL 행을 지우는 경로는 모델 등록
+    마이그레이션의 downgrade(FK 자식 정리)뿐이고, 그것은 이 리비전의 downgrade 가 트리거를 지운 뒤에만
+    돈다.
 
 ## 왜 옛 이름을 그대로 쓰나
 
@@ -38,13 +61,22 @@ Create Date: 2026-10-15
 제약이라 생성이 실패할 수 없다(누가 0024 인덱스를 손으로 지웠다면 PostgreSQL 이 중복 키를 이름과
 함께 보고하며 실패한다 — 그때는 0024 docstring 의 중복 정리 기준으로 먼저 정리한다).
 
-순서: 새 GLOBAL 인덱스를 먼저 만들고(SHARE — 읽기는 막지 않는다) 옛 인덱스를 지운 뒤 USER/TEAM
-인덱스를 만든다. 트랜잭션 하나라 어느 순간에도 제약이 비지 않는다. ``lock_timeout`` 은 0043·0045 와
-같다 — 긴 트랜잭션 뒤에서 ACCESS EXCLUSIVE(DROP INDEX)를 기다리는 동안 이 테이블의 모든 읽기(게이트웨이
-의 한도 캐시 미스)가 뒤에 줄 서지 않게, 기다리지 말고 실패한다(Job 이 재시도한다).
+## 잠금 — ACCESS EXCLUSIVE 를 처음에 잡는다(양방향)
 
-init SQL(``02_create_tables.sql``)이 같은 두 정의를 갖는다. 클라우드 Job 에서는 init SQL 이 먼저
-GLOBAL 인덱스를 만들고(옛 인덱스가 아직 있어 단일 슬롯은 유지된다) 이 리비전이 옛 정의를 바꾼다.
+DROP INDEX 는 ACCESS EXCLUSIVE 가 필요하다. 처음 구현은 인덱스 생성(SHARE)부터 하고 DROP 에서
+ACCESS EXCLUSIVE 로 올렸는데, 그 사이 이 테이블을 읽은 트랜잭션이 이어서 쓰려 하면 서로를 기다려
+교착이 됐다(실 PG16: 그 트랜잭션이 ``DeadlockDetectedError`` 로 죽었다). 그래서 첫 문장에서 ACCESS
+EXCLUSIVE 를 잡는다 — 읽고 쓰는 트랜잭션이 있으면 그것이 끝날 때까지 기다리고(PostgreSQL 이 그 쓰기를
+대기 중인 우리 요청보다 앞에 세운다), 교착은 없다.
+
+⚠️ 기다리는 동안과 쥐고 있는 동안 이 테이블의 **읽기도 줄을 선다** — 대기 중인 ACCESS EXCLUSIVE 요청
+뒤에 새 요청이 선다. ``lock_timeout`` 5s(0043·0045 와 같다)가 그 상한이다: 5초 안에 못 잡으면 이
+마이그레이션이 실패하고 아무것도 바뀌지 않으며 Job 이 재시도한다. 잡은 뒤의 DDL 은 작은 테이블이라
+짧다. 이 테이블의 읽기는 gateway-proxy 의 한도 캐시 미스(TTL 300s)와 admin-api 의 rate-limit 화면이다.
+
+init SQL(``02_create_tables.sql``)이 같은 인덱스·함수·트리거를 갖는다. 클라우드 Job 에서는 init SQL 이
+먼저 GLOBAL 인덱스와 트리거를 만들고(옛 인덱스가 아직 있어 단일 슬롯은 유지된다) 이 리비전이 옛 정의를
+바꾼다.
 
 ## 되돌리기(downgrade) — GLOBAL 한도를 말없이 버리지 않는다
 
@@ -52,18 +84,23 @@ GLOBAL 인덱스를 만들고(옛 인덱스가 아직 있어 단일 슬롯은 �
 "최신 하나만 남기기" 로 자동 정리하면 나머지 모델의 Bedrock 쿼터 보호가 **아무 신호 없이** 사라진다.
 어느 모델의 한도를 남길지는 운영 판단이다. 그래서:
 
-  * 실제 한도(rpm 또는 tpm)를 가진 활성 GLOBAL 행이 2개 이상이면 **실패한다**. 메시지에 모델·한도
-    목록과 정리 SQL 을 담는다. 트랜잭션이 롤백되므로 아무것도 바뀌지 않고 ``alembic_version`` 도
-    0046 그대로다.
-  * rpm·tpm 이 모두 NULL 인 활성 GLOBAL 행(콘솔에서 값을 비우고 저장한 모델)은 아무것도 집행하지
-    않는다 — gateway-proxy 는 GLOBAL 의 cpm/cph 를 읽지 않는다. 그런 행은 비활성화한다(삭제가 아니다,
-    이력은 남는다). 그래서 콘솔에서 비운 모델이 downgrade 를 막지 않는다.
-  * 판정 전에 테이블을 SHARE ROW EXCLUSIVE 로 잠근다 — 판정과 인덱스 생성 사이에 끼어든 저장이 판정을
-    무효화하지 못한다(읽기는 막지 않는다).
+  * 실제 한도(rpm 또는 tpm)를 가진, alias 있는 활성 GLOBAL 행이 2개 이상이면 **실패한다**. 메시지에
+    모델·한도 목록과 정리 방법을 담는다. 트랜잭션이 롤백되므로 아무것도 바뀌지 않고
+    ``alembic_version`` 도 0046 그대로다.
+  * 아무것도 집행하지 않는 활성 GLOBAL 행은 판정에서 빼고 비활성화한다(삭제가 아니다, 이력은 남는다):
+    rpm·tpm 이 모두 NULL 인 행(콘솔에서 값을 비우고 저장한 모델 — gateway-proxy 는 GLOBAL 의 cpm/cph 를
+    읽지 않는다)과 alias 가 없는 행(SQL 로만 생기고, gateway-proxy 는 GLOBAL 을 alias 로만 읽으며 콘솔
+    트리에도 나오지 않는다). 트리거를 ``SET LOCAL`` 로 우회하고, 행마다 ``audit.audit_logs`` 에
+    ``DELETE_RATE_LIMIT`` 를 남긴다.
+  * 판정 전에 ACCESS EXCLUSIVE 를 잡는다(위 잠금) — 판정과 인덱스 생성 사이에 끼어든 저장이 판정을
+    무효화하지 못한다.
+  * 인덱스 DDL 전에 ``SET CONSTRAINTS ALL IMMEDIATE`` 로 위 비활성화가 남긴 지연 트리거 이벤트를 처리한다
+    (우회가 켜져 있어 통과한다). PostgreSQL 은 지연 이벤트가 남은 테이블에 ``CREATE INDEX`` 를 거부한다
+    (``cannot CREATE INDEX ... because it has pending trigger events`` — 실 PG16).
 
-⚠️ 다운그레이드한 DB 는 **같은 차트의 다음 마이그레이션 Job 이 돌 때까지만** 0045 다. 그 Job 의 init SQL 이
-   GLOBAL 인덱스를 다시 만들고 alembic 이 이 리비전을 다시 적용한다. 0045 로 남기려면 다운그레이드 뒤에
-   이 리비전이 없는 차트(이미지)로 되돌린다 — 순서와 이미지만 되돌릴 때의 동작은
+⚠️ 다운그레이드한 DB 는 **0046 이 있는 차트의 다음 마이그레이션 Job 이 돌 때까지만** 그 상태다. 그 Job 의
+   init SQL 이 GLOBAL 인덱스와 트리거를 다시 만들고 alembic 이 이 리비전을 다시 적용한다. 되돌릴 대상
+   리비전은 0045 가 아니라 **이전 차트의 alembic head** 다 — 순서와 명령은
    deployment/docs/eks-fargate/06-upgrade-rollback.md §4.4.
 """
 
@@ -75,6 +112,8 @@ branch_labels = None
 depends_on = None
 
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
+# db/init/03_seed_data.sql 의 시스템 관리자 — 마이그레이션이 남기는 감사 행의 actor.
+SYSTEM_ADMIN_ID = "00000000-0000-4000-a000-000000000010"
 
 # 0046 — USER/TEAM: 0024 와 같은 키, GLOBAL 제외.
 CREATE_ACTIVE_INDEX = (
@@ -97,12 +136,78 @@ CREATE_SINGLE_SLOT_INDEX = (
     "WHERE is_active = true"
 )
 
-# 아무것도 집행하지 않는 활성 GLOBAL 행(rpm·tpm 모두 NULL) — downgrade 가 비활성화한다.
-DEACTIVATE_EMPTY_GLOBAL_ROWS = (
-    "UPDATE model.rate_limit_configs SET is_active = false, updated_at = now() "
-    "WHERE scope = 'GLOBAL' AND is_active = true "
-    "AND rpm_limit IS NULL AND tpm_limit IS NULL"
+# 활성 GLOBAL 행을 비활성화하는 커밋은 같은 alias 의 활성 GLOBAL 행이 남아 있어야 한다.
+# ⚠️ db/init/02_create_tables.sql 에 글자까지 같은 정의가 있다(실 PG 대조:
+#    admin-api tests/regression/test_high_global_rate_limit_0046_real_db.py).
+CREATE_RELEASE_GUARD_FUNCTION = """
+CREATE OR REPLACE FUNCTION model.rl_global_release_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF coalesce(current_setting('rl.allow_global_release', true), '') = 'on' THEN
+        RETURN NULL;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM model.rate_limit_configs
+         WHERE scope = 'GLOBAL' AND is_active
+           AND model_alias IS NOT DISTINCT FROM OLD.model_alias
+    ) THEN
+        RAISE EXCEPTION 'GLOBAL rate limit of % would be released without a replacement',
+            OLD.model_alias
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'rl_global_release_guard',
+                  HINT = 'Save that model''s GLOBAL limit instead. An intended release runs '
+                         || 'SET LOCAL rl.allow_global_release = ''on'' in its transaction.';
+    END IF;
+    RETURN NULL;
+END
+$$
+"""
+
+# CONSTRAINT TRIGGER 에는 IF NOT EXISTS 가 없다 — init SQL 이 먼저 만들었을 수 있다.
+CREATE_RELEASE_GUARD_TRIGGER = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+         WHERE tgrelid = 'model.rate_limit_configs'::regclass
+           AND tgname = 'rl_global_release_guard'
+    ) THEN
+        CREATE CONSTRAINT TRIGGER rl_global_release_guard
+            AFTER UPDATE OF is_active ON model.rate_limit_configs
+            DEFERRABLE INITIALLY DEFERRED
+            FOR EACH ROW
+            WHEN (OLD.scope = 'GLOBAL' AND OLD.is_active AND NOT NEW.is_active)
+            EXECUTE FUNCTION model.rl_global_release_guard();
+    END IF;
+END
+$$
+"""
+
+# downgrade — 아무것도 집행하지 않는 활성 GLOBAL 행(rpm·tpm 모두 NULL, 또는 alias 없음)을 비활성화하고
+# 행마다 감사 기록을 남긴다. 트리거 우회(SET LOCAL)를 먼저 켠다.
+RELEASE_UNENFORCED_GLOBAL_ROWS = f"""
+WITH released AS (
+    UPDATE model.rate_limit_configs SET is_active = false, updated_at = now()
+     WHERE scope = 'GLOBAL' AND is_active = true
+       AND (model_alias IS NULL OR (rpm_limit IS NULL AND tpm_limit IS NULL))
+    RETURNING id, model_alias, rpm_limit, tpm_limit
+), audited AS (
+    INSERT INTO audit.audit_logs
+        (actor_user_id, actor_role, action, resource_type, resource_id, changes,
+         result, ip_address, request_id)
+    SELECT '{SYSTEM_ADMIN_ID}'::uuid, 'ADMIN', 'DELETE_RATE_LIMIT', 'RateLimitConfig', r.id::text,
+           jsonb_build_object(
+               'before', jsonb_build_object(
+                   'scope', 'GLOBAL', 'model_alias', r.model_alias,
+                   'rpm', r.rpm_limit, 'tpm', r.tpm_limit),
+               'after', jsonb_build_object('scope', 'GLOBAL', 'deactivated', 1),
+               'reason', 'migration 0046 downgrade: this GLOBAL row enforced nothing'),
+           'SUCCESS', '0.0.0.0', 'migration-0046-downgrade'
+      FROM released r
+    RETURNING 1
 )
+SELECT r.model_alias, r.rpm_limit, r.tpm_limit FROM released r ORDER BY r.model_alias NULLS FIRST
+"""
 
 ACTIVE_GLOBAL_ROWS = (
     "SELECT model_alias, rpm_limit, tpm_limit FROM model.rate_limit_configs "
@@ -113,40 +218,54 @@ ACTIVE_GLOBAL_ROWS = (
 
 def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
+    # 처음부터 ACCESS EXCLUSIVE — SHARE 에서 올리면 읽고-쓰는 트랜잭션과 교착한다(docstring 잠금).
+    op.execute("LOCK TABLE model.rate_limit_configs IN ACCESS EXCLUSIVE MODE")
     op.execute(CREATE_GLOBAL_INDEX)
     op.execute("DROP INDEX IF EXISTS model.uq_rate_limit_configs_active")
     op.execute(CREATE_ACTIVE_INDEX)
+    op.execute(CREATE_RELEASE_GUARD_FUNCTION)
+    op.execute(CREATE_RELEASE_GUARD_TRIGGER)
 
 
 def downgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
-    op.execute("LOCK TABLE model.rate_limit_configs IN SHARE ROW EXCLUSIVE MODE")
+    op.execute("LOCK TABLE model.rate_limit_configs IN ACCESS EXCLUSIVE MODE")
+    op.execute("SET LOCAL rl.allow_global_release = 'on'")
     conn = op.get_bind()
 
-    emptied = conn.exec_driver_sql(DEACTIVATE_EMPTY_GLOBAL_ROWS).rowcount
+    released = conn.exec_driver_sql(RELEASE_UNENFORCED_GLOBAL_ROWS).all()
     held = conn.exec_driver_sql(ACTIVE_GLOBAL_ROWS).all()
     if len(held) > 1:
-        listing = "\n".join(
-            f"  {alias if alias is not None else '<no alias>'}: rpm={rpm}, tpm={tpm}"
-            for alias, rpm, tpm in held
-        )
+        listing = "\n".join(f"  {alias}: rpm={rpm}, tpm={tpm}" for alias, rpm, tpm in held)
         raise RuntimeError(
             "[0046] downgrade refused: revision 0045 allows one active GLOBAL rate limit in total, "
             f"but {len(held)} models have one:\n{listing}\n"
             "Downgrading would drop the others' Bedrock quota protection, and which one to keep is "
-            "your call. Keep one and clear the rest — in the console (empty RPM and TPM, then save) "
-            "or with:\n"
-            "  UPDATE model.rate_limit_configs SET is_active = false\n"
-            "   WHERE scope = 'GLOBAL' AND is_active\n"
-            "     AND model_alias IS DISTINCT FROM '<alias to keep>';\n"
-            "then rerun the downgrade. Nothing was changed."
+            "your call. Keep one and clear the rest, then rerun the downgrade:\n"
+            "  - in the console: empty RPM and TPM and save (audit-logged; this downgrade then "
+            "deactivates the empty rows), or\n"
+            "  - in SQL, in one transaction (0046 refuses to release a GLOBAL limit otherwise):\n"
+            "      BEGIN;\n"
+            "      SET LOCAL rl.allow_global_release = 'on';\n"
+            "      UPDATE model.rate_limit_configs SET is_active = false, updated_at = now()\n"
+            "       WHERE scope = 'GLOBAL' AND is_active\n"
+            "         AND model_alias IS DISTINCT FROM '<alias to keep>';\n"
+            "      COMMIT;\n"
+            "    (deployment/docs/eks-fargate/06-upgrade-rollback.md section 4.4 has the "
+            "audit-logged form.)\n"
+            "Nothing was changed."
         )
 
+    # 위 UPDATE 가 남긴 지연 트리거 이벤트를 지금 처리한다(우회가 켜져 있어 통과). 남아 있으면 아래
+    # CREATE INDEX 가 "pending trigger events" 로 거부된다.
+    op.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    op.execute("DROP TRIGGER IF EXISTS rl_global_release_guard ON model.rate_limit_configs")
+    op.execute("DROP FUNCTION IF EXISTS model.rl_global_release_guard()")
     op.execute("DROP INDEX IF EXISTS model.uq_rate_limit_configs_active")
     op.execute(CREATE_SINGLE_SLOT_INDEX)
     op.execute("DROP INDEX IF EXISTS model.uq_rate_limit_configs_global_active")
-    if emptied:
+    for alias, rpm, tpm in released:
         print(
-            f"[0046] deactivated {emptied} active GLOBAL row(s) with neither rpm nor tpm "
-            "(they enforced nothing); the remaining GLOBAL limit, if any, is kept"
+            f"[0046] deactivated the active GLOBAL row of {alias if alias is not None else '<no alias>'} "
+            f"(rpm={rpm}, tpm={tpm}) — it enforced nothing; audit.audit_logs has a DELETE_RATE_LIMIT entry"
         )
