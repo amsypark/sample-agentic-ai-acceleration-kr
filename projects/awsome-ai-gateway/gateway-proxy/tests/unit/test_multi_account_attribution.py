@@ -21,7 +21,7 @@ import ast
 import json
 import pathlib
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -369,3 +369,117 @@ async def _until_written(written: list) -> None:
 
     while not written:
         await asyncio.sleep(0.005)
+
+
+# ── bedrock-runtime chat 스트림: 강제한 include_usage 가 alias 계정 서명 안에 들어간다 ──────────
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_chat_stream_for_an_alias_account_signs_as_it_and_records_real_usage(
+    monkeypatch, mock_redis, auth_context_vk
+):
+    """runtime plane 은 chat 스트림의 usage 를 받으려고 본문에 include_usage 를 강제한다
+    (bedrock_openai_adapter.with_chat_usage). 본문은 SigV4 서명 대상이라 그 강제는 서명 **전에**
+    일어나야 하고, 그 서명은 alias 계정(0043)의 자격증명이어야 한다 — 프로필 역할(444455556666)도
+    파드도 아니다. 원장 행은 실제 usage(추정 아님)와 그 계정을 남기고, 클라이언트는 요청하지 않은
+    usage 청크를 받지 않는다.
+
+    실제 _handle_openai · BedrockOpenAIAdapter · SigV4Signer · CostRecorder.finalize 를 지난다.
+    대역은 STS(역할마다 계정이 박힌 키)와 상류뿐이고, 상류는 측정대로 서명된 본문에 include_usage 가
+    있을 때만 usage 청크를 보낸다(test_bedrock_openai_adapter._measured_runtime_http).
+    """
+    from decimal import Decimal
+
+    from starlette.datastructures import Headers
+
+    from app.providers.bedrock_openai_adapter import BedrockOpenAIAdapter
+    from app.routers import openai_compat
+    from app.schemas.domain import ApiFormat, ModelConfigSchema, ModelPricingSchema, ModelStatus
+    from app.schemas.routing import RoutingProfileSchema
+    from app.services import bg_tasks
+    from app.services.cost_recorder import CostRecorder
+    from app.services.sigv4_signer import SigV4Signer
+    from tests.unit.test_bedrock_openai_adapter import _CHAT_DONE, ENDPOINT, _measured_runtime_http
+    from tests.unit.test_multi_account import _cred_key, _PodSession, _provider, _sts
+
+    _mock_budget(mock_redis)
+    cfg = ModelConfigSchema(
+        provider_model_id="us.openai.gpt-6-luna",
+        alias="gpt-6-luna",
+        provider=ProviderType.BEDROCK_RUNTIME_OPENAI,
+        api_format=ApiFormat.OPENAI_RESPONSES,
+        endpoint=ENDPOINT,
+        pricing=ModelPricingSchema(input_per_1k=Decimal("0.0002"), output_per_1k=Decimal("0.0012")),
+        status=ModelStatus.ACTIVE,
+        account_role_arn=ALIAS_ROLE,
+        account_external_id="alias-ext",
+    )
+    profile = RoutingProfileSchema(
+        client="codex", backend="bedrock_openai", account_role_arn=PROFILE.role_arn,
+        region="us-east-2", default_model="gpt-6-luna", external_id="codex-ext",
+    )
+    sts, sts_calls = _sts(per_role_keys=True)
+    profile_sts = MagicMock()
+    profile_sts.assume_role = MagicMock(side_effect=AssertionError("프로필 역할로 assume 했다"))
+    signer = SigV4Signer(sts_client=profile_sts, account_provider=_provider(sts))
+    signer._session = _PodSession()
+    real_sign, signed = signer.sign, []
+
+    async def _spy_sign(**kw):
+        signed.append(kw["body"])
+        return await real_sign(**kw)
+
+    signer.sign = _spy_sign
+    http, sent = _measured_runtime_http()
+    adapter = BedrockOpenAIAdapter(http_client=http, signer=signer)
+
+    async def _resolve(redis, db, alias):
+        return cfg
+
+    async def _no_limits(**_k):
+        return None
+
+    async def _load(*_a, **_k):
+        return profile
+
+    monkeypatch.setattr(openai_compat._router_service, "resolve_openai_model", _resolve)
+    monkeypatch.setattr("app.services.rate_limit_enforcement.enforce_rate_limits", _no_limits)
+    app_state = SimpleNamespace(
+        provider_registry=SimpleNamespace(get=lambda _p: adapter),
+        cost_recorder=CostRecorder(),
+        tokenizer=None,
+        body_logger=None,
+        metrics=None,
+        agentcore_mcp_client=None,
+        routing_profile_loader=SimpleNamespace(load=_load),
+    )
+    body = {"model": "gpt-6-luna", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+    state = {"auth_context": auth_context_vk, "client": "codex", "_redis": mock_redis,
+             "_session_factory": None, "request_id": "req-rt-chat"}
+
+    class _Req:
+        scope = {"state": state}
+        app = SimpleNamespace(state=app_state)
+        headers = Headers()
+
+        async def body(self) -> bytes:
+            return json.dumps(body).encode()
+
+    resp = await openai_compat._handle_openai(_Req(), "/v1/chat/completions")
+    client_bytes = b"".join([c async for c in resp.body_iterator])
+    await bg_tasks.drain(timeout=2.0)
+
+    # 서명: alias 계정의 역할·ExternalId 로 assume 했고, 보낸 요청이 그 자격증명으로 서명됐다.
+    assert [(c["RoleArn"], c.get("ExternalId")) for c in sts_calls] == [(ALIAS_ROLE, "alias-ext")]
+    assert _cred_key(http.stream.call_args.kwargs["headers"]).startswith("ASIA_111122223333_")
+    # 강제는 서명 전: 서명한 바이트 = 보낸 바이트이고, 그 안에 include_usage 가 있다.
+    assert sent == signed and len(sent) == 1, "서명한 바이트와 보낸 바이트가 다르다"
+    assert json.loads(sent[0])["stream_options"] == {"include_usage": True}
+    # 원장: 실제 usage(상류가 보낸 12/6, 추정 아님)와 서명한 계정.
+    payload = json.loads(mock_redis.xadd.call_args.args[1]["payload"])
+    assert (payload["request_id"], payload["aws_account_id"]) == ("req-rt-chat", "111122223333")
+    assert (payload["input_tokens"], payload["output_tokens"]) == (12, 6)
+    assert payload["estimated_usage"] is False
+    # 클라이언트는 요청하지 않은 usage 청크를 받지 않는다(strip_usage_chunk).
+    assert b'"usage"' not in client_bytes and b'"choices":[]' not in client_bytes
+    assert b"Hello there" in client_bytes and client_bytes.endswith(_CHAT_DONE)
