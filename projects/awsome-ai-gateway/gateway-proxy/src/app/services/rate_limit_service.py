@@ -32,6 +32,12 @@ _TPM_KEY_TTL = 60 * 2 + 60
 #: +13.6MB. 초당 100요청 × 스코프 5(TPM 3 + 비용 2) 이면 120초 동안 6만 개 ≈ 12MB 가 상한이고
 #: 늘 그만큼 있다(만료가 생성과 같은 속도). 시간 단위로 두면 30배(≈ 360MB)가 된다.
 _SETTLE_MARKER_TTL = 120
+#: 예약 표지(한 예약을 한 번만 예약)의 수명. 같은 예약 EVAL 이 두 번 오는 경우는 응답이 늦어
+#: redis-py 가 다시 보내는 것뿐이고, 그 재시도는 첫 시도의 socket_timeout(운영 2초) + 백오프(최대
+#: 0.5초) 뒤에 온다 — redis_retries 를 몇 번으로 올려도 수십 초 안이다. 표지에는 처음 결과(JSON)를
+#: 담아 두므로 정산 표지보다 크다: redis 7 실측 MEMORY USAGE TPM 328바이트·비용 200바이트, 초당
+#: 100요청 × 스코프 5(TPM 3 + 비용 2) × 60초 = 3만 개를 실제로 만들면 used_memory +9.6MB.
+_RESERVE_MARKER_TTL = 60
 
 # 관측성 hook(deepdive Q50 Phase 3) — rate-limit eval 이 예외로 fail-open(집행 못함)
 # 한 횟수를 셀 카운터. main.py lifespan 에서 set_fail_open_metric(metrics.rl_fail_open_total)
@@ -163,18 +169,22 @@ async def _guarded_eval(redis, *args):
     return out
 
 
-def _cost_settle_marker(cpm_key: str, reservation_id: str) -> str:
-    """``rl:cost:<scope>:{<id>}:cpm:<ts>`` → ``rl:cost-settled:<scope>:{<id>}:<예약 id>``.
+def _cost_marker(cpm_key: str, reservation_id: str, kind: str) -> str:
+    """``rl:cost:<scope>:{<id>}:cpm:<ts>`` → ``rl:cost-<kind>:<scope>:{<id>}:<예약 id>``.
 
-    같은 hash tag({<id>}) = 정산 대상 키와 같은 슬롯이다. ``rl:cost:*`` 패턴에는 걸리지 않는다.
+    kind = ``settled``(정산 표지) 또는 ``reserved``(예약 표지). 같은 hash tag({<id>}) = 대상
+    키와 같은 슬롯이다. ``rl:cost:*`` 패턴에는 걸리지 않는다.
     """
     head = cpm_key.rsplit(":cpm:", 1)[0]  # rl:cost:<scope>:{<id>}
-    return "rl:cost-settled:" + head[len("rl:cost:"):] + ":" + reservation_id
+    return f"rl:cost-{kind}:" + head[len("rl:cost:"):] + ":" + reservation_id
 
 
-def _tpm_settle_marker(cur_key: str, reservation_id: str) -> str:
-    """``{SCOPE:id:model}:tpm:cur`` → ``{SCOPE:id:model}:tpm-settled:<예약 id>`` (같은 hash tag)."""
-    return cur_key.rsplit(":tpm:", 1)[0] + ":tpm-settled:" + reservation_id
+def _tpm_marker(cur_key: str, reservation_id: str, kind: str) -> str:
+    """``{SCOPE:id:model}:tpm:cur`` → ``{SCOPE:id:model}:tpm-<kind>:<예약 id>`` (같은 hash tag).
+
+    kind = ``settled`` 또는 ``reserved``. ``{*}:tpm:*`` 패턴에는 걸리지 않는다.
+    """
+    return cur_key.rsplit(":tpm:", 1)[0] + f":tpm-{kind}:" + reservation_id
 
 
 class RateLimitService:
@@ -303,7 +313,12 @@ class RateLimitService:
                 d.scope.value,
             ]
             try:
-                raw = await _guarded_eval(redis, script, 3, cur, prev, win, *argv)
+                # 예약 표지 — 응답이 늦어 클라이언트가 같은 EVAL 을 다시 보내도 한 번만 예약하고
+                # 처음 결과를 돌려받는다(스크립트 docstring).
+                raw = await _guarded_eval(
+                    redis, script, 4, cur, prev, win, _tpm_marker(cur, rid, "reserved"),
+                    *argv, str(_RESERVE_MARKER_TTL),
+                )
                 result = json.loads(raw)
             except Exception:
                 # eval 실패 — 정책(rl_fail_mode)에 따라 통과(open)/차단(closed). 카운트.
@@ -405,7 +420,7 @@ class RateLimitService:
                     cur,
                     prev,
                     win,
-                    _tpm_settle_marker(cur, reservation_id),
+                    _tpm_marker(cur, reservation_id, "settled"),
                     str(adjustment),
                     str(bucket),
                     str(_TPM_KEY_TTL),
@@ -560,13 +575,16 @@ class RateLimitService:
                 raw = await _guarded_eval(
                     redis,
                     script,
-                    2,
+                    3,
                     cpm_key,
                     cph_key,
+                    # 예약 표지 — 늦은 응답의 재시도도 한 번만 예약한다(스크립트 docstring).
+                    _cost_marker(cpm_key, rid, "reserved"),
                     str(estimated_cost),
                     str(cpm),
                     str(cph),
                     label,
+                    str(_RESERVE_MARKER_TTL),
                 )
                 result = json.loads(raw)
             except Exception:
@@ -701,7 +719,7 @@ class RateLimitService:
                     5,
                     cpm_key,
                     cph_key,
-                    _cost_settle_marker(cpm_key, reservation_id),
+                    _cost_marker(cpm_key, reservation_id, "settled"),
                     # 같은 스코프의 지금 창 키 — 예약한 창이 지난 추가 청구가 간다(스크립트
                     # docstring). 예약한 창이 아직이면 위 두 키와 같다.
                     f"{cpm_key.rsplit(':', 1)[0]}:{(now // 60) * 60}",

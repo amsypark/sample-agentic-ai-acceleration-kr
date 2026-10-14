@@ -473,11 +473,13 @@ async def test_check_multi_scope_tpm_allowed(mock_redis):
         mock_redis, descriptors, reserved_tokens=5000
     )
     assert result.allowed is True
-    # CROSSSLOT 대응(deepdive Q50): scope 별 분리 호출 → eval 3회, 각 numkeys=3
-    # (한 scope 의 cur/prev/window 는 동일 hash tag = 단일 슬롯).
+    # CROSSSLOT 대응(deepdive Q50): scope 별 분리 호출 → eval 3회, 각 numkeys=4
+    # (한 scope 의 cur/prev/window 와 예약 표지는 동일 hash tag = 단일 슬롯).
     assert mock_redis.eval.await_count == 3
     for call in mock_redis.eval.await_args_list:
-        assert call.args[1] == 3
+        assert call.args[1] == 4
+        cur, marker = call.args[2], call.args[5]
+        assert marker.startswith(cur.replace(":tpm:cur", ":tpm-reserved:"))
 
 
 @pytest.mark.asyncio
@@ -655,12 +657,14 @@ async def test_reserve_cost_user_and_team_pass(mock_redis):
     assert result.allowed is True
     assert result.reserved_cost == Decimal("0.005")
     # CROSSSLOT 대응(deepdive Q50): scope 별 분리 호출 → eval 2회(USER, TEAM),
-    # 각 numkeys=2(cpm/cph 동일 hash tag = 단일 슬롯). scope_label 은 ARGV 마지막.
+    # 각 numkeys=3(cpm/cph 와 예약 표지는 동일 hash tag = 단일 슬롯). ARGV 는 비용, cpm·cph
+    # 한도, scope_label, 표지 TTL 순서다.
     assert mock_redis.eval.await_count == 2
-    labels = [call.args[-1] for call in mock_redis.eval.await_args_list]
+    labels = [call.args[-2] for call in mock_redis.eval.await_args_list]
     assert labels == ["USER", "TEAM"]
-    for call in mock_redis.eval.await_args_list:
-        assert call.args[1] == 2
+    for call, sid in zip(mock_redis.eval.await_args_list, ("user:{u1}", "team:{t1}")):
+        assert call.args[1] == 3
+        assert call.args[4].startswith(f"rl:cost-reserved:{sid}:")
 
 
 @pytest.mark.asyncio

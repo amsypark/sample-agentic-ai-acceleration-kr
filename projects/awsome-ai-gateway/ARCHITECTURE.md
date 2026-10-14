@@ -313,7 +313,8 @@ INLINE (gateway-proxy, CostRecorder.finalize, ~1–2ms, fail-soft, DB I/O 없음
   → settle_cost(CPM/CPH — 예약한 스코프만, 스코프별 EVAL. 환불은 예약한 창의 키에서만, 예약한 창이 지난 추가 청구는 지금 창에. 예약마다 한 번만(정산 표지). TTL 없는 키를 만들지 않음)
   → settle_tpm(예약한 스코프만. 환불은 예약한 버킷에서만 — 한 번 회전했으면 prev, 그보다 오래면 쓰지 않음. 예약한 버킷이 지난 추가분은 지금 버킷의 cur 에. 예약마다 한 번만)
   (거부된 요청은 정산 상태가 없다 — 뒤 스코프·비용 단계가 거부하면 enforce 가 그 요청의 TPM·비용 예약을
-   그 자리에서 되돌린다)
+   그 자리에서 되돌린다. 예약 EVAL 도 예약 id 표지로 한 번만 반영된다 — 응답이 늦어 클라이언트가 다시
+   보낸 같은 EVAL 은 처음 결과를 돌려받고, RPM 은 이미 들어간 요청을 다시 세어 거부하지 않는다)
   → XADD cost:stream {CostStreamEntry(... client ...)}     (실패 시 CostStreamSpool 스풀링)
 
 OFFLOADED (cost-recorder-worker):
