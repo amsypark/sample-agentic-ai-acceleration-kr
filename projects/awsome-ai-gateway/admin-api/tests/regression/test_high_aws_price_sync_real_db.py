@@ -177,7 +177,7 @@ async def test_sync_writes_aws_long_rates_to_real_db(dsn):
                     db, aliases=[alias.alias], region_code="us-gov-west-1", actor=_actor()
                 )
             await db.commit()
-        assert resp.synced == [alias.alias], (resp.synced, resp.skipped)
+        assert resp.response.synced == [alias.alias], (resp.response.synced, resp.response.skipped)
 
         async with Session() as db:
             cur = (await db.execute(

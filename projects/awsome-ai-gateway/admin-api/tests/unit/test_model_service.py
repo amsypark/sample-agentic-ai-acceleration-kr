@@ -228,10 +228,42 @@ class TestSetPricing:
         assert created.cache_creation_5m_price_per_1k_tokens == Decimal("0.00375")
         assert created.cache_creation_1h_price_per_1k_tokens == Decimal("0.006")
         assert created.cache_read_price_per_1k_tokens == Decimal("0.0003")
-        assert result.current_pricing is not None
-        assert result.current_pricing.cache_creation_5m_price_per_1k_tokens == Decimal("0.00375")
-        assert result.current_pricing.cache_creation_1h_price_per_1k_tokens == Decimal("0.006")
-        assert result.current_pricing.cache_read_price_per_1k_tokens == Decimal("0.0003")
+        current = result.response.current_pricing
+        assert current is not None
+        assert current.cache_creation_5m_price_per_1k_tokens == Decimal("0.00375")
+        assert current.cache_creation_1h_price_per_1k_tokens == Decimal("0.006")
+        assert current.cache_read_price_per_1k_tokens == Decimal("0.0003")
+
+    async def test_set_pricing_returns_the_keys_and_leaves_them_until_after_commit(
+        self, model_service: ModelService, mock_session: AsyncMock, admin_user: CurrentUser,
+        mock_redis: AsyncMock,
+    ):
+        """먼저 지우면 그 창의 게이트웨이 캐시 미스가 옛 단가를 300초 다시 캐시한다(ModelMutation)."""
+        data = PricingRequest(
+            input_price_per_1k_tokens=Decimal("0.005"),
+            output_price_per_1k_tokens=Decimal("0.025"),
+            effective_from=datetime.now(timezone.utc),
+        )
+        with patch("app.services.model_service.ModelRepository") as MockRepo, \
+             patch("app.services.model_service.audit_logger") as mock_audit:
+            repo = MockRepo.return_value
+            repo.get_by_alias = AsyncMock(return_value=_make_model())
+            repo.get_current_pricing = AsyncMock(return_value=None)
+            repo.close_current_pricing = AsyncMock()
+            repo.create_pricing = AsyncMock()
+            mock_audit.log = AsyncMock()
+
+            outcome = await model_service.set_pricing(
+                mock_session, alias="claude-sonnet", data=data, actor=admin_user
+            )
+
+        # 모델 id 키도 — 게이트웨이가 모델 id 로 지목한 해석(단가 포함)을 그 키에 캐시한다.
+        assert outcome.cache_keys == [
+            "model:claude-sonnet",
+            "model:anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "model:list",
+        ]
+        mock_redis.delete.assert_not_called()
 
     async def test_set_pricing_defaults_cache_to_zero(
         self, model_service: ModelService, mock_session: AsyncMock, admin_user: CurrentUser
@@ -267,7 +299,7 @@ class TestSetPricing:
 
 
 class TestPatchStatus:
-    async def test_patch_status_to_inactive_invalidates_cache(
+    async def test_patch_status_to_inactive_returns_the_keys_to_invalidate_after_commit(
         self, model_service: ModelService, mock_session: AsyncMock, admin_user: CurrentUser, mock_redis: AsyncMock
     ):
         data = StatusPatchRequest(active=False)
@@ -283,5 +315,12 @@ class TestPatchStatus:
 
             result = await model_service.patch_status(mock_session, alias="claude-sonnet", data=data, actor=admin_user)
 
-        assert result.status == "INACTIVE"
-        assert mock_redis.delete.call_count >= 1
+        assert result.response.status == "INACTIVE"
+        # 커밋 전(서비스 안)에는 지우지 않는다 — 먼저 지우면 그 창의 캐시 미스가 아직 ACTIVE 인 행을
+        # 300초 다시 캐시해 kill switch 가 늦게 걸린다. 라우터가 커밋 뒤에 지운다(ModelMutation).
+        assert result.cache_keys == [
+            "model:claude-sonnet",
+            "model:anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "model:list",
+        ]
+        mock_redis.delete.assert_not_called()

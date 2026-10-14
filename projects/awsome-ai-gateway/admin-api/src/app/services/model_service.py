@@ -49,11 +49,12 @@ class ModelMutation:
 
     서비스가 직접 지우지 않는 이유: 이 서비스는 커밋 전에 끝난다(CommittingRoute 가 그 뒤에
     커밋한다). 커밋 전에 지우면 그 창에 들어온 게이트웨이 캐시 미스가 저장 전 행을 다시 읽어
-    **옛 계정**을 300초 더 캐시한다. 라우터가 커밋한 뒤 :meth:`ModelService.invalidate` 로 지운다
-    (routers/aws_accounts.py 와 같은 순서).
+    **옛 값**을 300초 더 캐시한다 — 옛 계정, 옛 단가(set_pricing·sync_aws_pricing), 비활성화
+    전의 ACTIVE(patch_status, 즉 kill switch 가 5분 늦게 걸린다). 라우터가 커밋한 뒤
+    :meth:`ModelService.invalidate` 로 지운다(routers/aws_accounts.py 와 같은 순서).
     """
 
-    response: ModelResponse
+    response: ModelResponse | AwsPriceSyncResponse
     cache_keys: list[str] = field(default_factory=list)
 
 
@@ -407,7 +408,7 @@ class ModelService:
         actor: CurrentUser,
         ip_address: str = "0.0.0.0",
         request_id: str = "",
-    ) -> ModelResponse:
+    ) -> ModelMutation:
         repo = ModelRepository(session)
         model = await repo.get_by_alias(alias)
         if model is None:
@@ -455,7 +456,11 @@ class ModelService:
 
         # model:list 도 무효화한다 — list 엔드포인트가 _orm_to_schema 로 pricing 을 함께 실어
         # 보내므로, 여기서 안 지우면 요율 변경 뒤 MODEL_LIST_CACHE_TTL 동안 옛 단가를 응답한다.
-        await self._cache_mgr.invalidate([f"model:{alias}", "model:list"], session=session)
+        # 모델 id 키도 — 게이트웨이가 모델 id 로 지목한 해석(단가 포함)을 그 키에 캐시한다
+        # (create_model 주석). 지우는 것은 라우터가 커밋한 뒤다(ModelMutation).
+        cache_keys = list(dict.fromkeys(
+            [f"model:{alias}", f"model:{model.provider_model_id}", "model:list"]
+        ))
 
         await audit_logger.log(
             session,
@@ -475,7 +480,7 @@ class ModelService:
             request_id=request_id,
         )
 
-        return self._to_response(model, pricing)
+        return ModelMutation(self._to_response(model, pricing), cache_keys)
 
     # ── AWS Price List 자동연동 (fetch ≠ apply) ──────────────────────────────────────
     # preview 는 DB 를 건드리지 않고 필드별 drift 만 계산한다. sync 는 운영자가 승인한 alias 만
@@ -572,15 +577,17 @@ class ModelService:
         actor: CurrentUser,
         ip_address: str = "0.0.0.0",
         request_id: str = "",
-    ) -> AwsPriceSyncResponse:
+    ) -> ModelMutation:
         """운영자가 승인한 alias 만 AWS 단가로 반영. 각 alias 는 기존 set_pricing 경로로 나가므로
         감사·캐시무효화·long 승계가 그대로 적용된다. AWS 가 안 주는 항(short cache_1h)은 현재
-        행에서 보존해 full-replace clobber 를 막는다.
+        행에서 보존해 full-replace clobber 를 막는다. 반영한 alias 들의 캐시 키는 모아서 돌려준다 —
+        한 번의 커밋 뒤에 라우터가 지운다(ModelMutation).
         """
         repo = ModelRepository(session)
         aws = await asyncio.to_thread(fetch_bedrock_prices, region_code)
         synced: list[str] = []
         skipped: list[str] = []
+        cache_keys: list[str] = []
 
         for alias in aliases:
             model = await repo.get_by_alias(alias)
@@ -619,7 +626,7 @@ class ModelService:
                     long_context_cache_read_price_per_1k_tokens=entry.long.get("cache_read") if has_long else None,
                     effective_from=datetime.now(timezone.utc),
                 )
-                await self.set_pricing(
+                outcome = await self.set_pricing(
                     session, alias=alias, data=data, actor=actor,
                     ip_address=ip_address, request_id=request_id,
                 )
@@ -630,9 +637,12 @@ class ModelService:
                 logger.warning("aws_sync_alias_rejected", alias=alias)
                 skipped.append(alias)
                 continue
+            cache_keys.extend(outcome.cache_keys)
             synced.append(alias)
 
-        return AwsPriceSyncResponse(synced=synced, skipped=skipped)
+        return ModelMutation(
+            AwsPriceSyncResponse(synced=synced, skipped=skipped), list(dict.fromkeys(cache_keys))
+        )
 
     async def patch_status(
         self,
@@ -643,7 +653,7 @@ class ModelService:
         actor: CurrentUser,
         ip_address: str = "0.0.0.0",
         request_id: str = "",
-    ) -> ModelResponse:
+    ) -> ModelMutation:
         repo = ModelRepository(session)
         new_status = ModelStatus.ACTIVE if data.active else ModelStatus.INACTIVE
         if new_status == ModelStatus.ACTIVE:
@@ -672,8 +682,12 @@ class ModelService:
 
         pricing = await repo.get_current_pricing(alias)
 
-        # BR-MOD-03/04: Immediate cache invalidation on INACTIVE
-        await self._cache_mgr.invalidate([f"model:{alias}", "model:list"], session=session)
+        # BR-MOD-03/04: Immediate cache invalidation on INACTIVE — 커밋 **뒤에**(ModelMutation).
+        # 먼저 지우면 그 창의 캐시 미스가 아직 ACTIVE 인 행을 300초 다시 캐시해 kill switch 가 늦게
+        # 걸린다. 모델 id 키도 지운다 — 모델 id 로 부른 요청은 그 키의 해석으로 서빙된다.
+        cache_keys = list(dict.fromkeys(
+            [f"model:{alias}", f"model:{model.provider_model_id}", "model:list"]
+        ))
 
         await audit_logger.log(
             session,
@@ -687,7 +701,7 @@ class ModelService:
             request_id=request_id,
         )
 
-        return self._to_response(model, pricing)
+        return ModelMutation(self._to_response(model, pricing), cache_keys)
 
     @staticmethod
     def _to_response(model: ModelAlias, pricing: ModelPricing | None) -> ModelResponse:

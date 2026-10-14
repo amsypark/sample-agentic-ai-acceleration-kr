@@ -297,6 +297,53 @@ async def test_model_saves_invalidate_the_cache_only_after_commit(api):
     assert in_tx is False, "수정: 캐시를 커밋 전에 지웠다"
 
 
+async def test_pricing_status_and_aws_sync_invalidate_the_cache_only_after_commit(api):
+    """단가·상태 저장도 같다. 커밋 전에 지우면 그 창의 캐시 미스가 옛 단가를, 또는 비활성화 전의
+    ACTIVE 를 300초 다시 캐시한다 — kill switch 가 그만큼 늦게 걸린다. 모델 id 키도 지워야 모델 id 로
+    부른 요청이 옛 해석으로 서빙되지 않는다."""
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from unittest.mock import patch
+
+    from app.services.aws_price_list import AwsModelPrice, normalize_pmid
+
+    client, _sql, cache = api
+    assert (await client.post("/admin/models", json=_model_body())).status_code == 201
+    want = ["model:acctapi-claude", "model:anthropic.acctapi-claude", "model:list"]
+
+    def _last(label):
+        keys, in_tx = cache.calls[-1]
+        assert keys == want, (label, keys)
+        assert in_tx is False, f"{label}: 캐시를 커밋 전에 지웠다"
+
+    cache.calls.clear()
+    r = await client.put("/admin/models/acctapi-claude/pricing", json={
+        "input_price_per_1k_tokens": "0.004", "output_price_per_1k_tokens": "0.005",
+        "effective_from": datetime.now(timezone.utc).isoformat(),
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["current_pricing"]["input_price_per_1k_tokens"] == "0.004"
+    _last("단가")
+
+    r = await client.patch("/admin/models/acctapi-claude/status", json={"active": False})
+    assert r.status_code == 200 and r.json()["status"] == "INACTIVE", r.text
+    _last("비활성화")
+    r = await client.patch("/admin/models/acctapi-claude/status", json={"active": True})
+    assert r.status_code == 200 and r.json()["status"] == "ACTIVE", r.text
+    _last("활성화")
+
+    pmid = normalize_pmid("anthropic.acctapi-claude")
+    aws = {pmid: AwsModelPrice(provider_model_id=pmid, region_code="us-east-1", endpoint="runtime",
+                               short={"input": Decimal("0.006"), "output": Decimal("0.007")}, long={})}
+    calls_before = len(cache.calls)
+    with patch("app.services.model_service.fetch_bedrock_prices", return_value=aws):
+        r = await client.post("/admin/models/pricing/aws-sync",
+                              json={"aliases": ["acctapi-claude"], "region_code": "us-east-1"})
+    assert r.status_code == 200 and r.json()["synced"] == ["acctapi-claude"], r.text
+    assert len(cache.calls) == calls_before + 1, "자동연동: alias 마다가 아니라 커밋 뒤 한 번 지운다"
+    _last("자동연동")
+
+
 # ── 같은 모델 id 의 형제 alias 와 계정 일치 ───────────────────────────────────────────
 
 _SHARED = "acctapi-shared.model-id"  # 픽스처 정리(acctapi-%) 대상이어야 한다

@@ -120,7 +120,10 @@ async def test_sync_preserves_cache_1h_and_applies_aws(mock_session, admin_user)
             region_code="us-gov-west-1", actor=admin_user,
         )
 
-    assert resp.synced == ["gpt-5.6-terra"] and resp.skipped == []
+    assert resp.response.synced == ["gpt-5.6-terra"] and resp.response.skipped == []
+    # 반영한 alias 의 키를 모아 돌려준다 — 지우는 것은 라우터가 한 번 커밋한 뒤다(ModelMutation).
+    assert resp.cache_keys == ["model:gpt-5.6-terra", "model:us.openai.gpt-5.6-terra", "model:list"]
+    svc._cache_mgr.invalidate.assert_not_called()
     written = repo.create_pricing.call_args.args[0]
     # AWS 값 반영
     assert written.input_price_per_1k_tokens == Decimal("0.00264")
@@ -167,7 +170,7 @@ async def test_sync_clears_tier_when_aws_drops_long(mock_session, admin_user):
             mock_session, aliases=["gpt-5.6-terra"],
             region_code="us-gov-west-1", actor=admin_user,
         )
-    assert resp.synced == ["gpt-5.6-terra"]
+    assert resp.response.synced == ["gpt-5.6-terra"]
     written = repo.create_pricing.call_args.args[0]
     # ★ 티어가 실제로 제거됐다 — 이전 티어가 되살아나지 않는다
     assert written.long_context_threshold_tokens is None
@@ -189,7 +192,8 @@ async def test_sync_skips_unmatched_alias(mock_session, admin_user):
             region_code="us-gov-west-1", actor=admin_user,
         )
 
-    assert resp.synced == [] and resp.skipped == ["claude-sonnet"]
+    assert resp.response.synced == [] and resp.response.skipped == ["claude-sonnet"]
+    assert resp.cache_keys == []
     repo.create_pricing.assert_not_called()
 
 
