@@ -542,6 +542,7 @@
     "totalCost": "총 비용",
     "startDate": "시작일",
     "endDate": "종료일",
+    "rangeTooLong": "조회 기간은 최대 {max}일입니다 (선택: {days}일).",
     "costByModel": "모델별 비용",
     "costByTeam": "팀별 비용",
     "usageTrend": "사용량 추세",

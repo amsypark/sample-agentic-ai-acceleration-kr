@@ -168,7 +168,7 @@ export function AnalyticsFilter({ defaultValue, periods, currentMonth }: Analyti
           </div>
           {rangeTooLong && (
             <p role="alert" className="mb-2 text-xs text-destructive">
-              조회 기간은 최대 {MAX_ANALYTICS_RANGE_DAYS}일입니다 (선택: {rangeDays}일).
+              {t('rangeTooLong', { max: MAX_ANALYTICS_RANGE_DAYS, days: rangeDays })}
             </p>
           )}
         </div>

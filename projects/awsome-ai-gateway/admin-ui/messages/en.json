@@ -542,6 +542,7 @@
     "totalCost": "Total Cost",
     "startDate": "Start Date",
     "endDate": "End Date",
+    "rangeTooLong": "The date range can be at most {max} days (selected: {days} days).",
     "costByModel": "Cost by Model",
     "costByTeam": "Cost by Team",
     "usageTrend": "Usage Trend",
