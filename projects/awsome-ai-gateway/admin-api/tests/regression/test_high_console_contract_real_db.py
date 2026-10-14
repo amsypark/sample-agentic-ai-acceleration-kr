@@ -892,6 +892,20 @@ async def test_downgrade_enabled_false_really_turns_it_off(session):
     # 끈 규칙은 DB 에 활성으로 남지 않는다 — 감사 기록(before)이 무엇을 껐는지 담는다.
     assert audit.await_args.kwargs["changes"]["before"] == {"rules": rules}
 
+    # 규칙 없는 끄기 본문(`{"enabled": false, "rules": []}`)도 같은 결과다 — 예전엔 스키마가 422 로 막았다.
+    await svc.set_downgrade_config(
+        session, scope=BudgetScope.TEAM, scope_id=SEED_TEAM_ID,
+        data=AutoDowngradeConfigRequest(enabled=True, rules=rules), actor=actor,
+    )
+    await session.commit()
+    assert await active_rules() == 1
+    off_empty = await svc.set_downgrade_config(
+        session, scope=BudgetScope.TEAM, scope_id=SEED_TEAM_ID,
+        data=AutoDowngradeConfigRequest.model_validate({"enabled": False, "rules": []}), actor=actor,
+    )
+    await session.commit()
+    assert off_empty.enabled is False and await active_rules() == 0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. analytics scope — 닫힌 집합

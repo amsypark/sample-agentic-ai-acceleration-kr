@@ -96,3 +96,41 @@ async def test_enable_still_validates_and_sets_rules():
         out, rules, _, _ = await _set(enabled=True)
     assert isinstance(out, NotFoundError), out
     rules.delete_rules.assert_not_awaited()
+
+
+# ── 끄기는 규칙 없이도 된다 ──────────────────────────────────────────────────
+
+
+def test_disable_body_needs_no_rules():
+    """``{"enabled": false, "rules": []}`` 는 "끄기" 그 자체다 — 예전 ``min_length=1`` 이 422 로 거절했다
+    (규칙을 다 지운 뒤 끄려던 API 호출자는 끌 방법이 DELETE 뿐이었다). 끄는 경로는 rules 를 보지 않는다."""
+    assert AutoDowngradeConfigRequest.model_validate({"enabled": False, "rules": []}).rules == []
+    assert AutoDowngradeConfigRequest.model_validate({"enabled": False}).rules == []
+
+
+def test_enable_still_needs_at_least_one_rule():
+    """대조군 — 켜면서 규칙이 없으면 여전히 422(검증 오류)다."""
+    import pydantic
+    import pytest
+
+    with pytest.raises(pydantic.ValidationError, match="at least one rule"):
+        AutoDowngradeConfigRequest.model_validate({"enabled": True, "rules": []})
+    with pytest.raises(pydantic.ValidationError):
+        AutoDowngradeConfigRequest.model_validate({})  # enabled 기본값 True
+
+
+async def test_disable_with_no_rules_turns_it_off():
+    svc, _ = _svc()
+    off = AutoDowngradeConfigResponse(scope="TEAM", scope_id=str(TEAM_ID), enabled=False, rules=[])
+    with patch("app.services.budget_service.DowngradePolicyRepository") as Rules, patch(
+        "app.services.budget_service.audit_logger"
+    ) as audit, patch.object(svc, "get_downgrade_config", AsyncMock(return_value=off)):
+        Rules.return_value.get_rules = AsyncMock(return_value=[])
+        Rules.return_value.delete_rules = AsyncMock(return_value=0)
+        audit.log = AsyncMock()
+        out = await svc.set_downgrade_config(
+            AsyncMock(), scope=BudgetScope.TEAM, scope_id=TEAM_ID,
+            data=AutoDowngradeConfigRequest(enabled=False, rules=[]), actor=ADMIN,
+        )
+    assert out.enabled is False
+    Rules.return_value.delete_rules.assert_awaited_once_with(BudgetScope.TEAM, TEAM_ID)

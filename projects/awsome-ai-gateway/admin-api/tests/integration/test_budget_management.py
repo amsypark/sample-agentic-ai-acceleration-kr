@@ -133,3 +133,36 @@ class TestBudgetSummary:
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["summary"]) >= 1
+
+
+class TestDowngradeDisableBodyOverHttp:
+    """``PUT …/downgrade`` 의 끄기 본문은 규칙이 비어 있어도 받는다(예전: 422)."""
+
+    async def test_disable_with_empty_rules_is_accepted(self, client: AsyncClient, admin_headers: dict):
+        from app.schemas.budgets import AutoDowngradeConfigResponse
+
+        team_id = "66666666-6666-4666-8666-666666666666"
+        off = AutoDowngradeConfigResponse(scope="TEAM", scope_id=team_id, enabled=False, rules=[])
+        with patch("app.services.budget_service.DowngradePolicyRepository") as Rules, patch(
+            "app.services.budget_service.audit_logger"
+        ) as mock_audit, patch(
+            "app.services.budget_service.BudgetService.get_downgrade_config", AsyncMock(return_value=off)
+        ):
+            Rules.return_value.get_rules = AsyncMock(return_value=[])
+            Rules.return_value.delete_rules = AsyncMock(return_value=0)
+            mock_audit.log = AsyncMock()
+            resp = await client.put(
+                f"/admin/budgets/team/{team_id}/downgrade",
+                json={"enabled": False, "rules": []},
+                headers=admin_headers,
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["enabled"] is False
+
+    async def test_enable_with_empty_rules_is_still_422(self, client: AsyncClient, admin_headers: dict):
+        resp = await client.put(
+            "/admin/budgets/team/66666666-6666-4666-8666-666666666666/downgrade",
+            json={"enabled": True, "rules": []},
+            headers=admin_headers,
+        )
+        assert resp.status_code == 422, resp.text

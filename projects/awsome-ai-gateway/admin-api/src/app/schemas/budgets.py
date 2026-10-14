@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.schemas.common import BudgetPolicy
 
@@ -142,7 +142,16 @@ class DowngradeRuleItem(BaseModel):
 
 class AutoDowngradeConfigRequest(BaseModel):
     enabled: bool = True
-    rules: list[DowngradeRuleItem] = Field(min_length=1)
+    # ⚠️ 끄기(enabled=false)에는 규칙이 필요 없다 — 서비스의 끄는 경로는 rules 를 보지 않는다.
+    #    예전 ``Field(min_length=1)`` 은 ``{"enabled": false, "rules": []}`` 를 422 로 거절해, 규칙을
+    #    다 지운 뒤 끄려는 호출자가 PUT 으로는 끌 수 없었다. 켜기는 여전히 규칙 1개 이상(아래 검증).
+    rules: list[DowngradeRuleItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _rules_required_when_enabled(self) -> AutoDowngradeConfigRequest:
+        if self.enabled and not self.rules:
+            raise ValueError("rules must contain at least one rule when enabled is true")
+        return self
 
 
 class DowngradeRuleResponse(BaseModel):
