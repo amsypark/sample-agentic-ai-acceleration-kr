@@ -12,9 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit import audit_logger
 from app.core.auth import CurrentUser
 from app.core.cache_invalidation import CacheInvalidationManager
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import ConflictError, NotFoundError, ValidationError
 from app.models.auth import Team, User
 from app.models.model import ModelAlias, ModelStatus, RateLimitConfig, RateLimitScope
+from app.repositories._locks import advisory_xact_lock
 from app.repositories.model_repository import ModelRepository, RateLimitConfigRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.rate_limits import (
@@ -126,6 +127,7 @@ class RateLimitService:
         actor: CurrentUser,
         ip_address: str = "0.0.0.0",
         request_id: str = "",
+        release_alias: str | None = None,
     ) -> RateLimitResponse:
         # BR-RL-01: CPM/CPH not allowed for GLOBAL scope
         # (단기 비용 폭주 방어는 USER/TEAM 레벨에서. GLOBAL은 월 예산 엔진이 커버.)
@@ -138,6 +140,32 @@ class RateLimitService:
         if alias_exists is None:
             raise NotFoundError("ModelAlias", model_alias)
 
+        # ⚠️ GLOBAL 은 한 번에 한 모델만 — upsert 가 alias 와 무관하게 활성 행을 비활성화한다(0024 유니크
+        #    인덱스도 (scope, COALESCE(scope_id, nil))). 다른 모델이 **실제 한도**(rpm/tpm)를 들고 있으면
+        #    호출자가 그 alias 를 ``release_alias`` 로 명시했을 때만 해제한다 — 아니면 409. 예전엔 말없이
+        #    해제됐다(콘솔은 경고 문구만 띄웠다). 확인 화면을 본 뒤 다른 운영자가 슬롯을 바꿨어도 409 다.
+        #    잠금을 먼저 잡는다(upsert 와 같은 키, 같은 트랜잭션에서 재진입 가능) — 확인과 교체 사이에
+        #    다른 저장이 끼어들지 못한다. 전부 NULL 인 행은 아무것도 집행하지 않으므로 주인이 아니다.
+        await advisory_xact_lock(session, "rate_limit_configs", RateLimitScope.GLOBAL.value, None)
+        holder = await RateLimitConfigRepository(session).get_active(RateLimitScope.GLOBAL, None)
+        released = None
+        if (
+            holder is not None
+            and holder.model_alias not in (None, model_alias)
+            and (holder.rpm_limit is not None or holder.tpm_limit is not None)
+        ):
+            if release_alias != holder.model_alias:
+                raise ConflictError(
+                    f"The GLOBAL limit is held by {holder.model_alias} "
+                    f"(rpm={holder.rpm_limit}, tpm={holder.tpm_limit}); saving {model_alias} releases it. "
+                    f"Resend with release_alias={holder.model_alias} to confirm."
+                )
+            released = {
+                "model_alias": holder.model_alias,
+                "rpm": holder.rpm_limit,
+                "tpm": holder.tpm_limit,
+            }
+
         return await self._set_rate_limit(
             session,
             scope=RateLimitScope.GLOBAL,
@@ -148,6 +176,7 @@ class RateLimitService:
             cache_key=f"ratelimit:config:global:{model_alias}",
             ip_address=ip_address,
             request_id=request_id,
+            released=released,
         )
 
     async def get_rate_limit_tree(self, session: AsyncSession) -> list[RateLimitTreeNode]:
@@ -460,6 +489,7 @@ class RateLimitService:
         model_alias: str | None = None,
         ip_address: str = "0.0.0.0",
         request_id: str = "",
+        released: dict | None = None,
     ) -> RateLimitResponse:
         repo = RateLimitConfigRepository(session)
 
@@ -509,7 +539,11 @@ class RateLimitService:
             action="SET_RATE_LIMIT",
             resource_type="RateLimitConfig",
             resource_id=str(config.id),
-            changes={"after": {"scope": scope.value, "rpm": data.rpm, "tpm": data.tpm}},
+            changes={
+                "after": {"scope": scope.value, "rpm": data.rpm, "tpm": data.tpm},
+                # GLOBAL 저장으로 해제된 다른 모델의 한도 — 감사 로그만 보고도 무엇이 풀렸는지 안다.
+                **({"released": released} if released else {}),
+            },
             ip_address=ip_address,
             request_id=request_id,
         )

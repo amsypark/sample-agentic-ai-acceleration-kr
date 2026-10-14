@@ -89,6 +89,19 @@ describe('RateLimitTreeView', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(`globalSlotWarning:${globalCapped.id}`);
   });
 
+  it('전부 비어 있는 GLOBAL 행은 슬롯 주인이 아니다 — 경고하지 않는다', async () => {
+    // 값을 모두 비우고 저장한 GLOBAL 행은 아무것도 집행하지 않는다(admin-api 도 같은 기준으로 409 를 내지 않는다).
+    const user = userEvent.setup();
+    const empty = { ...globalCapped.config!, rpm: null, tpm: null };
+    render(
+      <RateLimitTreeView nodes={nodes.map((n) => (n.id === globalCapped.id ? { ...n, config: empty } : n))} />,
+    );
+
+    await user.click(screen.getByText(globalUncapped.label));
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalledWith('GLOBAL', globalUncapped.id));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('TEAM 은 접힌 채 시작하고 펼치면 멤버가 보인다', async () => {
     const user = userEvent.setup();
     render(<RateLimitTreeView nodes={nodes} />);

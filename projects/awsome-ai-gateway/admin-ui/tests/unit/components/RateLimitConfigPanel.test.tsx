@@ -174,7 +174,7 @@ describe('자기 설정이 있는 USER 노드', () => {
 describe('GLOBAL 노드', () => {
   it('선택 가능하고 CPM/CPH 는 비활성이며 alias 를 target 으로 저장한다', async () => {
     const user = userEvent.setup();
-    render(<RateLimitConfigPanel node={globalCapped} globalSlotHolder={globalCapped.id} />);
+    render(<RateLimitConfigPanel node={globalCapped} globalSlotHolder={globalCapped} />);
 
     expect(cpmInput()).toBeDisabled();
     expect(cphInput()).toBeDisabled();
@@ -200,15 +200,50 @@ describe('GLOBAL 노드', () => {
     await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalledWith('GLOBAL', globalCapped.id));
   });
 
-  it('다른 모델이 GLOBAL 슬롯을 갖고 있으면 저장 전에 경고한다', async () => {
-    render(<RateLimitConfigPanel node={globalUncapped} globalSlotHolder={globalCapped.id} />);
+  it('다른 모델이 GLOBAL 슬롯을 갖고 있으면 저장 전에 경고한다 — 해제될 한도까지', async () => {
+    render(<RateLimitConfigPanel node={globalUncapped} globalSlotHolder={globalCapped} />);
     await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalled());
-    expect(screen.getByRole('alert')).toHaveTextContent(`globalSlotWarning:${globalCapped.id}`);
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      `globalSlotWarning:${globalCapped.id},${globalCapped.config!.tpm} tpm`,
+    );
   });
 
-  it('슬롯 주인 자신이거나 슬롯이 비어 있으면 경고하지 않는다 (대조군)', async () => {
+  it('저장하면 해제될 한도를 보여 주고 확인을 받은 뒤에야 release_alias 와 함께 보낸다', async () => {
+    const user = userEvent.setup();
+    render(<RateLimitConfigPanel node={globalUncapped} globalSlotHolder={globalCapped} />);
+    await user.type(rpmInput(), '40');
+
+    await user.click(screen.getByRole('button', { name: 'save' }));
+    // 첫 클릭은 저장이 아니다 — 무엇이 풀리는지 보여 준다.
+    expect(setRateLimitAction).not.toHaveBeenCalled();
+    expect(screen.getByRole('alertdialog')).toHaveTextContent(
+      `globalSlotConfirm:${globalCapped.id},${globalCapped.config!.tpm} tpm`,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'releaseAndSave' }));
+    await waitFor(() => expect(setRateLimitAction).toHaveBeenCalledTimes(1));
+    expect(setRateLimitAction.mock.calls[0][0]).toMatchObject({
+      target_id: globalUncapped.id,
+      scope: 'GLOBAL',
+      rpm: 40,
+      release_alias: globalCapped.id, // 서버는 이 동의 없이는 409
+    });
+  });
+
+  it('확인에서 취소하면 저장하지 않는다', async () => {
+    const user = userEvent.setup();
+    render(<RateLimitConfigPanel node={globalUncapped} globalSlotHolder={globalCapped} />);
+    await user.click(screen.getByRole('button', { name: 'save' }));
+    await user.click(screen.getByRole('button', { name: 'cancel' }));
+
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(setRateLimitAction).not.toHaveBeenCalled();
+  });
+
+  it('슬롯 주인 자신이거나 슬롯이 비어 있으면 경고·확인 없이 바로 저장한다 (대조군)', async () => {
+    const user = userEvent.setup();
     const { unmount } = render(
-      <RateLimitConfigPanel node={globalCapped} globalSlotHolder={globalCapped.id} />,
+      <RateLimitConfigPanel node={globalCapped} globalSlotHolder={globalCapped} />,
     );
     await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalled());
     expect(screen.queryByRole('alert')).toBeNull();
@@ -217,6 +252,10 @@ describe('GLOBAL 노드', () => {
     render(<RateLimitConfigPanel node={globalUncapped} globalSlotHolder={null} />);
     await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalledTimes(2));
     expect(screen.queryByRole('alert')).toBeNull();
+    await user.click(screen.getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(setRateLimitAction).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(setRateLimitAction.mock.calls[0][0]).not.toHaveProperty('release_alias');
   });
 });
 

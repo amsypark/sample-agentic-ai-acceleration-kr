@@ -12,7 +12,8 @@
   2. /admin/rate-limits 트리·실시간 사용량·오버라이드 제거 — 팀 미배정 사용자 조회
      (team_id IS NULL), 활성 alias 목록, 활성 GLOBAL 행, 상속 표식, ``measured`` 의 근거인
      "자기 스코프 활성 rpm 행", DELETE 후 재설정이 유니크 인덱스(0024)와 공존하는지, 그리고
-     GLOBAL 이 **한 번에 한 모델**만 한도를 갖는 현재 불변식(콘솔 경고의 근거).
+     GLOBAL 이 **한 번에 한 모델**만 한도를 갖는 현재 불변식(콘솔 경고의 근거) — 다른 모델의 실제
+     한도를 해제하는 저장은 ``release_alias`` 동의 없이는 409 이고, 전부 NULL 인 행은 주인이 아니다.
   3. ``SetBudgetRequest.max_budget_usd`` 의 상한(max_digits=12, decimal_places=4)이
      ``budget_configs.max_budget_usd NUMERIC(12,4)`` 와 **정확히 같은 경계**인지 — 스키마가
      통과시키는 최댓값은 컬럼이 받고, 스키마가 거부하는 최솟값은 컬럼도 거부한다(그 값이
@@ -557,12 +558,26 @@ async def test_global_limit_is_single_slot_today(session):
     from app.models.auth import UserRole
     from app.schemas.rate_limits import RateLimitSetRequest
 
+    from app.core.exceptions import ConflictError
+
     actor = CurrentUser(user_id=SEED_ADMIN_ID, email="admin@example.com", role=UserRole.ADMIN, team_id=None)
     before = await _active_rows(session, "GLOBAL")
     assert [r.model_alias for r in before] == [RETIRED_ALIAS], "시드 전제가 깨졌다"
 
+    # 해제에 동의하지 않으면(release_alias 없음 / 다른 alias) 409 이고 아무것도 바뀌지 않는다 — 서버가
+    # 실제 활성 행(TPM 만 걸린 RETIRED_ALIAS)을 읽어 판정한다.
+    for consent in (None, "claude-sonnet-4-6"):
+        with pytest.raises(ConflictError, match=RETIRED_ALIAS):
+            await _rl_service().set_global_rate_limit(
+                session, model_alias="claude-opus-4-7", data=RateLimitSetRequest(rpm=10),
+                actor=actor, release_alias=consent,
+            )
+        await session.rollback()
+        assert [r.model_alias for r in await _active_rows(session, "GLOBAL")] == [RETIRED_ALIAS]
+
     await _rl_service().set_global_rate_limit(
-        session, model_alias="claude-opus-4-7", data=RateLimitSetRequest(rpm=10), actor=actor
+        session, model_alias="claude-opus-4-7", data=RateLimitSetRequest(rpm=10), actor=actor,
+        release_alias=RETIRED_ALIAS,
     )
     await session.commit()
 
@@ -571,6 +586,37 @@ async def test_global_limit_is_single_slot_today(session):
     nodes = await _tree(session)
     assert _find(nodes, RETIRED_ALIAS) is None, "비활성 모델은 한도가 해제되면 트리에서 내려간다"
     assert _find(nodes, "claude-opus-4-7").config.rpm == 10
+
+
+async def test_an_all_null_global_row_does_not_hold_the_slot(session):
+    """전부 NULL 인 GLOBAL 행(값을 비우고 저장)은 아무것도 집행하지 않는다 — 동의 없이 바로 바꿀 수 있다.
+    (콘솔 트리도 그 행을 슬롯 주인으로 세지 않는다.)"""
+    from sqlalchemy import text
+
+    from app.core.auth import CurrentUser
+    from app.models.auth import UserRole
+    from app.schemas.rate_limits import RateLimitSetRequest
+
+    actor = CurrentUser(user_id=SEED_ADMIN_ID, email="admin@example.com", role=UserRole.ADMIN, team_id=None)
+    svc = _rl_service()
+
+    # 상태를 직접 만든다: 활성 GLOBAL 행 하나, rpm/tpm 모두 NULL.
+    await session.execute(text(
+        "UPDATE model.rate_limit_configs SET is_active = false WHERE scope = 'GLOBAL' AND is_active"
+    ))
+    await session.execute(text(
+        "INSERT INTO model.rate_limit_configs (id, scope, scope_id, model_alias, is_active, created_by) "
+        "VALUES (gen_random_uuid(), 'GLOBAL', NULL, 'claude-opus-4-7', true, :by)"
+    ), {"by": SEED_ADMIN_ID})
+    await session.commit()
+
+    await svc.set_global_rate_limit(
+        session, model_alias="claude-sonnet-4-6", data=RateLimitSetRequest(rpm=9), actor=actor
+    )
+    await session.commit()
+    assert [(r.model_alias, r.rpm_limit) for r in await _active_rows(session, "GLOBAL")] == [
+        ("claude-sonnet-4-6", 9)
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

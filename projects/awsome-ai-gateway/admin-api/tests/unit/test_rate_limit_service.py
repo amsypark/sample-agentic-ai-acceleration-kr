@@ -10,7 +10,7 @@ import pytest
 
 from app.core.auth import CurrentUser
 from app.core.cache_invalidation import CacheInvalidationManager
-from app.core.exceptions import ValidationError
+from app.core.exceptions import ConflictError, ValidationError
 from app.schemas.rate_limits import RateLimitSetRequest
 from app.services.rate_limit_service import RateLimitService
 
@@ -242,6 +242,7 @@ class TestGatewayCacheInvalidation:
         with patch("app.services.rate_limit_service.RateLimitConfigRepository") as MockRepo, \
              patch("app.services.rate_limit_service.audit_logger") as mock_audit:
             MockRepo.return_value.upsert = AsyncMock()
+            MockRepo.return_value.get_active = AsyncMock(return_value=None)  # 슬롯이 비어 있다
             mock_audit.log = AsyncMock()
             mock_session.scalar = AsyncMock(return_value="claude-opus")  # alias 존재 확인
 
@@ -259,3 +260,78 @@ class TestGatewayCacheInvalidation:
         deleted_keys = [c.args[0] for c in mock_redis.delete.call_args_list]
         for k in cached_keys:
             assert k in deleted_keys
+
+
+class TestGlobalSlotRelease:
+    """GLOBAL 은 한 번에 한 모델만 활성 한도를 가진다(upsert 가 alias 무관하게 활성 행을 비활성화).
+
+    예전에는 다른 모델에 저장하면 그 모델의 한도가 **말없이** 해제됐다 — 콘솔은 경고 문구만 띄웠고
+    서버는 아무것도 확인하지 않았다. 이제 실제 한도(rpm/tpm)를 가진 다른 모델이 슬롯을 들고 있으면
+    호출자가 그 alias 를 ``release_alias`` 로 명시해야 하고, 아니면 409 다. 콘솔이 확인 화면을 띄운 뒤
+    다른 운영자가 슬롯을 바꿔도 409 다(확인한 것과 다른 한도를 해제하지 않는다).
+    """
+
+    @staticmethod
+    def _holder(alias: str, *, rpm=None, tpm=None):
+        return MagicMock(model_alias=alias, rpm_limit=rpm, tpm_limit=tpm)
+
+    async def _save(self, svc, session, actor, *, holder, release_alias=None, alias="claude-opus"):
+        with patch("app.services.rate_limit_service.RateLimitConfigRepository") as MockRepo, \
+             patch("app.services.rate_limit_service.audit_logger") as mock_audit:
+            MockRepo.return_value.upsert = AsyncMock()
+            MockRepo.return_value.get_active = AsyncMock(return_value=holder)
+            mock_audit.log = AsyncMock()
+            session.scalar = AsyncMock(return_value=alias)  # alias 존재 확인
+            try:
+                await svc.set_global_rate_limit(
+                    session, model_alias=alias, data=RateLimitSetRequest(rpm=10), actor=actor,
+                    release_alias=release_alias,
+                )
+            finally:
+                self.upsert = MockRepo.return_value.upsert
+                self.audit = mock_audit.log
+
+    async def test_releasing_another_models_limit_needs_explicit_consent(
+        self, rate_limit_service, mock_session, admin_user
+    ):
+        with pytest.raises(ConflictError, match="claude-sonnet"):
+            await self._save(
+                rate_limit_service, mock_session, admin_user, holder=self._holder("claude-sonnet", tpm=200000)
+            )
+        self.upsert.assert_not_awaited()  # 아무것도 바꾸지 않았다
+
+    async def test_naming_the_holder_releases_it_and_audits_what_was_released(
+        self, rate_limit_service, mock_session, admin_user
+    ):
+        await self._save(
+            rate_limit_service, mock_session, admin_user,
+            holder=self._holder("claude-sonnet", rpm=50, tpm=200000), release_alias="claude-sonnet",
+        )
+        self.upsert.assert_awaited_once()
+        changes = self.audit.await_args.kwargs["changes"]
+        assert changes["released"] == {"model_alias": "claude-sonnet", "rpm": 50, "tpm": 200000}
+
+    async def test_a_stale_confirmation_is_rejected(self, rate_limit_service, mock_session, admin_user):
+        """확인 화면에서 본 슬롯 주인(claude-haiku)이 그 사이 claude-sonnet 으로 바뀌었다."""
+        with pytest.raises(ConflictError):
+            await self._save(
+                rate_limit_service, mock_session, admin_user,
+                holder=self._holder("claude-sonnet", rpm=5), release_alias="claude-haiku",
+            )
+        self.upsert.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "holder",
+        [
+            None,  # 슬롯이 비어 있다
+            MagicMock(model_alias="claude-opus", rpm_limit=5, tpm_limit=None),  # 자기 자신
+            MagicMock(model_alias="claude-sonnet", rpm_limit=None, tpm_limit=None),  # 전부 NULL 행 — 집행 없음
+        ],
+    )
+    async def test_nothing_real_to_release_needs_no_consent(
+        self, rate_limit_service, mock_session, admin_user, holder
+    ):
+        """대조군 — 해제될 실제 한도가 없으면 예전처럼 바로 저장된다."""
+        await self._save(rate_limit_service, mock_session, admin_user, holder=holder)
+        self.upsert.assert_awaited_once()
+        assert "released" not in self.audit.await_args.kwargs["changes"]

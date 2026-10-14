@@ -229,7 +229,8 @@ async def test_released_global_limit_is_not_recached_from_the_commit_window(engi
         _, in_window = await _run_route_with_gateway_request_at_commit(
             s,
             lambda: routes.set_global_rate_limit(
-                _request(svc), ALIAS_B, RateLimitSetRequest(rpm=7), admin=_admin(), session=s
+                _request(svc), ALIAS_B, RateLimitSetRequest(rpm=7), admin=_admin(), session=s,
+                release_alias=ALIAS_A,  # 콘솔의 확인 대화상자가 보내는 동의
             ),
             lambda: _gateway_load(engine, redis_client, "GLOBAL", None, ALIAS_A),
         )

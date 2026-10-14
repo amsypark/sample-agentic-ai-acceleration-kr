@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, require_admin
@@ -134,6 +136,10 @@ async def set_global_rate_limit(
     body: RateLimitSetRequest,
     admin: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
+    release_alias: Annotated[
+        str | None,
+        Query(description="다른 모델이 GLOBAL 한도를 갖고 있으면 그 alias — 해제에 동의한다는 뜻(없으면 409)"),
+    ] = None,
 ):
     svc: RateLimitService = request.app.state.rate_limit_service
     result = await svc.set_global_rate_limit(
@@ -143,6 +149,7 @@ async def set_global_rate_limit(
         actor=admin,
         ip_address=request.client.host if request.client else "0.0.0.0",
         request_id=request.headers.get("x-request-id", ""),
+        release_alias=release_alias,
     )
     # ⚠️ GLOBAL 은 저장이 **다른 모델**의 한도를 해제한다 — 커밋 전에 지우면 해제된 한도가 그 창에서
     #    다시 캐시돼 5분 더 집행된다(set_user_rate_limit 주석).

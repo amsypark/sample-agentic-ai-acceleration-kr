@@ -25,6 +25,8 @@ vi.mock('@/lib/api-client', () => ({
 }));
 
 import { setRateLimitAction, deleteUserRateLimitAction } from '@/lib/actions/rate-limits';
+import { revalidatePath } from 'next/cache';
+import { APIError } from '@/lib/utils/retry';
 import { fetchRateLimitUsage } from '@/lib/utils/rateLimitUsage';
 
 beforeEach(() => {
@@ -46,6 +48,32 @@ describe('setRateLimitAction', () => {
       rpm: 60,
       tpm: 200000,
     });
+  });
+
+  it('GLOBAL 슬롯 해제 동의를 release_alias 쿼리로 보낸다 (alias 는 인코딩)', async () => {
+    await setRateLimitAction({
+      target_id: 'claude-opus-4-7',
+      scope: 'GLOBAL',
+      rpm: 5,
+      release_alias: 'claude-sonnet-4-6[1m]',
+    });
+    expect(putMock).toHaveBeenCalledWith(
+      '/admin/rate-limits/global/claude-opus-4-7?release_alias=claude-sonnet-4-6%5B1m%5D',
+      { rpm: 5 },
+    );
+  });
+
+  it('409(확인 뒤 슬롯 주인이 바뀜)면 트리를 새로 받게 한다 — 400 은 아니다 (대조군)', async () => {
+    vi.mocked(revalidatePath).mockClear();
+    putMock.mockRejectedValueOnce(new APIError(409, 'conflict', 'The GLOBAL limit is held by x'));
+    const res = await setRateLimitAction({ target_id: 'a', scope: 'GLOBAL', rpm: 1, release_alias: 'y' });
+    expect(res.success).toBe(false);
+    expect(revalidatePath).toHaveBeenCalledWith('/rate-limits');
+
+    vi.mocked(revalidatePath).mockClear();
+    putMock.mockRejectedValueOnce(new APIError(400, 'validation_error', 'bad'));
+    await setRateLimitAction({ target_id: 'a', scope: 'GLOBAL', rpm: 1 });
+    expect(revalidatePath).not.toHaveBeenCalled();
   });
 
   it('USER/TEAM 의 UUID 는 그대로 둔다(인코딩 무해 — 대조군)', async () => {

@@ -138,6 +138,7 @@ async def test_mutations_invalidate_the_proxy_cache_only_after_commit(
     ) as mock_audit:
         MockRepo.return_value.upsert = AsyncMock()
         MockRepo.return_value.deactivate_configs = AsyncMock(return_value=1)
+        MockRepo.return_value.get_active = AsyncMock(return_value=None)
         mock_audit.log = AsyncMock()
         resp = await client.request(method, path, json=body, headers=admin_headers)
 
@@ -145,3 +146,39 @@ async def test_mutations_invalidate_the_proxy_cache_only_after_commit(
     assert f"scan:{pattern}" in events, events  # 대조군 — 무효화 자체는 일어난다
     first_invalidation = min(i for i, e in enumerate(events) if e.startswith(("scan:", "del:")))
     assert "commit" in events[:first_invalidation], f"커밋 전에 캐시를 지웠다: {events}"
+
+
+# ── GLOBAL 슬롯 해제는 명시적 동의가 필요하다 ────────────────────────────────
+
+
+async def _put_global(client, headers, holder, query=""):
+    with patch("app.services.rate_limit_service.RateLimitConfigRepository") as MockRepo, patch(
+        "app.services.rate_limit_service.audit_logger"
+    ) as mock_audit:
+        MockRepo.return_value.upsert = AsyncMock()
+        MockRepo.return_value.get_active = AsyncMock(return_value=holder)
+        mock_audit.log = AsyncMock()
+        resp = await client.put(
+            f"/admin/rate-limits/global/claude-opus-4-7{query}", json={"rpm": 5}, headers=headers
+        )
+    return resp, MockRepo.return_value.upsert
+
+
+async def test_global_save_that_would_release_another_model_is_409(
+    client: AsyncClient, admin_headers: dict, test_app
+):
+    from app.core.db import get_db_session
+
+    test_app.dependency_overrides[get_db_session] = _recording_session([])
+    holder = MagicMock(model_alias="claude-sonnet-4-6", rpm_limit=None, tpm_limit=200000)
+
+    resp, upsert = await _put_global(client, admin_headers, holder)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "conflict"
+    assert "claude-sonnet-4-6" in resp.json()["error"]["message"]
+    upsert.assert_not_awaited()
+
+    test_app.state.redis.scan_iter = MagicMock(side_effect=lambda *a, **kw: _no_keys())
+    resp, upsert = await _put_global(client, admin_headers, holder, "?release_alias=claude-sonnet-4-6")
+    assert resp.status_code == 200, resp.text  # 대조군 — 주인을 명시하면 저장된다
+    upsert.assert_awaited_once()

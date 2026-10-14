@@ -25,20 +25,24 @@ export async function setRateLimitAction(formData: unknown): Promise<ActionResul
     return { success: false, error: 'Validation failed', fieldErrors };
   }
 
-  const { target_id, scope, ...limits } = parsed.data;
+  const { target_id, scope, release_alias, ...limits } = parsed.data;
+  // GLOBAL 슬롯 해제 동의(패널의 확인 대화상자) — 본문이 아니라 쿼리다(admin-api PUT /global).
+  const query = release_alias ? `?release_alias=${encodeURIComponent(release_alias)}` : '';
 
   try {
     // GLOBAL 의 target_id 는 UUID 가 아니라 model alias 다 — `claude-sonnet-4-6[1m]` 처럼 URL
     // 경로에서 인코딩이 필요한 문자가 실제로 들어 있다.
     await withRetry(() =>
       adminAPI.put(
-        `/admin/rate-limits/${scope.toLowerCase()}/${encodeURIComponent(target_id)}`,
+        `/admin/rate-limits/${scope.toLowerCase()}/${encodeURIComponent(target_id)}${query}`,
         limits,
       )
     );
     revalidatePath('/rate-limits');
     return { success: true, data: undefined };
   } catch (err) {
+    // 409 = 확인한 뒤 GLOBAL 슬롯 주인이 바뀌었다. 트리를 새로 받아 패널이 새 주인으로 다시 확인받게 한다.
+    if (err instanceof APIError && err.status === 409) revalidatePath('/rate-limits');
     return { success: false, error: toErrorMessage(err) };
   }
 }

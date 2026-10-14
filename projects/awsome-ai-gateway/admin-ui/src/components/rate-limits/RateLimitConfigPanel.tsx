@@ -16,11 +16,19 @@ import { useToast } from '@/components/common/ToastProvider';
 interface RateLimitConfigPanelProps {
   node: RateLimitTreeNode | null;
   /**
-   * 지금 활성 GLOBAL 한도를 가진 모델 alias(없으면 null). GLOBAL 은 현재 **한 번에 한 모델**만
+   * 지금 실제 GLOBAL 한도(rpm/tpm)를 가진 모델 노드(없으면 null). GLOBAL 은 현재 **한 번에 한 모델**만
    * 활성 한도를 가질 수 있다(admin-api upsert 가 alias 와 무관하게 GLOBAL 활성 행을 전부
-   * 비활성화한다) — 다른 모델에 저장하기 전에 그 사실을 알린다.
+   * 비활성화한다) — 다른 모델에 저장하기 전에 무엇이 풀리는지 보여 주고 확인을 받는다.
    */
-  globalSlotHolder?: string | null;
+  globalSlotHolder?: RateLimitTreeNode | null;
+}
+
+/** 'N rpm · M tpm' — 해제될 GLOBAL 한도를 사람이 읽게. */
+function describeLimits(config: RateLimitTreeNode['config']): string {
+  if (!config) return '';
+  return [config.rpm != null ? `${config.rpm} rpm` : null, config.tpm != null ? `${config.tpm} tpm` : null]
+    .filter(Boolean)
+    .join(' · ');
 }
 
 // SCOPE_LABEL is now resolved inside the component via translations
@@ -53,6 +61,7 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
   const [cpm, setCpm] = useState('');
   const [cph, setCph] = useState('');
   const [usage, setUsage] = useState<RateLimitUsage | null>(null);
+  const [confirmingRelease, setConfirmingRelease] = useState(false);
 
   // node가 변경될 때 폼 값 초기화.
   //
@@ -69,6 +78,7 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
     setCpm(own?.cpm != null ? String(own.cpm) : '');
     setCph(own?.cph != null ? String(own.cph) : '');
     setError(null);
+    setConfirmingRelease(false);
   }, [node]);
 
   // 실시간 RPM 사용량(§60.9) — node 선택 시 + 10초마다 폴링(gateway-proxy Redis 카운터).
@@ -114,11 +124,12 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
   const canRemoveOverride =
     node.scope === RateLimitScope.USER && !!node.config && !node.inherited_from;
 
-  // GLOBAL 은 한 번에 한 모델만 — 다른 모델이 슬롯을 갖고 있으면 저장 전에 알린다.
+  // GLOBAL 은 한 번에 한 모델만 — 다른 모델이 슬롯을 갖고 있으면 저장 전에 알리고 확인을 받는다.
   const replacesGlobalOn =
-    node.scope === RateLimitScope.GLOBAL && globalSlotHolder && globalSlotHolder !== node.id
+    node.scope === RateLimitScope.GLOBAL && globalSlotHolder && globalSlotHolder.id !== node.id
       ? globalSlotHolder
       : null;
+  const releasedLimits = replacesGlobalOn ? describeLimits(replacesGlobalOn.config) : '';
 
   // 게이지 분모는 **이 스코프 자신의** 한도여야 한다. 상속 노드의 config.rpm 은 팀 값이고 그
   // 카운터는 TEAM 키에 쌓이므로, USER 사용량을 팀 한도로 나누면 거짓 비율이 된다.
@@ -140,10 +151,7 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
     });
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-
+  const save = (releaseAlias?: string) => {
     startTransition(async () => {
       const result = await setRateLimitAction({
         target_id: node.id,
@@ -152,6 +160,7 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
         tpm: parsePosInt(tpm),
         cpm: isUserOrTeam ? parsePosFloat(cpm) : undefined,
         cph: isUserOrTeam ? parsePosFloat(cph) : undefined,
+        ...(releaseAlias ? { release_alias: releaseAlias } : {}),
       });
 
       if (result.success) {
@@ -164,6 +173,18 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
         setError(result.error);
       }
     });
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    // ⚠️ 다른 모델의 GLOBAL 한도를 해제하는 저장은 무엇이 풀리는지 보여 주고 한 번 더 확인받는다.
+    //    서버도 release_alias(=확인한 주인) 없이는 409 다 — 확인 뒤 다른 운영자가 슬롯을 바꿨어도 409.
+    if (replacesGlobalOn) {
+      setConfirmingRelease(true);
+      return;
+    }
+    save();
   };
 
   return (
@@ -189,7 +210,7 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
           role="alert"
           className="mb-4 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400"
         >
-          {t('globalSlotWarning', { alias: replacesGlobalOn })}
+          {t('globalSlotWarning', { alias: replacesGlobalOn.id, limits: releasedLimits })}
         </div>
       )}
 
@@ -332,6 +353,36 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
         </div>
 
         <FormError error={error} />
+
+        {confirmingRelease && replacesGlobalOn && (
+          <div
+            role="alertdialog"
+            aria-label={t('releaseAndSave')}
+            className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400"
+          >
+            <p>{t('globalSlotConfirm', { alias: replacesGlobalOn.id, limits: releasedLimits })}</p>
+            <div className="mt-2 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmingRelease(false)}
+                className="rounded-md border border-input px-3 py-1.5 text-sm hover:bg-accent"
+              >
+                {tCommon('cancel')}
+              </button>
+              <button
+                type="button"
+                disabled={isPending}
+                onClick={() => {
+                  setConfirmingRelease(false);
+                  save(replacesGlobalOn.id);
+                }}
+                className="rounded-md bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+              >
+                {t('releaseAndSave')}
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* 입력을 모두 비우고 저장하는 것은 '제거' 가 아니다 — 전부 NULL 인 USER 행이 남아 상속
             표식이 사라지고, 팀 한도가 걸려 있는데도 무제한처럼 보인다. 실제 제거는
