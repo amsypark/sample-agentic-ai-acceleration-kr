@@ -594,7 +594,16 @@ CREATE INDEX IF NOT EXISTS idx_service_tokens_hash ON auth.service_tokens (token
 -- 새 마이그레이션을 넣고 여기를 빠뜨리면 그 테스트가 잡는다.
 
 -- migration 0007: 요청을 발생시킨 앱 태그(claude-code | cowork | codex | other | NULL).
-ALTER TABLE usage.usage_logs ADD COLUMN IF NOT EXISTS client TEXT;
+-- 존재를 먼저 본다: no-op 인 ADD COLUMN IF NOT EXISTS 도 원장 테이블에 ACCESS EXCLUSIVE 를 잡아,
+-- 매 Job 마다 그 테이블의 읽기·쓰기를 전부 세운다(아래 0039·0045 와 같은 가드).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'usage' AND table_name = 'usage_logs'
+                      AND column_name = 'client') THEN
+        ALTER TABLE usage.usage_logs ADD COLUMN client TEXT;
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS ix_usage_logs_client ON usage.usage_logs (client);
 
 -- migration 0034: 생산성 이벤트 멱등키. 부분 유니크 인덱스라 NULL 은 중복을 허용한다
@@ -686,7 +695,16 @@ WHERE a.alias = p.model_alias
 
 -- migration 0039: 요청별 청구 티어 감사. 게이트웨이 resolve_context_tier 가 청구와 이 값을
 -- 같은 판정으로 채운다(청구=long/기록=short 불일치 방지). 'short'|'long'|NULL(티어없는 모델).
-ALTER TABLE usage.usage_logs ADD COLUMN IF NOT EXISTS context_tier VARCHAR(8);
+-- 존재를 먼저 본다(아래 0045 와 같다): 컬럼이 있어 no-op 인 ADD COLUMN IF NOT EXISTS 도 원장
+-- 테이블에 ACCESS EXCLUSIVE 를 잡고, 이 파일은 모든 마이그레이션 Job 에서 다시 돈다.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'usage' AND table_name = 'usage_logs'
+                      AND column_name = 'context_tier') THEN
+        ALTER TABLE usage.usage_logs ADD COLUMN context_tier VARCHAR(8);
+    END IF;
+END $$;
 
 -- migration 0043: alias 별 대상 AWS 계정. NULL = alias 계정 없음 = 오늘 동작(라우팅 프로필
 -- 계정 → 파드 IRSA). 두 ORM 이 이 컬럼을 명시 열거하므로, 컬럼 없는 DB 에 새 이미지가 붙으면
