@@ -22,6 +22,10 @@
      owned DB 에는 없다 — 이 테스트만 alembic head 의 PROOF_DSN DB 를 쓰고 만든 행을 지운다).
   5. /admin/monitoring/models 의 status 가 등록부 LEFT JOIN 으로 ACTIVE / INACTIVE /
      UNREGISTERED 를 실제로 구분하고, 등록부에 없는 alias 의 트래픽이 사라지지 않는다.
+  6. /admin/dashboard/top-teams 가 동명 팀을 서로 다른 ``team_id`` 의 두 행으로 낸다(콘솔이 이름으로
+     조인하던 동안 두 팀의 소진율이 뒤바뀌었다 — 이 스키마에는 팀 이름 유일성 제약이 아예 없다).
+  7. 자동 하향 PUT 의 ``enabled: false`` 가 budget.downgrade_policies 의 활성 행을 실제로 없앤다
+     (예전: 규칙을 전부 is_active=true 로 다시 써서 '끄기' 저장 후에도 집행이 계속됐다).
 
 실행::
 
@@ -719,3 +723,107 @@ async def test_monitoring_status_reflects_the_registry(owned_dsn):
     assert ghost is not None, "등록부에 없는 alias 의 트래픽이 조인에서 사라졌다"
     assert ghost["status"] == UNREGISTERED_MODEL_STATUS
     assert ghost["last_1h_requests"] == 2, "GROUP BY 가 status 때문에 행을 쪼개거나 합쳤다"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. 대시보드 top-teams — 동명 팀
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def test_top_teams_keeps_same_named_teams_apart(owned_dsn):
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.routers.dashboard import top_teams
+
+    twin_1, twin_2 = uuid.uuid4(), uuid.uuid4()
+    asyncpg = pytest.importorskip("asyncpg")
+    conn = await asyncpg.connect(_asyncpg_dsn(owned_dsn))
+    try:
+        dept_id = await conn.fetchval("SELECT dept_id FROM auth.teams WHERE id = $1", SEED_TEAM_ID)
+        for tid in (twin_1, twin_2):
+            await conn.execute(
+                "INSERT INTO auth.teams (id, dept_id, name) VALUES ($1, $2, 'Twin Team')", tid, dept_id
+            )
+        # 다른 증명(2026-09)과 섞이지 않게 2026-07 에 쌓는다.
+        for tid, cost in ((twin_1, "500.00"), (twin_2, "400.00")):
+            await conn.execute(
+                "INSERT INTO usage.usage_logs "
+                "(id, request_id, user_id, team_id, dept_id, model_alias, provider, status, "
+                " requested_at, completed_at, cost_usd, input_tokens, output_tokens, latency_ms) "
+                "VALUES (gen_random_uuid(), gen_random_uuid()::text, $1, $2, $3, $4, 'BEDROCK', "
+                "        'SUCCESS'::usage.usage_status, $5, $5, $6, 1, 1, 50)",
+                U_A, tid, dept_id, ALIAS, _kst(7, 10, 12), Decimal(cost),
+            )
+    finally:
+        await conn.close()
+
+    engine = create_async_engine(owned_dsn)
+    try:
+        async with async_sessionmaker(engine)() as session:
+            out = await top_teams(period="2026-07", limit=5, client=None, _admin=MagicMock(), session=session)
+    finally:
+        await engine.dispose()
+
+    twins = [t for t in out["teams"] if t["name"] == "Twin Team"]
+    assert [(t["team_id"], t["cost_usd"]) for t in twins] == [(str(twin_1), 500.0), (str(twin_2), 400.0)], (
+        "동명 팀이 하나로 합쳐졌거나 team_id 가 없다 — 콘솔은 이 id 로 소진율을 조인한다"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. 자동 하향 끄기
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def test_downgrade_enabled_false_really_turns_it_off(session):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from sqlalchemy import text
+
+    from app.core.auth import CurrentUser
+    from app.models.auth import UserRole
+    from app.models.budget import BudgetScope
+    from app.schemas.budgets import AutoDowngradeConfigRequest
+    from app.services.budget_service import BudgetService
+
+    cache = MagicMock()
+    cache.invalidate = AsyncMock()
+    svc = BudgetService(cache_mgr=cache)
+    actor = CurrentUser(user_id=SEED_ADMIN_ID, email="admin@example.com", role=UserRole.ADMIN, team_id=None)
+    rules = [{"from_model_alias": "claude-opus-4-8", "to_model_alias": "claude-sonnet-4-6", "threshold_pct": 80}]
+
+    async def active_rules() -> int:
+        return (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM budget.downgrade_policies "
+                    "WHERE scope = 'TEAM' AND scope_id = :sid AND is_active"
+                ),
+                {"sid": SEED_TEAM_ID},
+            )
+        ).scalar_one()
+
+    # 대조군 — 켜서 저장하면 활성 규칙이 생긴다(시드 팀에는 03_seed_data 의 팀 예산이 있다).
+    on = await svc.set_downgrade_config(
+        session,
+        scope=BudgetScope.TEAM,
+        scope_id=SEED_TEAM_ID,
+        data=AutoDowngradeConfigRequest(enabled=True, rules=rules),
+        actor=actor,
+    )
+    await session.commit()
+    assert on.enabled is True and await active_rules() == 1
+
+    # 콘솔은 체크를 끈 상태에서도 규칙과 함께 PUT 한다(AutoDowngradeConfig.handleSave).
+    off = await svc.set_downgrade_config(
+        session,
+        scope=BudgetScope.TEAM,
+        scope_id=SEED_TEAM_ID,
+        data=AutoDowngradeConfigRequest(enabled=False, rules=rules),
+        actor=actor,
+    )
+    await session.commit()
+    assert off.enabled is False
+    assert await active_rules() == 0, "끄기 저장 후에도 활성 규칙이 남아 gateway-proxy 가 계속 바꿔치기한다"

@@ -1065,6 +1065,31 @@ class BudgetService:
     ) -> AutoDowngradeConfigResponse:
         from app.repositories.model_repository import ModelRepository
 
+        # ⚠️ ``enabled: False`` 는 "자동 하향 끄기" 다. budget.downgrade_policies 에는 enabled 컬럼이
+        #    없고 "꺼짐" 의 유일한 표현은 활성 행이 없는 것이다. 예전에는 이 플래그를 감사 로그의
+        #    after 에만 적고 규칙은 전부 is_active=True 로 다시 썼다 — 체크를 끄고 저장한 운영자는
+        #    200 + 성공 토스트를 받았지만 gateway-proxy 는 임계값에서 계속 모델을 바꿔치기했고, 감사
+        #    기록은 DB 와 반대(enabled:false)를 주장했다. 그래서 삭제 경로로 단축한다. alias/provider/
+        #    예산 검증은 일부러 하지 않는다 — 저장해 둔 alias 가 나중에 무효가 됐거나 예산 행이
+        #    지워졌어도 기능을 **끌 수는** 있어야 한다.
+        if not data.enabled:
+            deactivated = await DowngradePolicyRepository(session).delete_rules(scope, scope_id)
+            cache_key = f"budget:downgrade:{scope.value.lower()}:{scope_id}"
+            await self._cache_mgr.invalidate([cache_key], session=session)
+            await audit_logger.log(
+                session,
+                actor_user_id=actor.user_id,
+                actor_role=actor.role.value,
+                action="SET_AUTO_DOWNGRADE",
+                resource_type="DowngradePolicy",
+                resource_id=str(scope_id),
+                # 요청 echo 가 아니라 **실제로 남긴 상태**를 기록한다.
+                changes={"after": {"enabled": False, "rules": [], "deactivated": deactivated}},
+                ip_address=ip_address,
+                request_id=request_id,
+            )
+            return await self.get_downgrade_config(session, scope=scope, scope_id=scope_id)
+
         model_repo = ModelRepository(session)
         all_aliases = {alias for rule in data.rules for alias in (rule.from_model_alias, rule.to_model_alias)}
         # ⚠️ 행을 버리지 말고 들고 있는다 — 아래 provider 대조에 필요하다(존재 확인만 하고
