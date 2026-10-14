@@ -217,6 +217,7 @@ class CostRecorder:
                             actual_cost=Decimal("0"),
                             reserved_cost=reserved_cost,
                             team_id=str(auth_context.team_id) if auth_context.team_id else None,
+                            reserved_keys=rate_limit_state.get("cost_reserved_keys"),
                         )
                     except Exception:
                         logger.warning(
@@ -333,9 +334,10 @@ class CostRecorder:
                 except Exception:
                     logger.warning("client_budget_deduct_failed", client=client)
 
-        # 2. CPM/CPH 정산 (USER+TEAM 2 스코프, FR-4.6)
+        # 2. CPM/CPH 정산 (예약한 스코프·창만, FR-4.6)
         # reserved_cost는 rate_limit_state['cost_reserved'] (enforcement 주입) 우선,
-        # 없으면 legacy 파라미터 사용.
+        # 없으면 legacy 파라미터 사용. 조정할 키는 rate_limit_state['cost_reserved_keys'] 뿐이다 —
+        # 없으면 settle_cost 가 아무것도 쓰지 않는다(그 docstring).
         cost_reserved = reserved_cost
         if rate_limit_state and "cost_reserved" in rate_limit_state:
             cost_reserved = rate_limit_state["cost_reserved"]
@@ -349,6 +351,7 @@ class CostRecorder:
                     actual_cost=cost_usd,
                     reserved_cost=cost_reserved,
                     team_id=auth_context.team_id,
+                    reserved_keys=(rate_limit_state or {}).get("cost_reserved_keys"),
                 )
             except Exception:
                 logger.warning("cost_settle_failed", user_id=auth_context.user_id)

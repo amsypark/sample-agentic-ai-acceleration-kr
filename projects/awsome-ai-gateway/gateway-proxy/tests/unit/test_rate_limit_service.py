@@ -693,9 +693,16 @@ async def test_reserve_cost_unlimited_skips_lua(mock_redis):
     mock_redis.eval.assert_not_called()
 
 
+_USER_KEYS = ("rl:cost:user:{u1}:cpm:120", "rl:cost:user:{u1}:cph:0")
+_TEAM_KEYS = ("rl:cost:team:{t1}:cpm:120", "rl:cost:team:{t1}:cph:0")
+
+
 @pytest.mark.asyncio
-async def test_settle_cost_adjusts_user_and_team(mock_redis):
-    """post-settle 시 user + team 양쪽 스코프에 차액(음수일 수 있음) 반영(파이프라인)."""
+async def test_settle_cost_evals_each_reserved_scope_once(mock_redis):
+    """정산 = 예약한 스코프마다 cost_settle_scope EVAL 한 번(두 키, 차액). 파이프라인 1회."""
+    from app.services.lua_loader import LuaScriptLoader
+
+    LuaScriptLoader._scripts["cost_settle_scope"] = "-- mock"
     svc = RateLimitService()
     await svc.settle_cost(
         mock_redis,
@@ -703,11 +710,99 @@ async def test_settle_cost_adjusts_user_and_team(mock_redis):
         actual_cost=Decimal("0.003"),
         reserved_cost=Decimal("0.010"),
         team_id="t1",
+        reserved_keys=(_USER_KEYS, _TEAM_KEYS),
     )
-    # USER cpm + USER cph + TEAM cpm + TEAM cph → 파이프라인에 4회 적재 + 1 execute.
     pipe = mock_redis.pipeline.return_value
-    assert pipe.incrbyfloat.call_count == 4
+    calls = [c.args for c in pipe.eval.call_args_list]
+    assert calls == [
+        ("-- mock", 2, *_USER_KEYS, "-0.007"),
+        ("-- mock", 2, *_TEAM_KEYS, "-0.007"),
+    ]
+    pipe.incrbyfloat.assert_not_called()  # 키를 직접 만들 수 있는 INCRBYFLOAT 는 쓰지 않는다
     pipe.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_settle_cost_touches_only_the_reserved_scope(mock_redis):
+    """USER 만 예약했으면 team_id 가 있어도 TEAM 키는 건드리지 않는다(옛 정산은 무조건 조정했다)."""
+    from app.services.lua_loader import LuaScriptLoader
+
+    LuaScriptLoader._scripts["cost_settle_scope"] = "-- mock"
+    await RateLimitService().settle_cost(
+        mock_redis,
+        user_id="u1",
+        actual_cost=Decimal("0"),
+        reserved_cost=Decimal("0.010"),
+        team_id="t1",
+        reserved_keys=(_USER_KEYS,),
+    )
+    keys = [k for c in mock_redis.pipeline.return_value.eval.call_args_list for k in c.args[2:4]]
+    assert keys == list(_USER_KEYS)
+
+
+@pytest.mark.asyncio
+async def test_settle_cost_without_reserved_keys_writes_nothing(mock_redis):
+    """예약 키가 없는(옛 모양의) 정산 상태 → Redis 에 아무것도 보내지 않는다."""
+    for keys in (None, ()):
+        await RateLimitService().settle_cost(
+            mock_redis,
+            user_id="u1",
+            actual_cost=Decimal("0"),
+            reserved_cost=Decimal("0.010"),
+            team_id="t1",
+            reserved_keys=keys,
+        )
+    mock_redis.pipeline.assert_not_called()
+    mock_redis.eval.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reserve_cost_records_only_the_scopes_it_reserved(mock_redis):
+    """reserved_keys = 실제로 예약한 스코프의 (cpm, cph) 키. 한도 없음·fail-open 은 빠진다."""
+    from app.services.lua_loader import LuaScriptLoader
+
+    LuaScriptLoader._scripts["cost_rate_limit_scope"] = "-- mock"
+    ok = json.dumps({"allowed": True, "reserved_cost": 0.5}).encode()
+    svc = RateLimitService()
+
+    # USER 한도만 — TEAM 은 team_id 가 있어도 예약하지 않는다.
+    mock_redis.eval = AsyncMock(return_value=ok)
+    r = await svc.reserve_cost(
+        mock_redis, user_id="u1", estimated_cost=Decimal("0.5"),
+        user_cpm_limit=Decimal("1"), user_cph_limit=None, team_id="t1",
+    )
+    assert r.allowed and r.reserved_cost == Decimal("0.5")
+    assert [tuple(k.split(":")[2:4]) for pair in r.reserved_keys for k in pair] == [
+        ("user", "{u1}"), ("user", "{u1}")
+    ]
+    cpm_key, cph_key = r.reserved_keys[0]
+    assert cpm_key.split(":")[4] == "cpm" and cph_key.split(":")[4] == "cph"
+
+    # TEAM eval 이 실패(fail-open) — 통과하지만 TEAM 키는 기록하지 않는다.
+    mock_redis.eval = AsyncMock(side_effect=[ok, ConnectionError("shard down")])
+    r = await svc.reserve_cost(
+        mock_redis, user_id="u1", estimated_cost=Decimal("0.5"),
+        user_cpm_limit=Decimal("1"), user_cph_limit=None,
+        team_id="t1", team_cpm_limit=Decimal("5"), team_cph_limit=None,
+    )
+    assert r.allowed and len(r.reserved_keys) == 1 and "user" in r.reserved_keys[0][0]
+
+    # 전부 fail-open — 예약한 키가 없으니 reserved_cost 도 0(정산이 돌지 않는다).
+    mock_redis.eval = AsyncMock(side_effect=ConnectionError("down"))
+    r = await svc.reserve_cost(
+        mock_redis, user_id="u1", estimated_cost=Decimal("0.5"),
+        user_cpm_limit=Decimal("1"), user_cph_limit=None,
+    )
+    assert r.allowed and r.reserved_keys == () and r.reserved_cost == Decimal("0")
+
+    # 예약액 0 — Lua 가 쓰지 않으므로(`if cost > 0`) 기록할 키도 없다.
+    zero = json.dumps({"allowed": True, "reserved_cost": 0}).encode()
+    mock_redis.eval = AsyncMock(return_value=zero)
+    r = await svc.reserve_cost(
+        mock_redis, user_id="u1", estimated_cost=Decimal("0"),
+        user_cpm_limit=Decimal("1"), user_cph_limit=None,
+    )
+    assert r.allowed and r.reserved_keys == () and r.reserved_cost == Decimal("0")
 
 
 @pytest.mark.asyncio
@@ -807,3 +902,25 @@ async def test_cost_eval_never_crosses_slots(mock_redis):
         team_cph_limit=Decimal("50.0"),
     )
     assert _assert_eval_calls_single_slot(mock_redis) == 2
+
+
+@pytest.mark.asyncio
+async def test_cost_settle_eval_never_crosses_slots(mock_redis):
+    """정산 EVAL 도 스코프마다 한 슬롯 — 두 스코프의 키를 한 EVAL 에 섞지 않는다."""
+    from app.services.lua_loader import LuaScriptLoader
+
+    LuaScriptLoader._scripts["cost_settle_scope"] = "-- mock"
+    await RateLimitService().settle_cost(
+        mock_redis,
+        user_id="u1",
+        actual_cost=Decimal("0"),
+        reserved_cost=Decimal("0.010"),
+        team_id="t1",
+        reserved_keys=(_USER_KEYS, _TEAM_KEYS),
+    )
+    evals = mock_redis.pipeline.return_value.eval.call_args_list
+    assert len(evals) == 2
+    for call in evals:
+        numkeys = call.args[1]
+        keys = call.args[2 : 2 + numkeys]
+        assert len({_hash_tag(k) for k in keys}) == 1, f"CROSSSLOT: {keys}"

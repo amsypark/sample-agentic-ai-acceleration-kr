@@ -310,7 +310,7 @@ TEAM 미설정 = deny, USER 미설정 = pass. **per-app(client) 예산:** `PER_A
 INLINE (gateway-proxy, CostRecorder.finalize, ~1–2ms, fail-soft, DB I/O 없음):
   zero-usage guard(release TPM) → calculate_cost(input+output+cache_write[5m|1h]+cache_read)
   → budget_deduct Lua (user + team, returns threshold_triggered)
-  → settle_cost(CPM/CPH USER+TEAM) → settle_tpm
+  → settle_cost(CPM/CPH — 예약한 스코프·창의 키만, 스코프별 EVAL, TTL 없는 키를 만들지 않음) → settle_tpm
   → XADD cost:stream {CostStreamEntry(... client ...)}     (실패 시 CostStreamSpool 스풀링)
 
 OFFLOADED (cost-recorder-worker):

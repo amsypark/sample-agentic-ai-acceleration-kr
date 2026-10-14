@@ -183,6 +183,9 @@ class CostLimitResult(BaseModel):
     retry_after: int | None = None
     reserved_cost: Decimal = Decimal("0")
     window_reset: int = 0
+    # 실제로 예약한 (cpm 키, cph 키) — 스코프마다 한 쌍, 키 이름에 창(window_ts)이 들어 있다.
+    # 정산(settle_cost)은 이 키만 조정한다(rate_limit_service.settle_cost).
+    reserved_keys: tuple[tuple[str, str], ...] = ()
 
 
 def split_cached_input(input_total: int, cached_tokens: int) -> tuple[int, int]:

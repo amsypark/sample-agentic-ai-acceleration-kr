@@ -1,0 +1,50 @@
+-- Copyright 2026 © Amazon.com and Affiliates: This deliverable is considered Developed Content as defined in the AWS Service Terms.
+
+-- Cost Rate Limit — 단일 스코프 CPM/CPH 사후 정산 (USER 또는 TEAM)
+--
+-- 예약(cost_rate_limit_scope.lua)이 **실제로 쓴** 두 키만 받는다. 호출자(rate_limit_service.settle_cost)
+-- 는 예약할 때 기록해 둔 키 이름을 그대로 넘긴다 — 키 이름에 스코프와 창(window_ts)이 들어 있으므로
+-- 정산 시각으로 창을 다시 계산하지 않는다. 예약하지 않은 스코프는 호출 자체가 없다.
+--
+-- Redis Cluster CROSSSLOT(deepdive Q50): 두 키는 같은 hash tag({scope_id}) = 같은 슬롯이다.
+-- USER 와 TEAM 은 tag 가 달라 한 EVAL 에 섞을 수 없으므로 호출자가 스코프마다 한 번씩 부른다.
+--
+-- KEYS[1] = rl:cost:<scope>:{<scope_id>}:cpm:<예약 때의 window_ts>
+-- KEYS[2] = rl:cost:<scope>:{<scope_id>}:cph:<예약 때의 window_ts>
+-- ARGV[1] = adjustment (USD, actual - reserved. 음수 = 환불)
+--
+-- 키마다:
+--   * 키가 없으면 **아무것도 쓰지 않는다**(키를 만들지 않는다). 예약한 키가 없어지는 경우는 TTL 만료
+--     — 예약이 걸 때마다 TTL 을 창 길이의 두 배(cpm 120s / cph 7200s)로 다시 걸므로, 만료됐다면 그
+--     창은 이미 끝났고 어떤 검사도 그 키를 다시 읽지 않는다 — 또는 축출·유실이다. 어느 쪽이든 그 창의
+--     카운터에 차액만 다시 쓰는 것은 의미 없는 부분값이고, 만들면 TTL 을 지어내야 한다.
+--   * 있으면 INCRBYFLOAT. 기존 TTL 은 그대로 남는다. TTL 이 없으면(-1: 이 수정 이전의 정산이 만든 키가
+--     예약 창과 겹친 경우) 예약과 같은 TTL 을 건다 — 정산이 TTL 없는 키를 남기지 않는다.
+--   * 결과가 음수면 0 으로 둔다(TTL 유지, KEEPTTL 은 Redis 6.0+/Valkey). 한 창의 비용 합계는 음수일 수
+--     없다 — 음수는 부동소수 잔차나 축출된 예약을 환불한 결과이고, 남겨 두면 그 창 동안 남의 한도를
+--     빌려 준다.
+--
+-- 증분은 예약과 같은 경로(tonumber → redis.call 의 숫자 인자)로 넘긴다. 예약액 전액을 환불하면 두 증분이
+-- 같은 문자열로 직렬화돼 카운터가 정확히 원래 값으로 돌아간다.
+--
+-- Returns: {cpm_applied, cph_applied}  (1 = 조정함, 0 = 키 없음 → 건너뜀)
+
+local adj = tonumber(ARGV[1])
+local ttls = {120, 7200}
+local applied = {0, 0}
+
+for i = 1, 2 do
+    local key = KEYS[i]
+    if redis.call('EXISTS', key) == 1 then
+        local v = tonumber(redis.call('INCRBYFLOAT', key, adj))
+        if v < 0 then
+            redis.call('SET', key, '0', 'KEEPTTL')
+        end
+        if redis.call('TTL', key) < 0 then
+            redis.call('EXPIRE', key, ttls[i])
+        end
+        applied[i] = 1
+    end
+end
+
+return applied

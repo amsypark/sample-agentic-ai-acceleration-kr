@@ -175,6 +175,8 @@ async def enforce_rate_limits(
         통과한 경우 ``state`` 에 ``rate_limit_state`` 키로 settle 정보 주입:
             - ``tpm_descriptors``: list[ScopeDescriptor]
             - ``tpm_reserved``: int
+            - ``cost_reserved``: Decimal (예약한 키가 없으면 0)
+            - ``cost_reserved_keys``: 예약한 스코프마다 (cpm 키, cph 키)
     """
     if redis is None:
         # Redis 다운 — fail-open (NFR-2.4). Middleware의 in-memory fallback이 처리 중.
@@ -270,6 +272,8 @@ async def enforce_rate_limits(
         "tpm_descriptors": _only_tpm(descriptors),
         "tpm_reserved": reserved,
         "cost_reserved": cost_result.reserved_cost,
+        # 실제로 예약한 스코프·창의 키. 비용 정산은 이 키만 조정한다(RateLimitService.settle_cost).
+        "cost_reserved_keys": cost_result.reserved_keys,
     }
     return None
 

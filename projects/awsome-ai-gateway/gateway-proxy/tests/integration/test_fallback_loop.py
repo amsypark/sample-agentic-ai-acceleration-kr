@@ -220,19 +220,31 @@ class TestFallsBackOn502ThenSucceeds:
         settle_tpm_calls = []
         settle_cost_calls = []
 
+        reserved_keys = (("rl:cost:user:{u}:cpm:60", "rl:cost:user:{u}:cph:0"),)
+
         async def _fake_enforce(*, redis, auth_context, model_config, body, state, request_id, budget_status):
             state["rate_limit_state"] = {
                 "tpm_descriptors": ["desc1"],
                 "tpm_reserved": 500,
                 "cost_reserved": Decimal("0.01"),
+                "cost_reserved_keys": reserved_keys,
             }
             return None
 
         async def _fake_settle_tpm(redis, descriptors, reserved, actual):
             settle_tpm_calls.append({"descriptors": descriptors, "reserved": reserved, "actual": actual})
 
-        async def _fake_settle_cost(redis, *, user_id, actual_cost, reserved_cost, team_id):
-            settle_cost_calls.append({"user_id": user_id, "actual": actual_cost, "reserved": reserved_cost})
+        async def _fake_settle_cost(
+            redis, *, user_id, actual_cost, reserved_cost, team_id, reserved_keys=None
+        ):
+            settle_cost_calls.append(
+                {
+                    "user_id": user_id,
+                    "actual": actual_cost,
+                    "reserved": reserved_cost,
+                    "keys": reserved_keys,
+                }
+            )
 
         from fakeredis import aioredis as fr
         fake_redis = fr.FakeRedis(decode_responses=True)
@@ -269,6 +281,8 @@ class TestFallsBackOn502ThenSucceeds:
         assert len(settle_cost_calls) >= 1
         assert settle_cost_calls[0]["actual"] == Decimal("0")
         assert settle_cost_calls[0]["reserved"] == Decimal("0.01")
+        # 정산은 예약한 키만 조정한다 — release 가 그 키를 그대로 넘겨야 한다.
+        assert settle_cost_calls[0]["keys"] == reserved_keys
 
         # CB: failure recorded for the failed original, success for fallback
         cb.record_failure.assert_awaited()

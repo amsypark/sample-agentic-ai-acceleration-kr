@@ -385,9 +385,14 @@ class RateLimitService:
         fail-open 으로 CPM/CPH **무음 미집행**됐다(team 없을 때 dummy team 키조차
         cross-slot). cost_rate_limit_scope.lua 로 한 scope 의 cpm/cph 2키(동일 hash
         tag = 단일 슬롯)만 넘겨 scope 별 호출. USER 통과 후에만 TEAM 검사(fast-fail).
-        USER 통과·TEAM 거부 시 USER 카운터엔 phantom 예약이 남지만 settle_cost 가
-        실제 비용과 차액 정산(요청 자체가 거부되니 실제 비용 0 → 다음 settle 로 환불).
-        budget_service.check 와 동형 패턴.
+        USER 통과·TEAM 거부 시 USER 카운터엔 phantom 예약이 남는다 — 거부된 요청은 정산
+        상태를 받지 않으므로 settle_cost 가 돌지 않고, 그 예약은 창이 끝날 때까지(cpm 1분,
+        cph 1시간) 남는다(과잉제한 방향). budget_service.check 와 동형 패턴.
+
+        반환값의 ``reserved_keys`` 는 **실제로 예약한** 스코프의 (cpm 키, cph 키)다. 한도가 없어
+        건너뛴 스코프, eval 이 실패해 fail-open 한 스코프, 예약액이 0 이라 Lua 가 쓰지 않은 경우는
+        들어가지 않는다. 정산은 이 키만, 이 창에서만 조정한다(:meth:`settle_cost`). 예약한 키가
+        하나도 없으면 ``reserved_cost`` 도 0 이다 — 되돌릴 예약이 없으므로 정산이 돌지 않는다.
         """
         user_cpm = Decimal(str(user_cpm_limit)) if user_cpm_limit else Decimal("0")
         user_cph = Decimal(str(user_cph_limit)) if user_cph_limit else Decimal("0")
@@ -411,6 +416,7 @@ class RateLimitService:
         if has_team_limit:
             scopes.append(("TEAM", "team", team_id, team_cpm, team_cph))
 
+        reserved: list[tuple[str, str]] = []
         for label, prefix, sid, cpm, cph in scopes:
             cpm_key = f"rl:cost:{prefix}:{{{sid}}}:cpm:{cpm_window_ts}"
             cph_key = f"rl:cost:{prefix}:{{{sid}}}:cph:{cph_window_ts}"
@@ -454,9 +460,18 @@ class RateLimitService:
                     retry_after=result.get("retry_after"),
                     reserved_cost=Decimal("0"),
                 )
+            # 통과 — 이 scope 의 eval 이 두 키에 INCRBYFLOAT + EXPIRE 를 커밋했다
+            # (예약액 > 0 일 때만, cost_rate_limit_scope.lua 의 `if cost > 0`).
+            # 정산이 조정할 키는 이것뿐이다.
+            if estimated_cost > 0:
+                reserved.append((cpm_key, cph_key))
 
-        # 전 scope 통과 — 예약 커밋됨(각 scope eval 이 INCRBYFLOAT 수행).
-        return CostLimitResult(allowed=True, reserved_cost=estimated_cost)
+        # 전 scope 통과. 예약한 키가 없으면(전부 fail-open, 또는 예약액 0) 되돌릴 것도 없다.
+        return CostLimitResult(
+            allowed=True,
+            reserved_cost=estimated_cost if reserved else Decimal("0"),
+            reserved_keys=tuple(reserved),
+        )
 
     async def settle_cost(
         self,
@@ -466,29 +481,75 @@ class RateLimitService:
         actual_cost: Decimal,
         reserved_cost: Decimal,
         team_id: str | None = None,
+        reserved_keys: tuple[tuple[str, str], ...] | None = None,
     ) -> None:
-        """CPM/CPH 사후 정산 — 실제 비용과 예약분 차이 조정 (USER + TEAM)."""
+        """CPM/CPH 사후 정산 — 실제 비용과 예약분의 차액을 **예약한 키에만** 반영한다.
+
+        ``reserved_keys`` = :meth:`reserve_cost` 가 돌려준 ``reserved_keys``(스코프마다 (cpm 키,
+        cph 키)). 정산은 그 키만, 그 키 이름의 창에서만 조정한다 — 예약하지 않은 스코프는 건드리지
+        않고, 정산 시각으로 창을 다시 고르지 않는다.
+
+        ⚠️ 예전 구현은 USER 키를 무조건, TEAM 키를 ``team_id`` 만 있으면 조정했고 창을 정산
+           시각의 ``now`` 로 골랐으며 EXPIRE 를 걸지 않았다. 그래서 (1) 한도가 없어 예약하지 않은
+           스코프에 음수 카운터가 생기고, (2) 분·시 경계를 넘긴 정산은 **다음 창에** 새 키를
+           만들었으며 — 예약한 창의 예약은 그대로 남는다 — (3) 그 키들에는 TTL 이 없었다(실측:
+           user 한도만 있을 때 zero-usage 환불 뒤 팀 키 −0.015078, TTL −1). TTL 없는 키는 만료되지
+           않고 volatile-lru 도 축출하지 못해 활성 분·시마다 쌓이며, 메모리가 차면 TTL 이 있는
+           키(rate-limit 카운터·모델 캐시·예산 설정)가 먼저 축출된다. 나중에 그 스코프에 한도를
+           켜면 쌓인 음수만큼 그 창의 한도가 느슨해진다.
+
+        스코프마다 EVAL 한 번(cost_settle_scope.lua, 같은 hash tag 의 두 키) — USER 와 TEAM 키는
+        슬롯이 달라 한 EVAL 에 섞으면 Redis Cluster 에서 CROSSSLOT 이다(deepdive Q50). 키가 이미
+        없으면(긴 스트림이 cpm 키의 120초 TTL 을 넘긴 경우 등) 그 키는 건너뛰고 되살리지 않는다 —
+        TTL 이 끝났다면 그 창도 끝나 어떤 검사도 그 키를 읽지 않는다. 결과가 음수면 0 으로 둔다.
+        스크립트 docstring 참조.
+
+        ``reserved_keys`` 가 없으면(None/빈 값 — 이 필드 이전 모양의 정산 상태) 아무것도 조정하지
+        않는다. 어느 스코프의 어느 창을 예약했는지 모르는 채로 쓰는 것은 정확히 위의 결함이다.
+        그 대가는 그 예약이 창 끝까지 남는 것(과잉제한, 최대 cpm 1분·cph 1시간)이다. 정산 상태는
+        요청을 받은 프로세스 안에만 있으므로(라우터 → finalize / release_reservations), 이 모양은
+        이 코드가 만든 예약에서는 생기지 않는다.
+        """
         adjustment = actual_cost - reserved_cost
         if adjustment == Decimal("0"):
             return
+        if not reserved_keys:
+            logger.warning(
+                "cost_settle_skipped_no_reserved_keys",
+                user_id=user_id,
+                adjustment=str(adjustment),
+            )
+            return
 
-        now = int(time.time())
-        cpm_window_ts = (now // 60) * 60
-        cph_window_ts = (now // 3600) * 3600
-        adj_float = float(adjustment)
-
-        # 파이프라이닝(deepdive Q50): 2~4 incrbyfloat 를 순차 await 대신 한 파이프라인으로.
-        # 비트랜잭션 파이프라인은 cluster 에서 키별 노드 라우팅 → cross-slot 안전.
+        script = LuaScriptLoader.get("cost_settle_scope")
+        # 파이프라이닝(deepdive Q50): 스코프별 EVAL 을 순차 await 대신 한 파이프라인으로.
+        # 비트랜잭션 파이프라인은 cluster 에서 명령마다 그 키의 노드로 라우팅되고, 각 EVAL 의
+        # 두 키는 한 슬롯이다.
         try:
             pipe = redis.pipeline(transaction=False)
-            pipe.incrbyfloat(f"rl:cost:user:{{{user_id}}}:cpm:{cpm_window_ts}", adj_float)
-            pipe.incrbyfloat(f"rl:cost:user:{{{user_id}}}:cph:{cph_window_ts}", adj_float)
-            if team_id:
-                pipe.incrbyfloat(f"rl:cost:team:{{{team_id}}}:cpm:{cpm_window_ts}", adj_float)
-                pipe.incrbyfloat(f"rl:cost:team:{{{team_id}}}:cph:{cph_window_ts}", adj_float)
-            await pipe.execute()
+            for cpm_key, cph_key in reserved_keys:
+                pipe.eval(script, 2, cpm_key, cph_key, str(adjustment))
+            results = await pipe.execute(raise_on_error=False)
         except Exception:
             logger.warning("cost_settle_failed", user_id=user_id, adjustment=str(adjustment))
+            return
+        for (cpm_key, _cph_key), res in zip(reserved_keys, results):
+            if isinstance(res, Exception):
+                logger.warning(
+                    "cost_settle_failed",
+                    user_id=user_id,
+                    key=cpm_key,
+                    adjustment=str(adjustment),
+                    error=type(res).__name__,
+                )
+            elif isinstance(res, list | tuple) and 0 in [int(x) for x in res]:
+                # 예약한 창의 키가 이미 만료됐다 — 그 키는 조정하지 않았다(스크립트 docstring).
+                logger.debug(
+                    "cost_settle_window_expired",
+                    key=cpm_key,
+                    applied=[int(x) for x in res],
+                    adjustment=str(adjustment),
+                )
 
 
 class InMemoryRateLimiter:

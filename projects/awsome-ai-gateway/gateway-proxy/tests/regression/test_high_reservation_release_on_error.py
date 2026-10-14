@@ -79,6 +79,23 @@ def _cost_keys(user_id: str, team_id: str) -> list[str]:
     ]
 
 
+def _rate_limit_state(keys: list[str], reserved: Decimal) -> dict:
+    """``enforce_rate_limits`` 가 라우터에 넘기는 모양 — 예약한 스코프마다 (cpm 키, cph 키).
+
+    정산은 이 키만 조정한다(``RateLimitService.settle_cost``). ``keys`` 는 :func:`_cost_keys` 순서
+    (user cpm, user cph, team cpm, team cph). 정산 스크립트(cost_settle_scope.lua)도 여기서 올린다.
+    """
+    from app.services.lua_loader import LuaScriptLoader
+
+    LuaScriptLoader.load_all(_SRC / "redis_scripts")
+    return {
+        "tpm_descriptors": [],
+        "tpm_reserved": 0,
+        "cost_reserved": reserved,
+        "cost_reserved_keys": ((keys[0], keys[1]), (keys[2], keys[3])),
+    }
+
+
 async def _read_floats(redis, keys: list[str]) -> list[float]:
     out = []
     for k in keys:
@@ -106,13 +123,7 @@ async def test_release_refunds_the_cost_reservation_on_real_redis():
         before = await _read_floats(r, keys)
         assert all(abs(v - 2.50) < 1e-9 for v in before), f"예약 셋업 실패: {before}"
 
-        state = {
-            "rate_limit_state": {
-                "tpm_descriptors": [],
-                "tpm_reserved": 0,
-                "cost_reserved": reserved,
-            }
-        }
+        state = {"rate_limit_state": _rate_limit_state(keys, reserved)}
         await release_reservations(redis=r, state=state, auth_context=_Auth(user_id, team_id))
 
         after = await _read_floats(r, keys)
@@ -142,13 +153,7 @@ async def test_release_is_idempotent_and_does_not_over_refund():
     try:
         for k in keys:
             await r.incrbyfloat(k, 1.0)
-        state = {
-            "rate_limit_state": {
-                "tpm_descriptors": [],
-                "tpm_reserved": 0,
-                "cost_reserved": Decimal("1.0"),
-            }
-        }
+        state = {"rate_limit_state": _rate_limit_state(keys, Decimal("1.0"))}
         auth = _Auth(user_id, team_id)
         await release_reservations(redis=r, state=state, auth_context=auth)
         await release_reservations(redis=r, state=state, auth_context=auth)
@@ -188,11 +193,7 @@ async def test_finalize_zero_usage_releases_cost_not_just_tpm():
             "req-zero",
             True,
             123,
-            rate_limit_state={
-                "tpm_descriptors": [],
-                "tpm_reserved": 0,
-                "cost_reserved": Decimal("0.75"),
-            },
+            rate_limit_state=_rate_limit_state(keys, Decimal("0.75")),
         )
         after = await _read_floats(r, keys)
         assert all(abs(v) < 1e-9 for v in after), (
@@ -248,13 +249,7 @@ async def test_release_then_finalize_with_a_captured_state_refunds_once():
     try:
         for k in keys:
             await r.incrbyfloat(k, 0.5)
-        state = {
-            "rate_limit_state": {
-                "tpm_descriptors": [],
-                "tpm_reserved": 0,
-                "cost_reserved": Decimal("0.5"),
-            }
-        }
+        state = {"rate_limit_state": _rate_limit_state(keys, Decimal("0.5"))}
         captured = state["rate_limit_state"]  # openai_compat 가 하는 것: release 전에 잡는다
         auth = _Auth(user_id, team_id)
         await release_reservations(redis=r, state=state, auth_context=auth)

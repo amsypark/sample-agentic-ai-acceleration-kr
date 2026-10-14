@@ -242,6 +242,7 @@ async def release_reservations(
                 actual_cost=Decimal("0"),
                 reserved_cost=cost_reserved,
                 team_id=str(auth_context.team_id) if auth_context.team_id else None,
+                reserved_keys=rls.get("cost_reserved_keys"),
             )
         except Exception:
             logger.warning("fallback_unwind_cost_failed")
@@ -251,6 +252,7 @@ async def release_reservations(
     rls["tpm_descriptors"] = []
     rls["tpm_reserved"] = 0
     rls["cost_reserved"] = Decimal("0")
+    rls["cost_reserved_keys"] = ()
     state.pop("rate_limit_state", None)
 
 
