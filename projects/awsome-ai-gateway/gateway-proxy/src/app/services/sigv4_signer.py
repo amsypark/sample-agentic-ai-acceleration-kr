@@ -11,7 +11,10 @@ keeps using ``providers/bedrock_adapter.py`` + boto3.
 Two credential paths, mirroring :class:`~app.services.mantle_credentials.MantleCredentialBroker`:
 
 * in-account (``role_arn`` is None) — the pod's own IRSA credentials.
-* cross-account (``role_arn`` set) — STS AssumeRole, creds cached ~1h.
+* cross-account (``role_arn`` set) — STS AssumeRole, creds cached ~1h. A failed AssumeRole is
+  remembered for ``PROFILE_FAILURE_BACKOFF`` seconds per (role, ExternalId, session name): until
+  then requests for that key fail at once (the adapter's usual 502) instead of each calling STS
+  again behind the lock and waiting out its timeout.
 
 It vends SIGNATURES where the Mantle broker vends BEARER TOKENS; the duplication of the
 assume+cache block is deliberate. Folding both into one broker would mean editing the
@@ -39,7 +42,12 @@ from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
-from app.services.account_credentials import SESSION_NAME_RUNTIME, AccountCredentialsUnavailable
+from app.services.account_credentials import (
+    SESSION_NAME_RUNTIME,
+    AccountCredentialsUnavailable,
+    ProfileAssumeBackoff,
+    ProfileFailureMemory,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -73,6 +81,8 @@ class SigV4Signer:
         self._now = now
         self._creds: dict[str, _CachedCreds] = {}
         self._lock = asyncio.Lock()
+        # 프로필 경로의 짧은 AssumeRole 실패 기억 — 키 (역할, ExternalId, gw-bedrock-openai).
+        self._profile_failures = ProfileFailureMemory(now)
         # BedrockAccountClientProvider (0043). alias 계정 서명에만 쓴다. None 이면 account 가 온
         # 서명은 파드 자격증명으로 대신하지 않고 거부한다.
         self._account_provider = account_provider
@@ -137,6 +147,16 @@ class SigV4Signer:
             return await asyncio.get_running_loop().run_in_executor(
                 None, self._in_account_creds
             )
+        # lock 밖에서 먼저 본다. lock 은 모든 역할이 하나를 쓰므로, 캐시가 신선한 요청까지 다른
+        # 역할의 느린 STS 호출 뒤에 줄 서지 않게 한다. 그 키의 AssumeRole 이 방금 실패했거나
+        # 재시도가 진행 중이면 STS 를 기다리지 않고 실패한다 — 어댑터가 오늘처럼 502 로 답한다
+        # (ProfileFailureMemory).
+        key = (role_arn, external_id or "", SESSION_NAME_RUNTIME)
+        cached = self._creds.get(role_arn)
+        if cached and cached.expires_at - _CRED_REFRESH_SKEW > self._now():
+            return cached.creds
+        if self._profile_failures.blocked(key):
+            raise ProfileAssumeBackoff(role_arn)
         async with self._lock:
             now = self._now()
             cached = self._creds.get(role_arn)
@@ -147,9 +167,12 @@ class SigV4Signer:
                     "SigV4Signer has no STS client; cannot assume "
                     f"{role_arn} for the cross-account runtime path"
                 )
-            creds, expires_at = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._assume(role_arn, external_id)
-            )
+            if self._profile_failures.blocked(key):  # lock 을 기다리는 사이 앞 요청이 실패했다
+                raise ProfileAssumeBackoff(role_arn)
+            with self._profile_failures.attempt(key):
+                creds, expires_at = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._assume(role_arn, external_id)
+                )
             self._creds[role_arn] = _CachedCreds(creds=creds, expires_at=expires_at)
             logger.info("sigv4_xacct_creds_assumed", role_arn=role_arn)
             return creds

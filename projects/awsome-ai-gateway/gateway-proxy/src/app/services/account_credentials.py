@@ -48,6 +48,8 @@ alias 계정이 없는 요청에만 걸린다.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 #: RoleSessionName — 경로(transport)마다 **이미 쓰던 이름**을 alias 계정에도 쓴다. 대상 계정의
@@ -82,6 +84,85 @@ class AccountCredentialsUnavailable(RuntimeError):
         self.role_arn = role_arn
         self.reason = reason
         super().__init__(f"{reason} (role_arn={role_arn})")
+
+
+#: 라우팅 프로필 경로(세 평면)가 실패한 AssumeRole 을 기억하는 시간(초). alias 경로의 30초
+#: (``bedrock_account_client.FAILURE_BACKOFF``)와 따로다.
+#:
+#: * 이 동안 그 키의 새 요청과, lock 뒤에서 그 실패를 기다리던 요청은 STS 를 부르지 않고 곧바로
+#:   경로의 폴백으로 간다 — claude-code native 는 파드 계정, runtime·Mantle 은 그 경로의 502.
+#:   줄 선 요청은 lock 을 넘겨받자마자(밀리초) 이 기억을 보므로, 5초는 큰 줄을 비우고도 남는다.
+#: * 짧게 둔다. claude-code 는 이 동안 파드 계정으로 청구되고 runtime·Mantle 은 실패하므로, 복구된
+#:   STS(또는 고친 신뢰 정책)는 최대 5초 안에 다시 쓰여야 한다. 30초는 그 비용이 alias 의 500 뿐인
+#:   경로의 값이다.
+#: * 기억이 끝나면 다음 요청 **하나만** STS 를 다시 부른다. 그 재시도가 진행 중이면 같은 키의 다른
+#:   요청은 그것을 기다리지 않고 폴백한다(:meth:`ProfileFailureMemory.blocked`). 그래서 STS 가 응답
+#:   없이 멈춰 있어도 (5초 + 한 번의 STS 시간)마다 요청 하나만 기다린다.
+PROFILE_FAILURE_BACKOFF = 5.0
+
+
+class ProfileAssumeBackoff(RuntimeError):
+    """라우팅 프로필의 AssumeRole 이 방금 실패해서, 이 요청은 STS 를 부르지 않았다.
+
+    ⚠️ :class:`AccountCredentialsUnavailable` 의 하위 타입이 **아니다**. runtime·Mantle 어댑터는 그
+    타입을 alias 계정의 고정 500 으로 바꾸고, 그 밖의 서명·인증 실패는 오늘처럼 502 다. 이 예외는
+    STS 실패가 그 경로에서 내던 것과 같은 502 로 가야 한다.
+    """
+
+    def __init__(self, role_arn: str) -> None:
+        self.role_arn = role_arn
+        super().__init__(
+            f"AssumeRole for the routing profile's role failed moments ago; not calling STS "
+            f"again for up to {PROFILE_FAILURE_BACKOFF:g}s (role_arn={role_arn})"
+        )
+
+
+class ProfileFailureMemory:
+    """라우팅 프로필 경로의 짧은 AssumeRole 실패 기억. 키 = (역할, ExternalId, 세션 이름).
+
+    alias 경로(``BedrockAccountClientProvider`` 의 30초 기억)와 같은 키 모양이고, 같은 이유로 시계는
+    **실패를 기록하는 순간** 읽는다 — STS 가 실패하기까지 걸린 시간만큼 기억이 짧아지지 않게.
+    프로세스(워커)마다 하나다.
+    """
+
+    def __init__(self, now: Callable[[], float]) -> None:
+        self._now = now
+        self._until: dict[tuple, float] = {}
+        self._in_flight: dict[tuple, int] = {}
+
+    def blocked(self, key: tuple) -> bool:
+        """True = STS 를 부르지도, 진행 중인 STS 호출을 기다리지도 말고 그 경로의 폴백으로 간다.
+
+        마지막 시도가 실패였을 때만 True 다. 기억하는 동안(실패 시각 + PROFILE_FAILURE_BACKOFF)
+        이거나, 기억은 끝났지만 그 키의 STS 재시도가 지금 진행 중일 때. 성공하면 기억을 지우므로,
+        처음 호출이나 성공한 뒤의 갱신은 지금처럼 진행 중인 호출을 기다린다(single-flight).
+        """
+        until = self._until.get(key)
+        if until is None:
+            return False
+        return until > self._now() or self._in_flight.get(key, 0) > 0
+
+    @contextmanager
+    def attempt(self, key: tuple):
+        """STS 호출 하나를 감싼다 — 진행 중 표시, 실패면 지금 시각부터 기억, 성공이면 기억 삭제.
+
+        취소(``CancelledError``, 클라이언트 연결 끊김 등)는 실패로 치지 않는다 — STS 가 실패한 것이
+        아니다.
+        """
+        self._in_flight[key] = self._in_flight.get(key, 0) + 1
+        try:
+            yield
+        except Exception:
+            self._until[key] = self._now() + PROFILE_FAILURE_BACKOFF
+            raise
+        else:
+            self._until.pop(key, None)
+        finally:
+            left = self._in_flight[key] - 1
+            if left:
+                self._in_flight[key] = left
+            else:
+                del self._in_flight[key]
 
 
 @dataclass(frozen=True)

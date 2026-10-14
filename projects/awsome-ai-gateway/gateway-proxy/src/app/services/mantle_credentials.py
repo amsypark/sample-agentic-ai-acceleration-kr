@@ -14,6 +14,8 @@ from app.services.account_credentials import (
     SESSION_NAME_MANTLE,
     AccountCredentialsUnavailable,
     AccountTarget,
+    ProfileAssumeBackoff,
+    ProfileFailureMemory,
 )
 
 logger = structlog.get_logger(__name__)
@@ -58,7 +60,10 @@ class MantleCredentialBroker:
       pod's own IRSA credentials directly (no AssumeRole needed).
 
     Holds NO long-lived account keys. Caches assumed creds (~1h) and bearer
-    tokens (30 min) to avoid per-request STS calls and token minting.
+    tokens (30 min) to avoid per-request STS calls and token minting. A failed
+    AssumeRole of the profile's role is remembered for ``PROFILE_FAILURE_BACKOFF``
+    seconds per (role, ExternalId, ``gw-mantle``): until then those requests fail at
+    once (the adapter's usual 502) instead of each calling STS again behind the lock.
 
     alias 별 대상 계정(0043): ``bearer_token(profile, account=AccountTarget)`` 이면 프로필
     계정보다 **우선해** 그 계정으로 mint 한다. 자격증명은 세 경로가 공유하는
@@ -85,6 +90,8 @@ class MantleCredentialBroker:
         # alias 계정 bearer(0043)는 첫 칸이 ("account", 역할, ExternalId) 튜플이다(_account_bearer).
         self._bearers: dict[tuple, _CachedBearer] = {}
         self._lock = asyncio.Lock()
+        # 프로필 경로의 짧은 AssumeRole 실패 기억 — 키 (역할, ExternalId, gw-mantle).
+        self._profile_failures = ProfileFailureMemory(now)
 
     def _in_account_creds(self) -> Credentials:
         """Pod's own IRSA credentials (no AssumeRole) for in-account Mantle (333)."""
@@ -108,6 +115,17 @@ class MantleCredentialBroker:
 
         cred_key = profile.account_role_arn or "in-account"
         bearer_key = (cred_key, profile.region)
+        # lock 밖에서 먼저 본다(_account_bearer 와 같다). 프로필 역할의 STS 호출은 이 lock 안에서
+        # 일어나므로, 캐시된 bearer 가 있는 요청(in-account codex 포함)까지 그 호출 뒤에 줄 서지
+        # 않게 한다. 그 역할의 AssumeRole 이 방금 실패했거나 재시도가 진행 중이면 STS 를 기다리지
+        # 않고 실패한다 — 어댑터가 오늘처럼 502 로 답한다(ProfileFailureMemory).
+        cached_bearer = self._bearers.get(bearer_key)
+        if cached_bearer and cached_bearer.expires_at > self._now():
+            return cached_bearer.token
+        if profile.account_role_arn and self._profile_failures.blocked(
+            self._profile_key(profile.account_role_arn, profile.external_id)
+        ):
+            raise ProfileAssumeBackoff(profile.account_role_arn)
         async with self._lock:
             now = self._now()
             cached_bearer = self._bearers.get(bearer_key)
@@ -171,6 +189,10 @@ class MantleCredentialBroker:
             self._bearers[bearer_key] = _CachedBearer(token=token, expires_at=bearer_expiry)
             return token
 
+    @staticmethod
+    def _profile_key(role_arn: str, external_id: str | None) -> tuple[str, str, str]:
+        return (role_arn, external_id or "", SESSION_NAME_MANTLE)
+
     async def _get_creds(
         self, role_arn: str, external_id: Optional[str], now: float
     ) -> Credentials:
@@ -178,6 +200,9 @@ class MantleCredentialBroker:
         if cached and cached.expires_at - _CRED_REFRESH_SKEW > now:
             return cached.creds
 
+        key = self._profile_key(role_arn, external_id)
+        if self._profile_failures.blocked(key):  # lock 을 기다리는 사이 앞 요청이 실패했다
+            raise ProfileAssumeBackoff(role_arn)
         kwargs = {
             "RoleArn": role_arn,
             "RoleSessionName": "gw-mantle",
@@ -186,9 +211,10 @@ class MantleCredentialBroker:
         if external_id:
             kwargs["ExternalId"] = external_id
 
-        resp = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self._sts.assume_role(**kwargs)
-        )
+        with self._profile_failures.attempt(key):
+            resp = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._sts.assume_role(**kwargs)
+            )
         c = resp["Credentials"]
         creds = Credentials(c["AccessKeyId"], c["SecretAccessKey"], c["SessionToken"])
         expires_at = c["Expiration"].timestamp()
