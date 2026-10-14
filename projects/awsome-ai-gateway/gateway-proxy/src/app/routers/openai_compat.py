@@ -341,9 +341,11 @@ async def _handle_openai(request: Request, path: str):
                 client=client,
             )
 
-        # ⚠️ 상류가 비-2xx 면 SSE 제너레이터는 오류 프레임만 내보내고 on_usage 는 발화하지
-        #    않는다 → finalize 가 돌지 않아 예약이 창(window) 끝까지 남는다. 스트림을
-        #    클라이언트에게 넘기기 **전에** 되돌린다(release_reservations 는 멱등).
+        # ⚠️ 상류가 비-2xx 면 스트림을 클라이언트에게 넘기기 **전에** 예약을 되돌린다.
+        #    SSE 제너레이터는 이때도 zero-usage on_usage 를 쏘고(KI-08), 아래 _record 는
+        #    미리 잡아 둔 rate_limit_state 로 finalize 한다 — 그래서 release_reservations 가
+        #    그 dict 를 제자리에서 비운다. 안 그러면 finalize 가 한 번 더 환불해 카운터가
+        #    음수가 된다(services/fallback_loop.py release_reservations docstring).
         if not (200 <= status < 300):
             await release_reservations(redis=redis, state=state, auth_context=auth_context)
 
@@ -842,8 +844,8 @@ async def _handle_responses(request: Request):
             body, model_config.provider_model_id, **invoke_kwargs
         )
 
-        # 비-2xx 면 on_usage 가 발화하지 않아 예약을 되돌리는 곳이 없다 — 근거는
-        # _handle_openai 의 같은 주석 참조.
+        # 비-2xx 면 스트림 전에 예약을 되돌린다 — 이중 환불이 안 되는 이유까지 _handle_openai 의
+        # 같은 주석 참조.
         if not (200 <= status < 300):
             await release_reservations(redis=redis, state=state, auth_context=auth_context)
 
