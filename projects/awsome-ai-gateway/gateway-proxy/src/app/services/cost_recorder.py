@@ -10,6 +10,7 @@ import structlog
 from app.periods import current_kst_period
 from app.schemas.cost_stream import CostStreamEntry
 from app.schemas.domain import AuthContext, ModelConfigSchema, TokenUsage
+from app.services.account_credentials import effective_account_id
 
 logger = structlog.get_logger(__name__)
 
@@ -164,8 +165,15 @@ class CostRecorder:
         availability_fallback_from: str | None = None,
         bedrock_request_id: str | None = None,
         client: str | None = None,
+        profile_account=None,
     ) -> Decimal:
         """요청 완료 후 critical path 전체를 동기 await으로 수행. 실제 cost_usd 반환.
+
+        ``profile_account``: 이 요청을 **실제로 서명한** 라우팅 프로필 계정(``AccountTarget``,
+        없으면 None). usage_logs.aws_account_id(0045)를 서명 규칙과 똑같이 계산하는 데만 쓴다 —
+        alias 계정이 있으면 그것이 먼저다(account_credentials.effective_account_id). 이 값 없이
+        계산하면 cowork 의 Mantle 호출과 claude-code 의 cross-account 호출이 "게이트웨이 계정" 으로
+        잘못 기록된다.
 
         라우터는 응답 반환 **전에** ``await finalize(...)`` 호출해야 함 —
         budget_deduct + settle_*가 다음 요청 enforce에 영향.
@@ -363,6 +371,13 @@ class CostRecorder:
         # 3. XADD cost:stream — cost-recorder-worker가 DB INSERT / daily counter /
         #    threshold pub/sub 배치 처리. 실패는 경고만 (gateway response는 영향 없음).
         if redis is not None:
+            # 실제 서빙 계정(0045). 감사용 부가 정보라 여기서 예외가 나도 과금 행(XADD)을 잃지
+            # 않게 막는다 — 계정만 비운다.
+            try:
+                aws_account_id = effective_account_id(model_config, profile_account)
+            except Exception:
+                logger.warning("aws_account_attribution_failed", request_id=request_id)
+                aws_account_id = None
             await self._publish_to_stream(
                 redis,
                 auth_context=auth_context,
@@ -378,6 +393,7 @@ class CostRecorder:
                 availability_fallback_from=availability_fallback_from,
                 bedrock_request_id=bedrock_request_id,
                 client=client,
+                aws_account_id=aws_account_id,
             )
 
         return cost_usd
@@ -399,6 +415,7 @@ class CostRecorder:
         availability_fallback_from: str | None = None,
         bedrock_request_id: str | None = None,
         client: str | None = None,
+        aws_account_id: str | None = None,
     ) -> None:
         """XADD cost:stream — worker가 배치 소비하여 DB 쓰기 + threshold pub/sub.
 
@@ -443,6 +460,7 @@ class CostRecorder:
             bedrock_request_id=bedrock_request_id,
             client=client,
             context_tier=context_tier,
+            aws_account_id=aws_account_id,
         )
 
         payload_json = entry.model_dump_json()

@@ -53,9 +53,14 @@ async def test_provider_assumes_and_caches(monkeypatch):
     c2 = await prov.get_client("arn:aws:iam::123456789012:role/x", "ap-northeast-2", "ext-id")
     assert sts.calls == 1 and c2 is c1
 
-    # 다른 region → 별도 클라이언트
+    # 다른 region → 별도 클라이언트, 그러나 **같은 자격증명**(AssumeRole 1회).
+    # STS 자격증명은 리전에 묶이지 않는다(assume 은 언제나 mantle_assume_region 의 STS 로 간다).
+    # 리전마다 다시 assume 하던 것은 같은 세션을 두 번 받는 중복이었다 — 0043 에서 자격증명
+    # 캐시를 (역할, ExternalId, 세션 이름) 으로 한 곳에 모으며 없앴다. 클라이언트는 여전히
+    # 리전별이다(region-bound 클라이언트 cross-serve 방지).
     c3 = await prov.get_client("arn:aws:iam::123456789012:role/x", "us-east-1", "ext-id")
-    assert sts.calls == 2 and c3 is not c1 and c3["region"] == "us-east-1"
+    assert sts.calls == 1 and c3 is not c1 and c3["region"] == "us-east-1"
+    assert c3["creds"] == c1["creds"]
 
 
 @pytest.mark.asyncio

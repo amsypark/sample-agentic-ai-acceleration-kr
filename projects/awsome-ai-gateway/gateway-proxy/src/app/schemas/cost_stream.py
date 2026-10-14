@@ -61,6 +61,11 @@ class CostStreamEntry(BaseModel):
     # 청구 티어 감사 (마이그레이션 0039). "short"|"long"|None(티어 없는 모델).
     # 게이트웨이 resolve_context_tier 가 청구와 동일 판정으로 채운다.
     context_tier: str | None = None
+    # 이 요청을 실제로 서빙한 AWS 계정 12자리 (마이그레이션 0045). None = 게이트웨이 자신의
+    # 계정. 정산이 usage 행의 bedrock_request_id 를 **어느 계정의** invocation log 에서 찾을지
+    # 알려 준다. 기본 None 이라 구버전 엔트리도 파싱되고, 워커가 구버전이면(extra 무시) 조용히
+    # 버려질 뿐 과금에는 영향이 없다.
+    aws_account_id: str | None = None
 
     schema_version: int = Field(default=2)
 
@@ -93,6 +98,7 @@ class CostStreamEntry(BaseModel):
         bedrock_request_id: str | None = None,
         client: str | None = None,
         context_tier: str | None = None,
+        aws_account_id: str | None = None,
     ) -> CostStreamEntry:
         now = datetime.now(tz=UTC)
         return cls(
@@ -133,4 +139,5 @@ class CostStreamEntry(BaseModel):
             bedrock_request_id=bedrock_request_id,
             client=client,
             context_tier=context_tier,
+            aws_account_id=aws_account_id,
         )

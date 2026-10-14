@@ -19,6 +19,13 @@ live Cowork/Codex bearer path to add a runtime-plane feature, and a regression t
 down two shipped clients. The two caches are also keyed differently: a bearer is bound to
 (creds, region) and reusable for 30 min, while a signature is per-request (it covers the
 body hash) so only the CREDENTIALS are worth caching here.
+
+A third credential source, for alias accounts (migration 0043): ``sign(account=...)`` takes
+the credentials from the shared ``BedrockAccountClientProvider`` — the one cache every plane
+uses for alias accounts — and leaves the two paths above byte-identical. ``account`` changes
+WHICH credentials sign, never the URL or the region: the SigV4 scope
+(``<key>/<date>/<region>/bedrock``) has no account field, so the signing identity is the only
+thing that selects an account.
 """
 from __future__ import annotations
 
@@ -31,6 +38,8 @@ import structlog
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
+
+from app.services.account_credentials import SESSION_NAME_RUNTIME, AccountCredentialsUnavailable
 
 logger = structlog.get_logger(__name__)
 
@@ -57,12 +66,16 @@ class SigV4Signer:
         sts_client=None,
         service_name: str = "bedrock",
         now: Callable[[], float] = time.time,
+        account_provider=None,
     ) -> None:
         self._sts = sts_client
         self._service = service_name
         self._now = now
         self._creds: dict[str, _CachedCreds] = {}
         self._lock = asyncio.Lock()
+        # BedrockAccountClientProvider (0043). alias 계정 서명에만 쓴다. None 이면 account 가 온
+        # 서명은 파드 자격증명으로 대신하지 않고 거부한다.
+        self._account_provider = account_provider
         # One long-lived botocore session for the in-account path. It owns the
         # refreshable credential object, so building it ONCE is what makes the IRSA
         # web-identity session reusable; a per-request boto3.Session() would re-run the
@@ -80,19 +93,39 @@ class SigV4Signer:
         headers: Optional[dict] = None,
         role_arn: Optional[str] = None,
         external_id: Optional[str] = None,
+        account=None,
     ) -> dict:
         """Return the headers to send, including Authorization/X-Amz-Date/security token.
 
         The signature covers the exact ``body`` bytes and the host implied by ``url``, so
         the caller MUST send both verbatim (no re-serialising the JSON, no redirect
         following) or the service answers 403 SignatureDoesNotMatch.
+
+        ``account`` (an ``AccountTarget``, alias account) wins over ``role_arn`` — the alias
+        account takes precedence over the routing profile's. Raises
+        ``AccountCredentialsUnavailable`` when it cannot be used; never falls back to the
+        profile's role or the pod's identity.
         """
-        creds = await self._resolve_creds(role_arn, external_id)
+        if account is not None:
+            creds = await self._account_creds(account)
+        else:
+            creds = await self._resolve_creds(role_arn, external_id)
         base = {"content-type": "application/json", **(headers or {})}
         request = AWSRequest(method=method, url=url, data=body, headers=base)
         # SigV4Auth is pure CPU (hmac over the canonical request) — no I/O, safe inline.
         SigV4Auth(creds, self._service, region).add_auth(request)
         return dict(request.headers)
+
+    async def _account_creds(self, account) -> Credentials:
+        """alias 계정의 자격증명 — 공유 provider 에서(키: 역할, ExternalId, gw-bedrock-openai)."""
+        if self._account_provider is None:
+            # 파드 자격증명으로 서명하면 다른 계정에 청구되는 **성공** 호출이 된다.
+            raise AccountCredentialsUnavailable(
+                account.role_arn,
+                "alias requests a target AWS account but no account provider is wired into "
+                "SigV4Signer; refusing to sign with the pod's own credentials",
+            )
+        return await self._account_provider.credentials(account, session_name=SESSION_NAME_RUNTIME)
 
     async def _resolve_creds(
         self, role_arn: Optional[str], external_id: Optional[str]

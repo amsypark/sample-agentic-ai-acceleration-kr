@@ -30,6 +30,10 @@ def sample_alias_row():
     row.status = "ACTIVE"
     row.description = "Claude Sonnet 4.6"
     row.created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # alias 별 대상 계정(0043) — ORM 행에 있는 컬럼이다. 자동 MagicMock 속성은 _orm_to_schema
+    # 가 str | None 필드에 넣을 때 pydantic 검증을 깨뜨린다. None = alias 계정 없음.
+    row.account_role_arn = None
+    row.account_external_id = None
     return row
 
 
@@ -134,7 +138,16 @@ async def test_cache_hit_skips_db():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_cache_miss_writes_both_keys(sample_alias_row, sample_pricing_row):
+async def test_cache_miss_on_an_alias_request_writes_only_the_alias_key(
+    sample_alias_row, sample_pricing_row
+):
+    """alias 로 지목한 해석은 ``model:{alias}`` 만 쓴다.
+
+    예전에는 ``model:{provider_model_id}`` 도 썼다. 그 키는 provider_model_id 와 **이름이
+    같은 다른 alias** 의 캐시 칸이기도 해서(시드: claude-opus-4-8 → global.anthropic.
+    claude-opus-4-8 이라는 alias 가 따로 있다) TTL 동안 그 alias 가 이 alias 의 설정 — 단가,
+    허용 앱, status, alias 계정(0043) — 으로 서빙됐다(router_service._cache_resolved).
+    """
     redis = AsyncMock()
     redis.get = AsyncMock(return_value=None)
     redis.setex = AsyncMock()
@@ -144,8 +157,27 @@ async def test_cache_miss_writes_both_keys(sample_alias_row, sample_pricing_row)
     await rs.resolve_bedrock_model(redis, db, "claude-sonnet-4-6")
 
     keys_set = [call.args[0] for call in redis.setex.call_args_list]
-    assert "model:claude-sonnet-4-6" in keys_set
-    assert "model:global.anthropic.claude-sonnet-4-6" in keys_set
+    assert keys_set == ["model:claude-sonnet-4-6"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cache_miss_on_a_model_id_request_writes_both_keys(
+    sample_alias_row, sample_pricing_row
+):
+    """provider_model_id 로 지목한 해석은 두 키 모두 — 다음 같은 요청이 캐시에서 끝난다."""
+    redis = AsyncMock()
+    redis.get = AsyncMock(return_value=None)
+    redis.setex = AsyncMock()
+    # 1) alias 정확 매칭 없음 → 2) provider_model_id 형제 스캔 → 3) 단가
+    db = _make_db_mock([None, sample_alias_row, sample_pricing_row])
+
+    rs = RouterService()
+    schema = await rs.resolve_bedrock_model(redis, db, "global.anthropic.claude-sonnet-4-6")
+
+    assert schema.alias == "claude-sonnet-4-6"
+    keys_set = [call.args[0] for call in redis.setex.call_args_list]
+    assert keys_set == ["model:claude-sonnet-4-6", "model:global.anthropic.claude-sonnet-4-6"]
 
 
 @pytest.mark.unit

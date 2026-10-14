@@ -11,6 +11,11 @@ import structlog
 from app.providers.base import ProviderAdapter
 from app.providers.bedrock_adapter import _extract_bedrock_usage  # reuse usage parsing
 from app.schemas.domain import TokenUsage
+from app.services.account_credentials import (
+    ACCOUNT_UNAVAILABLE_BODY,
+    ACCOUNT_UNAVAILABLE_STATUS,
+    AccountCredentialsUnavailable,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -18,7 +23,7 @@ _ANTHROPIC_VERSION = "2023-06-01"
 
 
 class _BearerProvider(Protocol):
-    async def bearer_token(self, profile) -> str: ...
+    async def bearer_token(self, profile, account=...) -> str: ...
 
 
 class MantleAdapter(ProviderAdapter):
@@ -34,8 +39,13 @@ class MantleAdapter(ProviderAdapter):
         self._http = http_client
         self._broker = broker
 
-    async def _headers(self, profile) -> dict:
-        token = await self._broker.bearer_token(profile)
+    async def _headers(self, profile, account=None) -> dict:
+        # alias 계정(0043)이 있을 때만 넘긴다 — 없으면 오늘 호출 그대로(브로커가 프로필 계정,
+        # 그것도 없으면 파드 자격증명으로 mint).
+        if account is not None:
+            token = await self._broker.bearer_token(profile, account)
+        else:
+            token = await self._broker.bearer_token(profile)
         return {
             "Authorization": f"Bearer {token}",
             "anthropic-version": _ANTHROPIC_VERSION,
@@ -43,12 +53,23 @@ class MantleAdapter(ProviderAdapter):
         }
 
     async def invoke(
-        self, request_body: bytes, model_id: str, *, profile, endpoint: str, **kwargs
+        self,
+        request_body: bytes,
+        model_id: str,
+        *,
+        profile,
+        endpoint: str,
+        account=None,
+        **kwargs,
     ) -> tuple[int, bytes, dict, TokenUsage]:
         url = f"{endpoint.rstrip('/')}/v1/messages"
         try:
-            headers = await self._headers(profile)
+            headers = await self._headers(profile, account)
             resp = await self._http.post(url, content=request_body, headers=headers)
+        except AccountCredentialsUnavailable:
+            # alias 계정을 쓸 수 없다 — 502(폴백·서킷 대상)가 아니라 고정 500. 이 타입은 alias
+            # 계정 mint 에서만 나온다(프로필·파드 경로의 실패는 아래 기존 502 그대로).
+            return ACCOUNT_UNAVAILABLE_STATUS, ACCOUNT_UNAVAILABLE_BODY, {}, TokenUsage()
         except Exception:
             logger.exception("mantle_invoke_failed", model_id=model_id)
             return (
@@ -75,11 +96,24 @@ class MantleAdapter(ProviderAdapter):
         return 200, body, {}, usage
 
     async def invoke_stream(
-        self, request_body: bytes, model_id: str, *, profile, endpoint: str, **kwargs
+        self,
+        request_body: bytes,
+        model_id: str,
+        *,
+        profile,
+        endpoint: str,
+        account=None,
+        **kwargs,
     ) -> tuple[int, AsyncIterator[bytes], dict, str | None]:
         url = f"{endpoint.rstrip('/')}/v1/messages"
         try:
-            headers = await self._headers(profile)
+            headers = await self._headers(profile, account)
+        except AccountCredentialsUnavailable:
+
+            async def _account_err() -> AsyncIterator[bytes]:
+                yield ACCOUNT_UNAVAILABLE_BODY
+
+            return ACCOUNT_UNAVAILABLE_STATUS, _account_err(), {}, None
         except Exception:
             logger.exception("mantle_stream_auth_failed", model_id=model_id)
 

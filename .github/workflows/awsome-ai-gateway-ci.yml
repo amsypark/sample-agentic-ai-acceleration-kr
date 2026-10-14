@@ -324,15 +324,17 @@ jobs:
             tests/regression/test_high_budget_fallback_policy.py \
             tests/regression/test_medium_operator_thresholds_persist.py \
             tests/regression/test_medium_long_context_tier.py \
-            tests/regression/test_critical_stream_disconnect_ledger_gap.py > /tmp/proof3.txt 2>&1
+            tests/regression/test_critical_stream_disconnect_ledger_gap.py \
+            tests/regression/test_high_alias_account_real_db.py > /tmp/proof3.txt 2>&1
           status=$?
           tail -30 /tmp/proof3.txt
           if [ "$status" -ne 0 ]; then exit "$status"; fi
           passed=$(grep -oE "[0-9]+ passed" /tmp/proof3.txt | tail -1 | grep -oE "[0-9]+" || echo 0)
-          # 로컬 실측 기준선: 88 passed (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
+          # 로컬 실측 기준선: 95 passed (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
           #   + long-context 티어 27: calculate_cost/tier/감사 16 + 웹서치 턴별 티어 9
           #     + 실 PG 마이그레이션 2
-          #   + 스트림 끊김 원장 공백 10: 실 uvicorn 8 + 실 Redis 대사 2).
+          #   + 스트림 끊김 원장 공백 10: 실 uvicorn 8 + 실 Redis 대사 2
+          #   + alias 계정 7: 레지스트리 선택 → 트리거 사본 → 리졸버 → AccountTarget).
           #   예약 해제 14 중 4건(비-2xx 스트림 이중 환불: 메커니즘 1 + 라우터 2 + /v1/messages 1)이
           #   실 Redis 를 요구한다.
           # ⚠️ 예약 해제 파일은 REDIS_PROOF_URL 을 요구한다 — 환불은 incrbyfloat 로
@@ -340,8 +342,8 @@ jobs:
           #    원장 공백 파일의 대사 2건도 REDIS_PROOF_URL 이 없으면 skip 된다 — "카운터는 맞고
           #    원장만 짧다" 는 같은 실 Redis 에서 차감과 XADD 를 대사해야만 드러난다.
           #    두 env 중 하나라도 안 걸리면 통과 수가 떨어져 여기서 실패한다.
-          if [ "${passed:-0}" -lt 88 ]; then
-            echo "::error::통과 ${passed} 건(기대 88) — PROOF_DSN/REDIS_PROOF_URL 이 안 걸려 skip 됐다."
+          if [ "${passed:-0}" -lt 95 ]; then
+            echo "::error::통과 ${passed} 건(기대 95) — PROOF_DSN/REDIS_PROOF_URL 이 안 걸려 skip 됐다."
             exit 1
           fi
 

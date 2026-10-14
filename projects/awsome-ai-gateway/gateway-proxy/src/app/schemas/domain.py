@@ -137,6 +137,15 @@ class ModelConfigSchema(BaseModel):
     #:    옛 캐시 엔트리는 기본값을 받는다. 기본값을 ``[]`` 로 두면 배포 직후 캐시가
     #:    갈리기 전까지 **모든 모델이 전면 거부**된다.
     allowed_clients: list[str] | None = None
+    #: alias 별 대상 AWS 계정 (마이그레이션 0043; 0044 부터 레지스트리 선택의 사본).
+    #: None = alias 계정 없음 → 경로별 오늘 규칙(라우팅 프로필 계정 → 파드 IRSA). 판정은
+    #: ``services/account_credentials.resolve_account_target`` 한 곳이다.
+    #:
+    #: ⚠️ 기본값이 있어야 하는 이유는 ``allowed_clients`` 와 같다: Redis 모델 캐시(TTL 300s)가
+    #:    배포 직후 구 payload 를 ``ModelConfigSchema(**m)`` 로 되살린다. 그 창에서는 두 값이
+    #:    None 으로 보여 오늘 규칙대로 호출된다 — 계정 설정은 admin-api 의 캐시 DEL 뒤에 반영된다.
+    account_role_arn: str | None = None
+    account_external_id: str | None = None
 
 
 class BudgetStatus(BaseModel):
