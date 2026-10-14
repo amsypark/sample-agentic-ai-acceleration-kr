@@ -15,25 +15,20 @@ interface RateLimitTreeViewProps {
 
 const EXPANDED_NODES_STORAGE_KEY = 'rate-limits:tree:expandedNodes';
 
-function collectDefaultExpanded(nodes: RateLimitTreeNode[]): Set<string> {
-  // 기본적으로 GLOBAL 만 펼침. TEAM 은 접혀 있어서 USER 리스트 숨김.
-  const ids = new Set<string>();
-  for (const n of nodes) {
-    if (n.scope === 'GLOBAL') ids.add(n.id);
-  }
-  return ids;
-}
-
 export function RateLimitTreeView({ nodes }: RateLimitTreeViewProps) {
   const t = useTranslations('rateLimits');
   const [selectedNode, setSelectedNode] = useState<RateLimitTreeNode | null>(null);
-  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(() =>
-    collectDefaultExpanded(nodes)
-  );
+  // 최초 진입은 모두 접힌 상태다. 루트는 GLOBAL(모델별, children=[]) · TEAM(멤버를 자식으로) ·
+  // 팀 미배정 USER(children=[]) 세 부류가 **형제로** 온다 — GLOBAL 은 모델 축이라 TEAM/USER 의
+  // 부모가 아니다(admin-api get_rate_limit_tree). 예전의 "GLOBAL 만 펼침" 기본값은 GLOBAL 노드가
+  // 트리에 없던 시절의 것이라 아무것도 펼치지 않았다. 펼침 상태는 아래 effect 가 복원한다.
+  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(() => new Set<string>());
   const [showInactive, setShowInactive] = useState(false);
   const hasMountedRef = useRef(false);
 
   const hasInactive = nodes.some(n => n.is_active === false);
+  // GLOBAL 은 한 번에 한 모델만 활성 한도를 가진다 — 패널이 저장 전에 경고할 수 있게 넘긴다.
+  const globalSlotHolder = nodes.find(n => n.scope === 'GLOBAL' && n.config)?.id ?? null;
   const filteredNodes = showInactive
     ? nodes
     : nodes.filter(n => n.is_active !== false).map(n => ({
@@ -103,7 +98,7 @@ export function RateLimitTreeView({ nodes }: RateLimitTreeViewProps) {
         />
       </div>
       <div className="flex-1 p-6">
-        <RateLimitConfigPanel node={selectedNode} />
+        <RateLimitConfigPanel node={selectedNode} globalSlotHolder={globalSlotHolder} />
       </div>
       </div>
     </div>

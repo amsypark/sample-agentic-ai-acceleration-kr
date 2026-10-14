@@ -169,6 +169,24 @@ class UserRepository:
         result = await self._session.execute(stmt)
         return list(result.scalars().unique().all())
 
+    async def list_teamless_users(self) -> list[User]:
+        """팀이 없는 사용자(``auth.users.team_id IS NULL``) — 활성/비활성 모두, 이름순.
+
+        어떤 팀의 ``members`` 에도 나타나지 않으므로 팀 기준 트리(rate-limit)에서는 통째로
+        빠진다. 그런데 USER 스코프 한도는 그대로 집행되고 PUT 도 받는다 — 화면에서만 사라진다.
+
+        ``User.team``/``User.virtual_keys`` 는 모델 레벨 ``lazy="selectin"`` 이라 그냥 select 하면
+        키 이력까지 끌고 온다 — 트리는 id/이름/활성 여부만 쓰므로 lazyload 로 끊는다.
+        """
+        stmt = (
+            select(User)
+            .options(lazyload(User.team), lazyload(User.virtual_keys))
+            .where(User.team_id.is_(None))
+            .order_by(User.display_name, User.id)
+        )
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
     async def list_teams_lite(self) -> list[Team]:
         """멤버 미포함 경량 팀 조회. sync_all 의 팀 캐시 구축용 —
         list_all_teams(members selectinload)의 반복 호출로 인한 메모리 폭발을 회피.

@@ -9,6 +9,10 @@
 
   1. /admin/analytics 의 일자 범위(start_date/end_date) — 요약·모델·팀·사용자·추이가
      전부 같은 KST 범위로 잘리고, 범위 밖(월의 나머지)·실패 호출은 섞이지 않는다.
+  2. /admin/rate-limits 트리·실시간 사용량·오버라이드 제거 — 팀 미배정 사용자 조회
+     (team_id IS NULL), 활성 alias 목록, 활성 GLOBAL 행, 상속 표식, ``measured`` 의 근거인
+     "자기 스코프 활성 rpm 행", DELETE 후 재설정이 유니크 인덱스(0024)와 공존하는지, 그리고
+     GLOBAL 이 **한 번에 한 모델**만 한도를 갖는 현재 불변식(콘솔 경고의 근거).
 
 실행::
 
@@ -202,6 +206,39 @@ async def _seed_analytics(conn) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 시드 — 2. rate-limit 트리
+# ─────────────────────────────────────────────────────────────────────────────
+
+U_TEAMLESS = uuid.UUID("aaaa0000-0000-4000-a000-0000000000d1")
+RETIRED_ALIAS = "llama-3-70b"  # 비활성으로 내리고 GLOBAL 한도를 남긴다
+BRACKET_ALIAS = "claude-sonnet-4-6[1m]"
+
+
+async def _seed_rate_limits(conn) -> None:
+    await conn.execute(
+        "INSERT INTO auth.users (id, team_id, email, display_name, role, sso_subject) "
+        "VALUES ($1, NULL, 'rl-teamless@example.com', 'rl-teamless', 'DEVELOPER', $2)",
+        U_TEAMLESS,
+        f"sub-{U_TEAMLESS}",
+    )
+
+    async def rl(scope, scope_id, *, alias=None, rpm=None, tpm=None):
+        await conn.execute(
+            "INSERT INTO model.rate_limit_configs "
+            "(id, scope, scope_id, model_alias, rpm_limit, tpm_limit, is_active, created_by) "
+            "VALUES (gen_random_uuid(), $1::model.rate_limit_scope, $2, $3, $4, $5, true, $6)",
+            scope, scope_id, alias, rpm, tpm, SEED_ADMIN_ID,
+        )
+
+    await rl("TEAM", SEED_TEAM_ID, rpm=100, tpm=9000)
+    await rl("USER", U_A, rpm=60)
+    await conn.execute(
+        "UPDATE model.model_aliases SET status = 'INACTIVE' WHERE alias = $1", RETIRED_ALIAS
+    )
+    await rl("GLOBAL", None, alias=RETIRED_ALIAS, tpm=5000)  # TPM 만 — rpm 카운터 없음
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 픽스처
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -214,6 +251,7 @@ async def owned_dsn():
     conn = await asyncpg.connect(_asyncpg_dsn(dsn))
     try:
         await _seed_analytics(conn)
+        await _seed_rate_limits(conn)
     finally:
         await conn.close()
     yield dsn
@@ -353,3 +391,164 @@ async def test_team_export_csv_follows_the_range_and_axis(session):
     got = {r[2]: (r[0], Decimal(r[3])) for r in rows[1:]}
     assert got[str(TEAM_B_ID)] == ("2026-09-01~2026-09-05", Decimal("8"))
     assert got[str(SEED_TEAM_ID)] == ("2026-09-01~2026-09-05", Decimal("3"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. rate-limit 트리 / 실시간 사용량 / 오버라이드 제거
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _rl_service():
+    """Redis 는 대역(빈 SCAN) — 여기서 증명할 것은 DB 쪽이다. 실 Redis SCAN 은
+    test_high_rate_limit_live_usage_real_redis.py 가 따로 증명한다."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.core.cache_invalidation import CacheInvalidationManager
+    from app.services.rate_limit_service import RateLimitService
+
+    async def _empty(*_a, **_kw):
+        if False:  # pragma: no cover
+            yield None
+
+    redis = AsyncMock()
+    redis.scan_iter = MagicMock(side_effect=lambda *a, **kw: _empty())
+    return RateLimitService(cache_mgr=CacheInvalidationManager(redis))
+
+
+async def _tree(session):
+    return await _rl_service().get_rate_limit_tree(session)
+
+
+def _find(nodes, node_id: str):
+    for n in nodes:
+        if n.id == node_id:
+            return n
+        for c in n.children:
+            if c.id == node_id:
+                return c
+    return None
+
+
+async def _active_rows(session, scope: str, scope_id=None):
+    from sqlalchemy import text
+
+    sql = (
+        "SELECT model_alias, rpm_limit, tpm_limit FROM model.rate_limit_configs "
+        "WHERE scope = CAST(:scope AS model.rate_limit_scope) AND is_active "
+        + ("AND scope_id = :sid" if scope_id is not None else "AND scope_id IS NULL")
+    )
+    params = {"scope": scope, **({"sid": scope_id} if scope_id is not None else {})}
+    return (await session.execute(text(sql), params)).all()
+
+
+async def test_tree_lists_every_active_alias_as_a_global_root(session):
+    from sqlalchemy import text
+
+    active = {
+        r[0]
+        for r in (
+            await session.execute(text("SELECT alias FROM model.model_aliases WHERE status = 'ACTIVE'"))
+        ).all()
+    }
+    assert BRACKET_ALIAS in active, "시드 전제가 깨졌다"
+    nodes = await _tree(session)
+    global_ids = {n.id for n in nodes if n.scope == "GLOBAL"}
+    assert active <= global_ids, f"트리에 없는 활성 alias: {sorted(active - global_ids)}"
+    assert _find(nodes, BRACKET_ALIAS).config is None
+
+
+async def test_inactive_alias_with_a_live_global_cap_is_still_listed(session):
+    nodes = await _tree(session)
+    retired = _find(nodes, RETIRED_ALIAS)
+    assert retired is not None and retired.scope == "GLOBAL"
+    assert retired.config is not None
+    assert (retired.config.rpm, retired.config.tpm, retired.config.target_id) == (
+        None,
+        5000,
+        RETIRED_ALIAS,
+    )
+
+
+async def test_teamless_user_is_a_root(session):
+    nodes = await _tree(session)
+    roots = {n.id: n for n in nodes if n.scope == "USER"}
+    assert str(U_TEAMLESS) in roots, "team_id IS NULL 사용자가 트리에서 빠졌다"
+    assert roots[str(U_TEAMLESS)].inherited_from is None
+    # 팀 멤버는 루트로 중복 등장하지 않는다.
+    assert str(U_A) not in roots
+
+
+async def test_inherited_member_carries_the_team_marker(session):
+    nodes = await _tree(session)
+    seed_member = _find(nodes, str(U_SEED))  # 시드 팀 소속, 자기 행 없음
+    assert seed_member.inherited_from == str(SEED_TEAM_ID)
+    assert seed_member.config.scope == "TEAM" and seed_member.config.rpm == 100
+    own = _find(nodes, str(U_A))
+    assert own.inherited_from is None and own.config.scope == "USER" and own.config.rpm == 60
+
+
+async def test_measured_reads_only_the_subjects_own_rpm_row(session):
+    svc = _rl_service()
+    own = await svc.get_live_usage("USER", str(U_A), session=session)
+    assert (own["measured"], own["limit_rpm"]) == (True, 60)
+    # 상속 중인 사용자에게는 USER 카운터가 생기지 않는다 — 팀 한도를 끌어오면 거짓 '측정'.
+    inheriting = await svc.get_live_usage("USER", str(U_SEED), session=session)
+    assert (inheriting["measured"], inheriting["limit_rpm"]) == (False, None)
+    team = await svc.get_live_usage("TEAM", str(SEED_TEAM_ID), session=session)
+    assert (team["measured"], team["limit_rpm"]) == (True, 100)
+    # TPM 만 걸린 GLOBAL 은 rpm 카운터가 없다 → 측정 불가가 정답이다.
+    glob = await svc.get_live_usage("GLOBAL", RETIRED_ALIAS, session=session)
+    assert (glob["measured"], glob["limit_rpm"]) == (False, None)
+
+
+async def test_delete_override_restores_inheritance_and_reset_still_works(session):
+    from app.core.auth import CurrentUser
+    from app.models.auth import UserRole
+    from app.schemas.rate_limits import RateLimitSetRequest
+
+    actor = CurrentUser(user_id=SEED_ADMIN_ID, email="admin@example.com", role=UserRole.ADMIN, team_id=None)
+    svc = _rl_service()
+
+    out = await svc.delete_user_rate_limit(session, user_id=U_A, actor=actor)
+    await session.commit()
+    assert out.deactivated == 1
+    assert await _active_rows(session, "USER", U_A) == []
+    node = _find(await _tree(session), str(U_A))
+    assert node.inherited_from == str(SEED_TEAM_ID), "제거 후 팀 상속으로 돌아오지 않았다"
+
+    again = await svc.delete_user_rate_limit(session, user_id=U_A, actor=actor)
+    await session.commit()
+    assert again.deactivated == 0, "멱등이 아니다"
+
+    # 제거 후 재설정 — 0024 의 부분 유니크 인덱스와 충돌하지 않아야 한다.
+    await svc.set_user_rate_limit(session, user_id=U_A, data=RateLimitSetRequest(rpm=30), actor=actor)
+    await session.commit()
+    assert [(r.rpm_limit,) for r in await _active_rows(session, "USER", U_A)] == [(30,)]
+
+
+async def test_global_limit_is_single_slot_today(session):
+    """현재 불변식을 **고정**한다: 다른 모델의 GLOBAL 을 저장하면 앞 모델의 한도가 해제된다.
+
+    upsert 가 alias 와 무관하게 GLOBAL 활성 행을 전부 비활성화하고, 0024 의 유니크 인덱스도
+    ``(scope, COALESCE(scope_id, nil))`` 라 GLOBAL 활성 행은 최대 1개다. 콘솔이 GLOBAL 노드를
+    보여주게 되면서 이 동작이 콘솔에서 도달 가능해졌다 — admin-ui 는 저장 전에 경고한다.
+    이 테스트가 깨지면(=모델별 GLOBAL 이 공존하게 되면) 그 경고 문구를 지워야 한다.
+    """
+    from app.core.auth import CurrentUser
+    from app.models.auth import UserRole
+    from app.schemas.rate_limits import RateLimitSetRequest
+
+    actor = CurrentUser(user_id=SEED_ADMIN_ID, email="admin@example.com", role=UserRole.ADMIN, team_id=None)
+    before = await _active_rows(session, "GLOBAL")
+    assert [r.model_alias for r in before] == [RETIRED_ALIAS], "시드 전제가 깨졌다"
+
+    await _rl_service().set_global_rate_limit(
+        session, model_alias="claude-opus-4-7", data=RateLimitSetRequest(rpm=10), actor=actor
+    )
+    await session.commit()
+
+    after = await _active_rows(session, "GLOBAL")
+    assert [r.model_alias for r in after] == ["claude-opus-4-7"]
+    nodes = await _tree(session)
+    assert _find(nodes, RETIRED_ALIAS) is None, "비활성 모델은 한도가 해제되면 트리에서 내려간다"
+    assert _find(nodes, "claude-opus-4-7").config.rpm == 10

@@ -182,25 +182,42 @@ class TestGatewayCacheInvalidation:
         assert match_arg == f"rl:config:TEAM:{team_id}:*"
         assert cached_keys[0] in [c.args[0] for c in mock_redis.delete.call_args_list]
 
-    async def test_global_set_invalidates_specific_model_key(
+    async def test_global_set_invalidates_every_global_model_key(
         self,
         rate_limit_service: RateLimitService,
         mock_session: AsyncMock,
         admin_user: CurrentUser,
         mock_redis: AsyncMock,
     ):
-        # GLOBAL scope always carries a model_alias → exact-key delete, no SCAN.
+        """GLOBAL 저장은 **모든** 모델의 GLOBAL 캐시를 지운다(예전: 저장한 alias 키 하나만).
+
+        upsert 가 alias 와 무관하게 GLOBAL 활성 행을 전부 비활성화하므로(한 번에 한 모델),
+        방금 해제된 다른 모델(claude-sonnet)의 캐시가 남으면 gateway-proxy 는 최대 5분 동안
+        콘솔이 "한도 없음" 으로 보여주는 그 한도를 계속 집행한다. 콘솔 트리에 GLOBAL 노드가
+        생기면서 이 경로가 콘솔에서 도달 가능해졌다.
+        """
         data = RateLimitSetRequest(rpm=1000, tpm=500000)
+        cached_keys = [
+            "rl:config:GLOBAL:NULL:claude-opus",
+            "rl:config:GLOBAL:NULL:claude-sonnet",  # 이번 저장으로 해제된 다른 모델
+        ]
+        mock_redis.scan_iter = MagicMock(
+            side_effect=lambda *a, **kw: self._scan_iter_returning(cached_keys)()
+        )
 
         with patch("app.services.rate_limit_service.RateLimitConfigRepository") as MockRepo, \
              patch("app.services.rate_limit_service.audit_logger") as mock_audit:
             MockRepo.return_value.upsert = AsyncMock()
             mock_audit.log = AsyncMock()
+            mock_session.scalar = AsyncMock(return_value="claude-opus")  # alias 존재 확인
 
             await rate_limit_service.set_global_rate_limit(
                 mock_session, model_alias="claude-opus", data=data, actor=admin_user
             )
 
+        match_arg = mock_redis.scan_iter.call_args.kwargs.get("match") \
+            or mock_redis.scan_iter.call_args.args[0]
+        assert match_arg == "rl:config:GLOBAL:NULL:*"
         deleted_keys = [c.args[0] for c in mock_redis.delete.call_args_list]
-        assert "rl:config:GLOBAL:NULL:claude-opus" in deleted_keys
-        mock_redis.scan_iter.assert_not_called()
+        for k in cached_keys:
+            assert k in deleted_keys

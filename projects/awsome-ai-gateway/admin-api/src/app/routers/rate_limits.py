@@ -9,7 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, require_admin
 from app.core.db import get_db_session
-from app.schemas.rate_limits import RateLimitResponse, RateLimitSetRequest, RateLimitTreeNode
+from app.schemas.rate_limits import (
+    RateLimitDeleteResponse,
+    RateLimitResponse,
+    RateLimitSetRequest,
+    RateLimitTreeNode,
+)
 
 router = APIRouter(prefix="/admin/rate-limits", tags=["Rate Limit Management"])
 
@@ -32,14 +37,19 @@ async def get_rate_limit_usage(
     scope: str,
     scope_id: str,
     admin: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(get_db_session),
 ):
     """실시간 RPM 사용량(§60.9) — gateway-proxy 가 Redis 에 적재하는 sliding-window
     카운터를 읽어 현재 사용/모델별 분해 반환. 설정값(tree)과 별개의 라이브 상태.
-    fail-soft: 조회 실패 시 {available:false}(화면 막지 않음)."""
+    fail-soft: 조회 실패 시 {available:false}(화면 막지 않음).
+
+    ``session`` 은 이 스코프 자신의 rpm 한도를 읽어 ``measured``(카운터가 존재할 수 있는가)
+    를 판정하는 데 쓴다 — 한도가 없으면 proxy 가 ZSET 을 만들지 않으므로 '키 0건' 을
+    '요청 0건' 으로 단정할 수 없다. GLOBAL 의 ``scope_id`` 는 model alias 다."""
     from app.services.rate_limit_service import RateLimitService
 
     svc: RateLimitService = request.app.state.rate_limit_service
-    return await svc.get_live_usage(scope, scope_id)
+    return await svc.get_live_usage(scope, scope_id, session=session)
 
 
 @router.put("/user/{user_id}", response_model=RateLimitResponse)
@@ -57,6 +67,30 @@ async def set_user_rate_limit(
         session,
         user_id=uuid.UUID(user_id),
         data=body,
+        actor=admin,
+        ip_address=request.client.host if request.client else "0.0.0.0",
+        request_id=request.headers.get("x-request-id", ""),
+    )
+
+
+@router.delete("/user/{user_id}", response_model=RateLimitDeleteResponse)
+async def delete_user_rate_limit(
+    request: Request,
+    user_id: uuid.UUID,
+    admin: CurrentUser = Depends(require_admin),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """USER 오버라이드 제거 → 팀 설정 상속으로 복귀(멱등, 없으면 deactivated=0).
+
+    PUT 은 전체 교체라서 '값을 지우고 저장' 은 전부 NULL 인 USER 행을 남긴다. 그 행은
+    집행상 무해하지만 트리에서 상속 표식을 지워 팀 한도를 보이지 않게 만든다.
+    ``user_id`` 는 UUID 로 선언한다 — 형식이 틀리면 500 이 아니라 422 다."""
+    from app.services.rate_limit_service import RateLimitService
+
+    svc: RateLimitService = request.app.state.rate_limit_service
+    return await svc.delete_user_rate_limit(
+        session,
+        user_id=user_id,
         actor=admin,
         ip_address=request.client.host if request.client else "0.0.0.0",
         request_id=request.headers.get("x-request-id", ""),

@@ -28,8 +28,35 @@ export async function setRateLimitAction(formData: unknown): Promise<ActionResul
   const { target_id, scope, ...limits } = parsed.data;
 
   try {
+    // GLOBAL 의 target_id 는 UUID 가 아니라 model alias 다 — `claude-sonnet-4-6[1m]` 처럼 URL
+    // 경로에서 인코딩이 필요한 문자가 실제로 들어 있다.
     await withRetry(() =>
-      adminAPI.put(`/admin/rate-limits/${scope.toLowerCase()}/${target_id}`, limits)
+      adminAPI.put(
+        `/admin/rate-limits/${scope.toLowerCase()}/${encodeURIComponent(target_id)}`,
+        limits,
+      )
+    );
+    revalidatePath('/rate-limits');
+    return { success: true, data: undefined };
+  } catch (err) {
+    return { success: false, error: toErrorMessage(err) };
+  }
+}
+
+// ─── deleteUserRateLimitAction ────────────────────────────────────────────────
+
+/**
+ * USER 오버라이드 **제거** → 팀 설정 상속으로 복귀.
+ *
+ * PUT 은 전체 교체이므로 "입력을 비우고 저장" 은 전부 NULL 인 USER 행을 남긴다. 그 행은
+ * 집행상 무해하지만 트리에서 상속 표식을 지워, 팀 한도가 걸려 있는데도 무제한처럼 보이게
+ * 만든다. 되돌리려면 행 자체를 비활성화해야 한다(DELETE /admin/rate-limits/user/{id}).
+ */
+export async function deleteUserRateLimitAction(userId: string): Promise<ActionResult<void>> {
+  if (!userId) return { success: false, error: 'User ID is required' };
+  try {
+    await withRetry(() =>
+      adminAPI.delete(`/admin/rate-limits/user/${encodeURIComponent(userId)}`)
     );
     revalidatePath('/rate-limits');
     return { success: true, data: undefined };

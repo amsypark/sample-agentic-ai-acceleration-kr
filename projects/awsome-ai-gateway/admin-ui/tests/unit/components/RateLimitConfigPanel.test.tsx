@@ -1,0 +1,257 @@
+// Copyright 2026 © Amazon.com and Affiliates: This deliverable is considered Developed Content as defined in the AWS Service Terms.
+
+/**
+ * Rate Limits 화면의 설정 패널. 이 컴포넌트에는 테스트가 **하나도 없었고**, 그게 아래
+ * 결함들이 조용히 살아 있던 이유다.
+ *
+ * 1. 상속값 프리필 → 저장 시 굳음
+ *    서버는 USER 행이 없는 사용자에게 팀의 행을 `config`(scope="TEAM") + `inherited_from` 으로
+ *    실어 보낸다("실효값"). 패널은 `node?.config` 존재만 보고 그 값을 입력칸에 채웠다. PUT 은
+ *    전체 교체이므로 CPH 하나만 고쳐 저장해도 팀의 RPM/TPM 이 **새 USER 행**으로 굳는다.
+ *    작성자의 원래 의도는 `inheritedRpm`/`inheritedTpm` = **placeholder** 였는데, 프리필이 그
+ *    의도를 도달 불가 코드로 만들어 두었다.
+ * 2. "최근 60초간 요청 없음" 의 거짓 단정 — `measured` 로 구분한다.
+ * 3. cpm/cph 의 와이어 타입 — Decimal 은 JSON 문자열("0.5000"), 폼은 숫자로 보내야 한다.
+ * 4. 되돌릴 방법 — 입력을 비우고 저장하는 것은 제거가 아니다. 제거 버튼은 자기 행이 있을 때만.
+ * 5. GLOBAL 은 한 번에 한 모델만 — 다른 모델이 슬롯을 갖고 있으면 저장 전에 경고한다.
+ */
+
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { RateLimitTreeNode } from '@/types/entities';
+import type { RateLimitUsage } from '@/lib/utils/rateLimitUsage';
+import treeFixture from '../../fixtures/rate-limit-tree.json';
+
+vi.mock('next-intl', () => ({
+  useTranslations: () => (key: string, values?: Record<string, unknown>) =>
+    values ? `${key}:${Object.values(values).join(',')}` : key,
+}));
+
+const setRateLimitAction = vi.fn();
+const deleteUserRateLimitAction = vi.fn();
+vi.mock('@/lib/actions/rate-limits', () => ({
+  setRateLimitAction: (...a: unknown[]) => setRateLimitAction(...a),
+  deleteUserRateLimitAction: (...a: unknown[]) => deleteUserRateLimitAction(...a),
+}));
+
+const fetchRateLimitUsage = vi.fn();
+vi.mock('@/lib/utils/rateLimitUsage', () => ({
+  fetchRateLimitUsage: (...a: unknown[]) => fetchRateLimitUsage(...a),
+}));
+
+const toast = vi.fn();
+vi.mock('@/components/common/ToastProvider', () => ({ useToast: () => ({ toast }) }));
+
+import { RateLimitConfigPanel } from '@/components/rate-limits/RateLimitConfigPanel';
+
+/**
+ * 픽스처는 admin-api 가 **직접 직렬화한 트리**다(admin-api tests/unit/test_rate_limit_tree.py
+ * ::test_wire_matches_admin_ui_fixture 가 같은 파일과 완전 일치를 단정한다). 손으로 베낀 노드를
+ * 쓰면 서버가 모양을 바꿔도 이 테스트가 계속 통과해 버리므로, 반드시 이 파일에서 읽는다.
+ */
+const nodes = treeFixture as unknown as RateLimitTreeNode[];
+const globalCapped = nodes.find((n) => n.scope === 'GLOBAL' && n.config)!;
+const globalUncapped = nodes.find((n) => n.scope === 'GLOBAL' && !n.config)!;
+const teamNode = nodes.find((n) => n.scope === 'TEAM')!;
+const ownUserNode = teamNode.children.find((c) => !c.inherited_from)!; // Alice
+const inheritingNode = teamNode.children.find((c) => c.inherited_from)!; // Bob
+const teamlessNode = nodes.find((n) => n.scope === 'USER')!; // Zoe (config: null)
+
+const usage = (over: Partial<RateLimitUsage> = {}): RateLimitUsage => ({
+  available: true,
+  measured: true,
+  limit_rpm: null,
+  window_sec: 60,
+  rpm_used_total: 0,
+  by_model: [],
+  ...over,
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  setRateLimitAction.mockResolvedValue({ success: true, data: undefined });
+  deleteUserRateLimitAction.mockResolvedValue({ success: true, data: undefined });
+  fetchRateLimitUsage.mockResolvedValue(usage({ available: false, measured: false }));
+});
+
+const rpmInput = () => screen.getByLabelText('RPM (Requests Per Minute)');
+const tpmInput = () => screen.getByLabelText('TPM (Tokens Per Minute)');
+const cpmInput = () => screen.getByLabelText('CPM (Cost Per Minute, USD)');
+const cphInput = () => screen.getByLabelText('CPH (Cost Per Hour, USD)');
+
+describe('상속 중인 USER 노드', () => {
+  it('상속값을 입력칸에 채우지 않고 placeholder 로만 보여준다', async () => {
+    render(<RateLimitConfigPanel node={inheritingNode} />);
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalled());
+
+    expect(inheritingNode.config?.rpm).toBe(100); // 픽스처 전제(팀 값)
+    expect(rpmInput()).toHaveValue(null);
+    expect(tpmInput()).toHaveValue(null);
+    expect(rpmInput()).toHaveAttribute('placeholder', '100');
+    expect(tpmInput()).toHaveAttribute('placeholder', '9000');
+    // cpm/cph 도 같은 규칙 — 와이어는 Decimal 문자열이다.
+    expect(cpmInput()).toHaveValue(null);
+    expect(cpmInput()).toHaveAttribute('placeholder', '0.5000');
+    expect(cphInput()).toHaveAttribute('placeholder', '12.3456');
+    // 상속 중에는 "비워두면 제한 없음" 이 거짓이다 — 비워두면 팀 한도가 계속 적용된다.
+    expect(screen.getAllByText('emptyMeansInherit')).toHaveLength(2);
+    expect(screen.queryByText('emptyMeansUnlimited')).toBeNull();
+  });
+
+  it('CPH 만 입력해 저장하면 팀의 RPM/TPM 이 USER 행으로 굳지 않는다', async () => {
+    const user = userEvent.setup();
+    render(<RateLimitConfigPanel node={inheritingNode} />);
+
+    await user.type(cphInput(), '7.5');
+    await user.click(screen.getByRole('button', { name: 'save' }));
+
+    await waitFor(() => expect(setRateLimitAction).toHaveBeenCalledTimes(1));
+    expect(setRateLimitAction).toHaveBeenCalledWith({
+      target_id: inheritingNode.id,
+      scope: 'USER',
+      rpm: null,
+      tpm: null,
+      cpm: null,
+      cph: 7.5,
+    });
+  });
+
+  it('개인 한도 제거 버튼은 상속 중일 때 나타나지 않는다', async () => {
+    render(<RateLimitConfigPanel node={inheritingNode} />);
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalled());
+    expect(screen.queryByRole('button', { name: 'removeOverride' })).toBeNull();
+  });
+});
+
+describe('자기 설정이 있는 USER 노드', () => {
+  it('Decimal 문자열을 그대로 프리필하고 숫자로 전송한다 (대조군: 자기 값은 프리필된다)', async () => {
+    const user = userEvent.setup();
+    render(<RateLimitConfigPanel node={ownUserNode} />);
+
+    expect(ownUserNode.config?.cpm).toBe('0.5000'); // 와이어는 문자열이다
+    expect(cpmInput()).toHaveValue(0.5); // number 입력이 파싱한 값
+    expect(rpmInput()).toHaveValue(60);
+    expect(screen.getAllByText('emptyMeansUnlimited')).toHaveLength(2);
+
+    await user.click(screen.getByRole('button', { name: 'save' }));
+
+    await waitFor(() => expect(setRateLimitAction).toHaveBeenCalledTimes(1));
+    const payload = setRateLimitAction.mock.calls[0][0];
+    expect(payload).toEqual({
+      target_id: ownUserNode.id,
+      scope: 'USER',
+      rpm: 60,
+      tpm: 1000,
+      cpm: 0.5,
+      cph: 12.3456,
+    });
+    expect(typeof payload.cpm).toBe('number');
+  });
+
+  it('개인 한도 제거 버튼이 DELETE 액션을 호출한다', async () => {
+    const user = userEvent.setup();
+    render(<RateLimitConfigPanel node={ownUserNode} />);
+
+    await user.click(screen.getByRole('button', { name: 'removeOverride' }));
+
+    await waitFor(() => expect(deleteUserRateLimitAction).toHaveBeenCalledWith(ownUserNode.id));
+    expect(setRateLimitAction).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.stringContaining('overrideRemoved') }),
+      ),
+    );
+  });
+
+  it('설정이 아예 없는 사용자에게는 제거 버튼이 없다', async () => {
+    render(<RateLimitConfigPanel node={teamlessNode} />);
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalled());
+    expect(screen.queryByRole('button', { name: 'removeOverride' })).toBeNull();
+  });
+});
+
+describe('GLOBAL 노드', () => {
+  it('선택 가능하고 CPM/CPH 는 비활성이며 alias 를 target 으로 저장한다', async () => {
+    const user = userEvent.setup();
+    render(<RateLimitConfigPanel node={globalCapped} globalSlotHolder={globalCapped.id} />);
+
+    expect(cpmInput()).toBeDisabled();
+    expect(cphInput()).toBeDisabled();
+    // TPM 전용 쿼터가 그대로 보인다.
+    expect(tpmInput()).toHaveValue(200000);
+    expect(rpmInput()).toHaveValue(null);
+
+    await user.click(screen.getByRole('button', { name: 'save' }));
+
+    await waitFor(() => expect(setRateLimitAction).toHaveBeenCalledTimes(1));
+    expect(setRateLimitAction).toHaveBeenCalledWith({
+      target_id: globalCapped.id, // = model alias, UUID 가 아니다
+      scope: 'GLOBAL',
+      rpm: null,
+      tpm: 200000,
+      cpm: undefined,
+      cph: undefined,
+    });
+  });
+
+  it('GLOBAL 도 실시간 사용량을 조회한다 (alias 를 scope_id 로)', async () => {
+    render(<RateLimitConfigPanel node={globalCapped} />);
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalledWith('GLOBAL', globalCapped.id));
+  });
+
+  it('다른 모델이 GLOBAL 슬롯을 갖고 있으면 저장 전에 경고한다', async () => {
+    render(<RateLimitConfigPanel node={globalUncapped} globalSlotHolder={globalCapped.id} />);
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalled());
+    expect(screen.getByRole('alert')).toHaveTextContent(`globalSlotWarning:${globalCapped.id}`);
+  });
+
+  it('슬롯 주인 자신이거나 슬롯이 비어 있으면 경고하지 않는다 (대조군)', async () => {
+    const { unmount } = render(
+      <RateLimitConfigPanel node={globalCapped} globalSlotHolder={globalCapped.id} />,
+    );
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalled());
+    expect(screen.queryByRole('alert')).toBeNull();
+    unmount();
+
+    render(<RateLimitConfigPanel node={globalUncapped} globalSlotHolder={null} />);
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+});
+
+describe('실시간 사용량 표시', () => {
+  it('측정 불가(카운터 없음)면 "요청 없음" 을 단정하지 않는다', async () => {
+    fetchRateLimitUsage.mockResolvedValue(usage({ measured: false, rpm_used_total: 0 }));
+    render(<RateLimitConfigPanel node={teamlessNode} />);
+
+    await waitFor(() => expect(screen.getByText('usageNotMeasured')).toBeInTheDocument());
+    expect(screen.queryByText('noRecentRequests:60')).toBeNull();
+  });
+
+  it('측정된 0 이면 "요청 없음" 을 보여준다 (대조군)', async () => {
+    fetchRateLimitUsage.mockResolvedValue(usage({ measured: true, rpm_used_total: 0, limit_rpm: 60 }));
+    render(<RateLimitConfigPanel node={ownUserNode} />);
+
+    await waitFor(() => expect(screen.getByText('noRecentRequests:60')).toBeInTheDocument());
+    expect(screen.queryByText('usageNotMeasured')).toBeNull();
+  });
+
+  it('상속 노드의 게이지 분모로 팀 한도를 쓰지 않는다', async () => {
+    // 상속 사용자는 자기 카운터가 없다 → measured=false. 팀 한도(100)로 나눈 비율을 보여주면
+    // "USER 스코프 사용률" 이라는 거짓 지표가 된다.
+    fetchRateLimitUsage.mockResolvedValue(usage({ measured: false, limit_rpm: null, rpm_used_total: 0 }));
+    render(<RateLimitConfigPanel node={inheritingNode} />);
+
+    await waitFor(() => expect(screen.getByText('usageNotMeasured')).toBeInTheDocument());
+    expect(screen.queryByText(/\/ 100/)).toBeNull();
+  });
+
+  it('측정 중이면 자기 한도를 분모로 표시한다', async () => {
+    fetchRateLimitUsage.mockResolvedValue(usage({ measured: true, limit_rpm: 60, rpm_used_total: 12 }));
+    render(<RateLimitConfigPanel node={ownUserNode} />);
+
+    await waitFor(() => expect(screen.getByText(/\/ 60/)).toBeInTheDocument());
+    expect(screen.getByText('12')).toBeInTheDocument();
+  });
+});
