@@ -22,12 +22,21 @@ export function TeamAllocationView({ teamId, initialAllocation }: TeamAllocation
   const { toast } = useToast();
   const [isPending, startTransition] = useTransition();
 
+  // 배정 가능한 행은 **멤버(USER)** 뿐이다. GET /allocation 의 첫 항목은 팀 합계 행
+  // (target_type="TEAM", allocated_usd = 팀 총예산)이라, 그대로 두면 팀이 가짜 멤버로 그려지고
+  // totalAllocated 에 총예산이 한 번 더 더해져 멤버에게 1달러만 배정해도 isOverBudget 이 참 —
+  // 저장 버튼이 영구히 막혔다. 쓰기(allocateTeamBudgetAction)도 USER 만 보낸다.
   const [allocations, setAllocations] = useState<AllocationEntry[]>(
-    initialAllocation?.entries ?? []
+    (initialAllocation?.entries ?? []).filter((e) => e.target_type === 'USER')
   );
 
-  const totalBudget = initialAllocation?.total_budget_usd ?? 0;
-  const totalAllocated = allocations.reduce((sum, entry) => sum + (entry.allocated_usd || 0), 0);
+  // *_usd 는 Decimal-as-string 이다(entities.ts) — 산술 전에 숫자로 바꾼다. 문자열 그대로면
+  // `0 + "60.0000"` 이 문자열 연결이 되고 `.toFixed()` 는 TypeError 로 렌더를 죽인다.
+  const totalBudget = Number(initialAllocation?.total_budget_usd ?? 0) || 0;
+  const totalAllocated = allocations.reduce(
+    (sum, entry) => sum + (Number(entry.allocated_usd) || 0),
+    0
+  );
   const unallocated = totalBudget - totalAllocated;
   const isOverBudget = totalAllocated > totalBudget;
 
@@ -35,7 +44,7 @@ export function TeamAllocationView({ teamId, initialAllocation }: TeamAllocation
     setAllocations((prev) =>
       prev.map((entry) =>
         entry.target_id === targetId
-          ? { ...entry, allocated_usd: isNaN(newValue) ? 0 : newValue }
+          ? { ...entry, allocated_usd: isNaN(newValue) ? '0' : String(newValue) }
           : entry
       )
     );
@@ -108,7 +117,7 @@ export function TeamAllocationView({ teamId, initialAllocation }: TeamAllocation
                     </div>
                   </Td>
                   <Td numeric className="text-muted-foreground">
-                    ${entry.used_usd.toFixed(2)}
+                    ${(Number(entry.used_usd) || 0).toFixed(2)}
                   </Td>
                 </Tr>
               ))

@@ -48,8 +48,18 @@ async def get_my_budget(
     result = await session.execute(stmt)
     config = result.scalar_one_or_none()
 
-    limit_usd = float(config.max_budget_usd) if config else 0
-    policy = config.policy.value if config else "HARD_BLOCK"
+    # ⚠️ 개인 예산 행이 없으면 값을 **지어내지 않는다**(3-state: 설정됨 / 미설정 / 지출).
+    #    예전엔 limit 0 · policy "HARD_BLOCK" 으로 접어, 지출이 있는 사용자에게
+    #    "한도 $0 / 잔여 $-N / 하드 차단" 이라는 실재하지 않는 강제를 보였다. 게이트웨이는
+    #    개인 예산이 없으면 통과시킨다(gateway-proxy budget_service "Q 정책: USER 예산 미설정 →
+    #    pass-through", 팀 예산은 계속 적용) — 콘솔만 거짓말을 했다. 그래서 limit/remaining/
+    #    usage_pct/policy 는 null 로 내보내고 used_usd(진짜 지출)만 채운다.
+    if config is not None:
+        limit_usd: float | None = float(config.max_budget_usd)
+        policy: str | None = config.policy.value
+    else:
+        limit_usd = None
+        policy = None
 
     usage_stmt = select(func.coalesce(func.sum(UsageLog.cost_usd), 0)).where(
         UsageLog.user_id == user.user_id,
@@ -57,17 +67,21 @@ async def get_my_budget(
     )
     used_result = await session.execute(usage_stmt)
     used_usd = float(used_result.scalar_one())
-    remaining = limit_usd - used_usd
-    usage_pct = (used_usd / limit_usd * 100) if limit_usd > 0 else 0
+    if limit_usd is None:
+        remaining: float | None = None
+        usage_pct: float | None = None
+    else:
+        remaining = limit_usd - used_usd
+        usage_pct = (used_usd / limit_usd * 100) if limit_usd > 0 else 0.0
 
     return {
         "user_id": str(user.user_id),
         "period": period,
         "budget": {
-            "limit_usd": round(limit_usd, 2),
+            "limit_usd": round(limit_usd, 2) if limit_usd is not None else None,
             "used_usd": round(used_usd, 4),
-            "remaining_usd": round(remaining, 4),
-            "usage_pct": round(usage_pct, 1),
+            "remaining_usd": round(remaining, 4) if remaining is not None else None,
+            "usage_pct": round(usage_pct, 1) if usage_pct is not None else None,
             "policy": policy,
         },
     }

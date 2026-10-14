@@ -255,16 +255,22 @@ export interface AllocationEntry {
   target_id: string;
   target_name: string;
   target_type: BudgetScope;
-  allocated_usd: number;
-  used_usd: number;
-  remaining_usd: number;
+  // ⚠️ pydantic Decimal 은 JSON **문자열**("60.0000")로 나간다 — 숫자가 아니다. 소비 지점에서
+  //    Number() 로 바꾼 뒤 산술/.toFixed() 할 것. `number` 로 선언했던 동안 TeamAllocationView 는
+  //    `.toFixed is not a function` 으로 죽었고, reduce 합계는 문자열 연결("0100.0000…")이 됐다.
+  //    고정: admin-api tests/integration/test_budget_wire_contract.py.
+  allocated_usd: string;
+  used_usd: string;
+  remaining_usd: string;
   alert_level: AlertLevel;
 }
 
 export interface TeamBudgetAllocation {
   team_id: string;
   team_name: string;
-  total_budget_usd: number;
+  // Decimal → JSON string (AllocationEntry 와 같은 규약). 쓸 때 Number(...).
+  total_budget_usd: string;
+  // 첫 항목은 **팀 합계 행**(target_type="TEAM", allocated_usd = 팀 총예산)이고 그 뒤가 멤버다.
   entries: AllocationEntry[];
 }
 

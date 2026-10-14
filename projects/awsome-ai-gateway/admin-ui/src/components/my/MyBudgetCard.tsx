@@ -25,7 +25,6 @@ function barColor(pct: number) {
 
 export function MyBudgetCard({ data }: { data: MyBudgetResponse }) {
   const b = data.budget;
-  const pct = Math.min(b.usage_pct, 100);
 
   return (
     <div className="glass glass-hover rounded-apple p-6">
@@ -36,26 +35,57 @@ export function MyBudgetCard({ data }: { data: MyBudgetResponse }) {
           <span className="text-2xl font-bold">${b.used_usd.toFixed(2)}</span>
         </div>
 
-        <div className="w-full h-3 bg-muted rounded-full overflow-hidden">
-          <div
-            className={`h-full rounded-full transition-all ${barColor(pct)}`}
-            style={{ width: `${pct}%` }}
-          />
-        </div>
+        {b.limit_usd == null || b.usage_pct == null ? (
+          // 개인 예산 행이 없음(미설정). 지어낸 $0 한도 / 음수 잔여 / 하드 차단 대신 중립 상태로
+          // 그린다 — 게이트웨이는 개인 예산이 없으면 통과시키고 팀 예산만 적용한다.
+          <>
+            <div className="w-full h-3 bg-muted rounded-full overflow-hidden" />
+            <div className="flex items-center justify-between text-sm text-muted-foreground">
+              <span>개인 예산 미설정 (팀 예산 적용)</span>
+              <span>--</span>
+            </div>
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-muted-foreground">잔여</span>
+              <span className="font-medium">--</span>
+            </div>
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-muted-foreground">초과 정책</span>
+              <span className="font-medium">미설정</span>
+            </div>
+          </>
+        ) : (
+          (() => {
+            const pct = Math.min(b.usage_pct, 100);
+            return (
+              <>
+                <div className="w-full h-3 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all ${barColor(pct)}`}
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
 
-        <div className="flex items-center justify-between text-sm text-muted-foreground">
-          <span>한도: ${b.limit_usd.toFixed(2)}</span>
-          <span className={usageColor(pct)}>{b.usage_pct.toFixed(1)}%</span>
-        </div>
+                <div className="flex items-center justify-between text-sm text-muted-foreground">
+                  <span>한도: ${b.limit_usd.toFixed(2)}</span>
+                  <span className={usageColor(pct)}>{b.usage_pct.toFixed(1)}%</span>
+                </div>
 
-        <div className="flex items-center justify-between text-sm">
-          <span className="text-muted-foreground">잔여</span>
-          <span className="font-medium">${b.remaining_usd.toFixed(2)}</span>
-        </div>
-        <div className="flex items-center justify-between text-sm">
-          <span className="text-muted-foreground">초과 정책</span>
-          <span className="font-medium">{POLICY_LABELS[b.policy] ?? b.policy}</span>
-        </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">잔여</span>
+                  <span className="font-medium">
+                    {b.remaining_usd != null ? `$${b.remaining_usd.toFixed(2)}` : '--'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">초과 정책</span>
+                  <span className="font-medium">
+                    {b.policy ? (POLICY_LABELS[b.policy] ?? b.policy) : '--'}
+                  </span>
+                </div>
+              </>
+            );
+          })()
+        )}
       </div>
     </div>
   );

@@ -15,7 +15,12 @@ from app.schemas.common import BudgetPolicy
 
 
 class SetBudgetRequest(BaseModel):
-    max_budget_usd: Decimal = Field(ge=0, decimal_places=4)
+    # ``max_digits=12`` 는 저장 컬럼 ``NUMERIC(12, 4)`` 와 같은 폭이다(models/budget.py
+    # BudgetConfig.max_budget_usd). 없으면 99,999,999.9999 초과 금액이 검증을 통과해 INSERT 에서
+    # asyncpg numeric overflow → 정체불명 **500** 이 된다(필드 단위 422 여야 할 입력 오류).
+    # ⚠️ 정수부 8자리 상한을 만드는 것은 max_digits **와** decimal_places 의 조합이다 —
+    #    max_digits 만으로는 ``100000000``(유효숫자 9자리)이 통과한다.
+    max_budget_usd: Decimal = Field(ge=0, max_digits=12, decimal_places=4)
     policy: BudgetPolicy = BudgetPolicy.HARD_BLOCK
     # ⚠️ 범위를 여기서도 강제한다. DB 는 ``budget.alert_pct`` 도메인(1..100)으로 막고
     #    admin-ui 는 zod 로 막는데, API 스키마만 비어 있었다 — 즉 UI 를 거치지 않는

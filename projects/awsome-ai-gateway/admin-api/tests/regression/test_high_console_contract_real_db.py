@@ -13,6 +13,10 @@
      (team_id IS NULL), 활성 alias 목록, 활성 GLOBAL 행, 상속 표식, ``measured`` 의 근거인
      "자기 스코프 활성 rpm 행", DELETE 후 재설정이 유니크 인덱스(0024)와 공존하는지, 그리고
      GLOBAL 이 **한 번에 한 모델**만 한도를 갖는 현재 불변식(콘솔 경고의 근거).
+  3. ``SetBudgetRequest.max_budget_usd`` 의 상한(max_digits=12, decimal_places=4)이
+     ``budget_configs.max_budget_usd NUMERIC(12,4)`` 와 **정확히 같은 경계**인지 — 스키마가
+     통과시키는 최댓값은 컬럼이 받고, 스키마가 거부하는 최솟값은 컬럼도 거부한다(그 값이
+     예전에는 스키마를 통과해 asyncpg overflow → 500 이 됐다).
 
 실행::
 
@@ -552,3 +556,48 @@ async def test_global_limit_is_single_slot_today(session):
     nodes = await _tree(session)
     assert _find(nodes, RETIRED_ALIAS) is None, "비활성 모델은 한도가 해제되면 트리에서 내려간다"
     assert _find(nodes, "claude-opus-4-7").config.rpm == 10
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. 예산 금액 상한 = 컬럼 폭
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _insert_budget(owned_dsn, amount: str):
+    asyncpg = pytest.importorskip("asyncpg")
+    conn = await asyncpg.connect(_asyncpg_dsn(owned_dsn))
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO budget.budget_configs "
+                "(id, scope, scope_id, max_budget_usd, policy, allocated_by, effective_from, is_active) "
+                # is_active=false — 활성 행 유니크 인덱스(0024)와 다른 증명에 영향을 주지 않는다.
+                "VALUES (gen_random_uuid(), 'USER'::budget.budget_scope, gen_random_uuid(), "
+                "        $1, 'HARD_BLOCK'::budget.budget_policy, $2, CURRENT_DATE, false)",
+                Decimal(amount),
+                SEED_ADMIN_ID,
+            )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize("amount", ["99999999.9999", "0", "0.0001"])
+async def test_schema_accepted_amounts_fit_the_column(owned_dsn, amount):
+    from app.schemas.budgets import SetBudgetRequest
+
+    SetBudgetRequest(max_budget_usd=Decimal(amount))  # 스키마 통과
+    await _insert_budget(owned_dsn, amount)  # 컬럼도 받는다
+
+
+@pytest.mark.parametrize("amount", ["100000000", "100000000.0000", "123456789.5"])
+async def test_schema_rejected_amounts_also_overflow_the_column(owned_dsn, amount):
+    """스키마가 거부하는 값은 컬럼에서도 overflow 다 — 즉 422 가 막는 것은 진짜 500 이다."""
+    asyncpg = pytest.importorskip("asyncpg")
+    from pydantic import ValidationError
+
+    from app.schemas.budgets import SetBudgetRequest
+
+    with pytest.raises(ValidationError):
+        SetBudgetRequest(max_budget_usd=Decimal(amount))
+    with pytest.raises(asyncpg.exceptions.NumericValueOutOfRangeError):
+        await _insert_budget(owned_dsn, amount)

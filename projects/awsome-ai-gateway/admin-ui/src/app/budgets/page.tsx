@@ -9,6 +9,7 @@ import { BudgetSummaryTable } from '@/components/budgets/BudgetSummaryTable';
 import { TeamAllocationView } from '@/components/budgets/TeamAllocationView';
 import { DowngradeSection } from '@/components/budgets/DowngradeSection';
 import { RegisterScreenContext } from '@/components/chat/RegisterScreenContext';
+import { currentCalendarMonth } from '@/lib/utils/period';
 
 export default async function BudgetsPage() {
   const t = await getTranslations('budgets');
@@ -17,8 +18,10 @@ export default async function BudgetsPage() {
   const session = jwt ? parseJWT(jwt) : null;
   const isAdmin = session?.role === 'ADMIN';
 
-  const now = new Date();
-  const period = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  // KST 월(§59). ⚠️ `new Date().getMonth()` 는 Next 서버(pod)의 로컬 시간 = UTC 라서 매월 1일
+  //    KST 00:00~09:00 의 9시간 동안 **지난달** 예산 요약을 요청했다(새 달 첫 아침에 지난달 소진율이
+  //    그대로 보인다). 백엔드 집계와 같은 KST 기준 헬퍼를 쓴다.
+  const period = currentCalendarMonth();
 
   interface RawBudgetItem {
     target_type: string;
