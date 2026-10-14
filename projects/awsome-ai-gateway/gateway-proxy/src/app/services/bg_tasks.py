@@ -37,24 +37,40 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Coroutine
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 
 logger = structlog.get_logger(__name__)
 
-#: 떼어 낸 태스크의 강한 참조.
+
+class _Meta(NamedTuple):
+    #: 이 태스크가 회계하는 요청. 셧다운에 남은 태스크를 원장과 대사하는 열쇠다.
+    request_id: str | None
+    #: 상류를 끝까지 읽는 drain 처럼, 셧다운 대기가 끝나면 **한 번** 취소해도 되는 태스크.
+    cancel_on_shutdown: bool
+
+
+#: 떼어 낸 태스크의 강한 참조(+ 셧다운 drain 이 쓰는 메타데이터).
 #:
 #: ⚠️ asyncio 는 실행 중 태스크를 **약한 참조**로만 들고 있다. 핸들을 지역 변수로만 둔 태스크는
 #:    도중에 GC 될 수 있다("Task was destroyed but it is pending!"). 떼어 낸 회계 태스크는 끝날
-#:    때까지 여기 둔다 — 셧다운 :func:`drain` 이 가능한 것도 이 집합 덕분이다.
-_tasks: set[asyncio.Task[Any]] = set()
+#:    때까지 여기 둔다 — 셧다운 :func:`drain` 이 가능한 것도 이 표 덕분이다.
+_tasks: dict[asyncio.Task[Any], _Meta] = {}
+
+
+def request_id_of(request: Any) -> str | None:
+    """미들웨어(OTel)가 ``scope["state"]`` 에 넣은 요청 id — 태스크 이름용. 없으면 None."""
+    scope = getattr(request, "scope", None)
+    state = scope.get("state") if isinstance(scope, dict) else None
+    return state.get("request_id") if isinstance(state, dict) else None
 
 
 def _on_done(task: asyncio.Task[Any]) -> None:
-    _tasks.discard(task)
+    _tasks.pop(task, None)
     if task.cancelled():
-        # 루프 종료나 drain() 타임아웃에서만 도달한다 — 둘 다 자체 로그가 있다.
+        # 셧다운 drain 이 cancel_on_shutdown 태스크를 끊었거나(그 목록은 drain 이 로그한다)
+        # 루프 teardown 이 남은 것을 끊은 경우다(그 전에 drain 이 abandoned 로 남겼다).
         return
     exc = task.exception()
     if exc is not None:
@@ -67,26 +83,39 @@ def _on_done(task: asyncio.Task[Any]) -> None:
         )
 
 
-def spawn(coro: Coroutine[Any, Any, Any], *, name: str | None = None) -> asyncio.Task[Any]:
+def spawn(
+    coro: Coroutine[Any, Any, Any],
+    *,
+    name: str | None = None,
+    request_id: str | None = None,
+    cancel_on_shutdown: bool = False,
+) -> asyncio.Task[Any]:
     """``coro`` 를 호출자의 취소 스코프와 분리된 태스크로 띄운다(기다리지 않는다).
 
     fire-and-forget 용(스트림 drain). 정상 경로에서는 호출자가 완료를 기다려야 하는 회계에는
     :func:`spawn_shielded` 를 쓴다.
+
+    ``request_id`` 는 태스크 이름(``<name>:<request_id>``)에 붙는다. ``cancel_on_shutdown`` 은
+    상류를 마저 읽는 drain 전용이다 — :func:`drain` 의 대기가 끝나도 남아 있으면 한 번 취소되고,
+    그 finally 가 그때까지 읽은 usage 로 회계한다.
     """
-    task = asyncio.create_task(coro, name=name)
-    _tasks.add(task)
+    label = ":".join(part for part in (name, request_id) if part) or None
+    task = asyncio.create_task(coro, name=label)
+    _tasks[task] = _Meta(request_id, cancel_on_shutdown)
     task.add_done_callback(_on_done)
     return task
 
 
-async def spawn_shielded(coro: Coroutine[Any, Any, Any], *, name: str | None = None) -> Any:
+async def spawn_shielded(
+    coro: Coroutine[Any, Any, Any], *, name: str | None = None, request_id: str | None = None
+) -> Any:
     """호출자가 취소돼도 ``coro`` 는 끝까지 돈다.
 
     취소가 없으면 ``await coro`` 와 같다 — 호출자가 기다리고, 결과와 예외가 그대로 전달된다.
     호출자가 취소되면 호출자는 평소대로 ``CancelledError`` 를 받고, ``coro`` 는 자기 태스크에서
-    계속 돈다.
+    계속 돈다. (셧다운에도 취소하지 않는다 — 회계를 자르면 차감과 XADD 사이가 끊긴다.)
     """
-    return await asyncio.shield(spawn(coro, name=name))
+    return await asyncio.shield(spawn(coro, name=name, request_id=request_id))
 
 
 def pending_count() -> int:
@@ -94,17 +123,56 @@ def pending_count() -> int:
     return sum(1 for t in _tasks if not t.done())
 
 
-async def drain(timeout: float = 10.0) -> int:
-    """남은 떼어 낸 태스크를 기다린다. 완료된 개수를 돌려준다.
+async def drain(timeout: float = 10.0, *, cancel_grace: float = 2.0) -> int:
+    """셧다운: 떼어 낸 태스크를 끝낸다. 끝난(완료·실패·취소) 개수를 돌려준다.
 
-    lifespan 셧다운에서 부른다. shield 는 **요청** 취소만 막는다 — 이 drain 이 없으면 회계는
-    여전히 **프로세스** 셧다운(롤링 배포마다)에 노출된다. 창은 작아도 같은 조용한 유실이다.
+    lifespan 셧다운에서, 회계가 쓰는 싱크(body_logger·spool·Redis)를 닫기 **전에** 부른다.
+    shield 는 **요청** 취소만 막는다 — 여기서 끝내지 못한 태스크는 asyncio.run 의 teardown 취소가
+    싱크가 닫힌 **뒤에** 그 finally 를 돌린다(리뷰 프로브로 실측: 차감·XADD 가 sinks_closed 뒤).
+
+    1. ``timeout`` 까지 기다린다 — 매번 다시 스냅샷해서, 기다리는 동안 생긴 태스크도 기다린다.
+    2. 남은 ``cancel_on_shutdown`` 태스크(상류를 마저 읽는 drain)를 **한 번** 취소한다 — finally 가
+       그때까지 읽은 usage 로 회계한다. 회계 태스크는 취소하지 않는다(자르면 그게 바로 결함이다).
+    3. ``cancel_grace`` 동안 다시 기다린다(그 사이 생긴 drain 도 한 번 취소한다).
+    4. 그래도 남은 것은 이름과 요청 id 를 로그한다 — 그 요청들은 원장 대사가 필요하다.
     """
-    pending = {t for t in _tasks if not t.done()}
-    if not pending:
+    loop = asyncio.get_running_loop()
+    #: 스냅샷 시점의 메타. 끝난 태스크는 _tasks 에서 빠지므로 로그용으로 따로 쥔다.
+    meta: dict[asyncio.Task[Any], _Meta] = {}
+    cancelled: set[asyncio.Task[Any]] = set()
+
+    def _pending() -> set[asyncio.Task[Any]]:
+        live = {t: m for t, m in _tasks.items() if not t.done()}
+        meta.update(live)
+        return set(live)
+
+    def _describe(tasks: set[asyncio.Task[Any]]) -> dict[str, list]:
+        ordered = sorted(tasks, key=lambda t: t.get_name())
+        return {
+            "tasks": [t.get_name() for t in ordered],
+            "request_ids": [meta[t].request_id for t in ordered if meta[t].request_id],
+        }
+
+    async def _wait(deadline: float, *, cancel: bool) -> set[asyncio.Task[Any]]:
+        while True:
+            pending = _pending()
+            batch = {t for t in pending - cancelled if cancel and meta[t].cancel_on_shutdown}
+            if batch:
+                for t in batch:
+                    t.cancel()
+                cancelled.update(batch)
+                logger.warning("bg_tasks_drain_cancelled", **_describe(batch))
+            remaining = deadline - loop.time()
+            if not pending or remaining <= 0:
+                return pending
+            await asyncio.wait(pending, timeout=remaining)
+
+    if not _pending():
         return 0
-    logger.info("bg_tasks_drain_start", pending=len(pending), timeout=timeout)
-    done, still_pending = await asyncio.wait(pending, timeout=timeout)
-    if still_pending:
-        logger.warning("bg_tasks_drain_timeout", pending=len(still_pending), timeout=timeout)
-    return len(done)
+    logger.info("bg_tasks_drain_start", pending=len(meta), timeout=timeout)
+    pending = await _wait(loop.time() + timeout, cancel=False)
+    if any(meta[t].cancel_on_shutdown for t in pending):
+        pending = await _wait(loop.time() + cancel_grace, cancel=True)
+    if pending:
+        logger.warning("bg_tasks_drain_abandoned", timeout=timeout, **_describe(pending))
+    return sum(1 for t in meta if t.done())

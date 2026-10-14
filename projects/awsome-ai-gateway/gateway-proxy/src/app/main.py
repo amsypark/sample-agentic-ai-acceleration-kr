@@ -424,9 +424,12 @@ async def lifespan(app: FastAPI):
     #     stop() 은 flusher 를 취소한 뒤 큐를 비우므로, 그 뒤에 들어온 레코드는 조용히 버려진다.
     #   · redis.aclose()/db_engine.dispose() 앞 — finalize 가 차감과 원장 XADD 에 Redis 를 쓴다.
     #   · cost_stream_spool.drain() 앞 — 이 태스크들이 spool 한 레코드도 마지막 재발행을 받게.
-    # timeout 10s 는 pod terminationGracePeriodSeconds(60) 안에 들어간다.
+    # ⚠️ 끝까지 기다리지 못한 것을 그대로 두면 asyncio.run 의 teardown 이 그 finally 를 싱크가
+    #    닫힌 **뒤에** 돌린다. 그래서 10s 뒤에도 상류를 읽고 있는 drain 은 한 번 취소해(그때까지
+    #    읽은 만큼 회계) 2s 더 기다리고, 그래도 남은 것은 이름·요청 id 를 로그한다(bg_tasks.drain).
+    #    합계 12s 는 pod terminationGracePeriodSeconds(60) 안에 들어간다.
     try:
-        completed = await bg_tasks.drain(timeout=10.0)
+        completed = await bg_tasks.drain(timeout=10.0, cancel_grace=2.0)
         if completed:
             logger.info("bg_tasks_drained_on_shutdown", count=completed)
     except Exception:

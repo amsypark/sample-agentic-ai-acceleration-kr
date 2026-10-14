@@ -156,6 +156,57 @@ def test_streaming_drains_use_strong_referenced_tasks():
     )
 
 
+def _bg_calls(rel: str) -> list[ast.Call]:
+    """``bg_tasks.spawn(...)`` / ``bg_tasks.spawn_shielded(...)`` 호출 노드."""
+    return [
+        n
+        for n in ast.walk(ast.parse(_read(rel)))
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "bg_tasks"
+        and n.func.attr in ("spawn", "spawn_shielded")
+    ]
+
+
+def _kw(call: ast.Call, name: str):
+    return next((k.value for k in call.keywords if k.arg == name), None)
+
+
+def test_every_detached_task_is_named_after_its_request():
+    """셧다운에 남은 태스크는 이름(요청 id 포함)으로만 원장과 대사할 수 있다."""
+    for rel in (
+        "services/streaming.py",
+        "services/web_search_loop.py",
+        "services/body_log_records.py",
+        "routers/bedrock.py",
+    ):
+        calls = _bg_calls(rel)
+        assert calls, f"{rel} 에 bg_tasks 호출이 없다 — 구조가 바뀌었으면 갱신할 것"
+        missing = [c.lineno for c in calls if _kw(c, "request_id") is None]
+        assert not missing, f"{rel}:{missing} — request_id 없이 떼어 낸 태스크"
+
+
+def test_stream_drains_are_cancellable_at_shutdown_and_accounting_is_not():
+    """drain 은 셧다운에 한 번 취소돼야 하고(finally 가 읽은 만큼 회계), 회계는 취소되면 안 된다.
+
+    플래그가 빠진 drain 은 셧다운 대기를 다 쓰고도 상류를 읽다가, asyncio.run teardown 이 싱크가
+    닫힌 뒤에 그 finally 를 돌린다. 반대로 회계(spawn_shielded)에 취소가 닿으면 차감과 XADD 사이가
+    끊긴다 — spawn_shielded 는 그 인자를 받지도 않는다.
+    """
+    calls = _bg_calls("services/streaming.py")
+    drains = [c for c in calls if c.func.attr == "spawn"]
+    assert len(drains) == 4, f"drain 배선이 {len(drains)}개 (세 제너레이터 + stream_response)"
+    for c in drains:
+        flag = _kw(c, "cancel_on_shutdown")
+        assert isinstance(flag, ast.Constant) and flag.value is True, (
+            f"streaming.py:{c.lineno} drain 에 cancel_on_shutdown=True 가 없다"
+        )
+    for rel in ("services/web_search_loop.py", "services/body_log_records.py"):
+        flagged = [c.lineno for c in _bg_calls(rel) if _kw(c, "cancel_on_shutdown") is not None]
+        assert not flagged, f"{rel}:{flagged} — 회계/본문 로그 발화는 셧다운에 취소하지 않는다"
+
+
 # ── 2. web_search_loop.py — 두 스티처 ─────────────────────────────────────────
 
 

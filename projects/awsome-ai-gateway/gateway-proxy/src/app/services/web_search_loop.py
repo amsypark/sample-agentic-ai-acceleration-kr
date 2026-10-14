@@ -752,7 +752,9 @@ async def _anthropic_stream(
         #    level-triggered 라, 여기서의 평범한 await 는 첫 Redis 왕복에서 다시 잘려 N 턴의
         #    토큰과 검색 횟수가 원장 없이 사라진다(차감만 남을 수도 있다).
         await bg_tasks.spawn_shielded(
-            _fire_usage(on_usage, merged), name="web_search_anthropic_usage"
+            _fire_usage(on_usage, merged),
+            name="web_search_anthropic_usage",
+            request_id=bg_tasks.request_id_of(request),
         )
 
 
@@ -1187,7 +1189,9 @@ async def _responses_stream(
         merged.total_tokens = merged.input_tokens + merged.output_tokens
         # 보호 태스크로 — 근거는 anthropic 스티처의 같은 finally 참조.
         await bg_tasks.spawn_shielded(
-            _fire_usage(on_usage, merged), name="web_search_responses_usage"
+            _fire_usage(on_usage, merged),
+            name="web_search_responses_usage",
+            request_id=bg_tasks.request_id_of(request),
         )
 
 
@@ -1402,7 +1406,10 @@ async def run_web_search_loop(
         from app.services.body_log_records import wrap_stream_for_body_log
 
         return wrap_stream_for_body_log(
-            gen, dialect=dialect, on_complete=on_stream_complete
+            gen,
+            dialect=dialect,
+            on_complete=on_stream_complete,
+            request_id=bg_tasks.request_id_of(request),
         )
 
     async def _log_nonstream(status: int, raw: bytes) -> None:

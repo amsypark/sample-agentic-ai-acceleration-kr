@@ -154,8 +154,11 @@ def wrap_stream_for_body_log(
     *,
     dialect: str,
     on_complete: Callable[[str, str], Awaitable[None]],
+    request_id: str | None = None,
 ) -> AsyncIterator[bytes]:
     """SSE 제너레이터를 감싸 전문을 누적하고, 종료 시 ``on_complete`` 를 정확히 1회 부른다.
+
+    ``request_id`` 는 끊김 경로에서 떼어 내는 발화 태스크의 이름에만 쓰인다(셧다운 로그용).
 
     왜 래퍼인가 — ``services/streaming.py`` 의 세 헬퍼는 이미 ``on_complete`` 를 직접
     받는다. 그런데 웹서치 루프의 본 경로(``_anthropic_stream`` / ``_responses_stream``)는
@@ -209,7 +212,7 @@ def wrap_stream_for_body_log(
             #    이미 종결 표지가 있어 success 로 남는다.
             # bg_tasks.spawn — 강한 참조(GC 로 레코드가 사라지지 않게)이고, 셧다운 drain 이
             # body_logger.stop() 보다 먼저 이것을 기다린다.
-            bg_tasks.spawn(_fire(), name="web_search_body_log")
+            bg_tasks.spawn(_fire(), name="web_search_body_log", request_id=request_id)
             raise
         except Exception:
             # 상류 실패로 스트림이 끊긴 경우. 이 경로를 빼면 실패한 요청의 본문이 사라지는데,

@@ -86,6 +86,8 @@ async def bedrock_anthropic_sse_stream(
     - Malformed JSON chunk: passthrough as `data: <raw>\\n\\n` (no crash).
     """
     idle_timeout, drain_timeout = _resolve_timeouts(idle_timeout, drain_timeout)
+    # 떼어 낸 회계·drain 태스크 이름에 붙는다 — 셧다운에 남으면 이 id 로 원장을 대사한다.
+    request_id = bg_tasks.request_id_of(request)
     counters = {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -266,7 +268,9 @@ async def bedrock_anthropic_sse_stream(
         """
         fire_usage = _claim_usage()
         await bg_tasks.spawn_shielded(
-            _finalize(complete_status, fire_usage=fire_usage), name="bedrock_stream_finalize"
+            _finalize(complete_status, fire_usage=fire_usage),
+            name="bedrock_stream_finalize",
+            request_id=request_id,
         )
 
     async def _drain_remaining() -> None:
@@ -320,8 +324,14 @@ async def bedrock_anthropic_sse_stream(
         logger.info("bedrock_stream_cancelled")
         client_disconnected = True
         # bg_tasks.spawn — bare asyncio.create_task 는 약한 참조라 drain 이 도중에 GC 될 수
-        # 있고, 셧다운 drain 대상에도 들지 않는다.
-        bg_tasks.spawn(_drain_remaining(), name="bedrock_stream_drain")
+        # 있고, 셧다운 drain 대상에도 들지 않는다. cancel_on_shutdown: 셧다운 대기가 끝나도
+        # 상류를 읽고 있으면 한 번 취소돼, finally 가 그때까지 읽은 usage 로 회계한다.
+        bg_tasks.spawn(
+            _drain_remaining(),
+            name="bedrock_stream_drain",
+            request_id=request_id,
+            cancel_on_shutdown=True,
+        )
         raise
 
     except Exception as exc:
@@ -366,6 +376,7 @@ async def openai_sse_stream(
     - Upstream exception mid-stream: same OpenAI-shaped error chunk path.
     """
     idle_timeout, drain_timeout = _resolve_timeouts(idle_timeout, drain_timeout)
+    request_id = bg_tasks.request_id_of(request)  # 태스크 이름용(Bedrock 경로 참조)
     latest_usage: TokenUsage | None = None
     accumulated_text: list[str] = []  # KI-08: delta.content 누적
     first_token_time: float | None = None
@@ -493,7 +504,9 @@ async def openai_sse_stream(
         """회계를 취소에서 분리된 태스크로 — Bedrock 경로의 같은 함수 참조."""
         fire_usage = _claim_usage()
         await bg_tasks.spawn_shielded(
-            _finalize(complete_status, fire_usage=fire_usage), name="openai_stream_finalize"
+            _finalize(complete_status, fire_usage=fire_usage),
+            name="openai_stream_finalize",
+            request_id=request_id,
         )
 
     async def _drain_remaining() -> None:
@@ -546,7 +559,12 @@ async def openai_sse_stream(
         # handler in `bedrock_anthropic_sse_stream` for rationale.
         logger.info("openai_stream_cancelled")
         client_disconnected = True
-        bg_tasks.spawn(_drain_remaining(), name="openai_stream_drain")  # 강한 참조(bg_tasks)
+        bg_tasks.spawn(  # 강한 참조 + 셧다운 취소 대상 — Bedrock 경로의 같은 핸들러 참조
+            _drain_remaining(),
+            name="openai_stream_drain",
+            request_id=request_id,
+            cancel_on_shutdown=True,
+        )
         raise
 
     except Exception as exc:
@@ -587,6 +605,7 @@ async def responses_sse_stream(
     idle/drain 타임아웃 기본값은 Settings 에서 해석된다(_resolve_timeouts).
     """
     idle_timeout, drain_timeout = _resolve_timeouts(idle_timeout, drain_timeout)
+    request_id = bg_tasks.request_id_of(request)  # 태스크 이름용(Bedrock 경로 참조)
     latest_usage: TokenUsage | None = None
     accumulated_text: list[str] = []
     first_token_time: float | None = None
@@ -731,7 +750,9 @@ async def responses_sse_stream(
         """
         fire_usage = _claim_usage()
         await bg_tasks.spawn_shielded(
-            _finalize(complete_status, fire_usage=fire_usage), name="responses_stream_finalize"
+            _finalize(complete_status, fire_usage=fire_usage),
+            name="responses_stream_finalize",
+            request_id=request_id,
         )
 
     async def _drain_remaining() -> None:
@@ -775,7 +796,12 @@ async def responses_sse_stream(
     except (asyncio.CancelledError, GeneratorExit):
         logger.info("responses_stream_cancelled")
         client_disconnected = True
-        bg_tasks.spawn(_drain_remaining(), name="responses_stream_drain")  # 강한 참조(bg_tasks)
+        bg_tasks.spawn(  # 강한 참조 + 셧다운 취소 대상 — Bedrock 경로의 같은 핸들러 참조
+            _drain_remaining(),
+            name="responses_stream_drain",
+            request_id=request_id,
+            cancel_on_shutdown=True,
+        )
         raise
 
     except Exception as exc:
@@ -807,6 +833,7 @@ async def stream_response(
     하드코딩 60s 로 되돌아가는 회귀를 원천 차단하기 위함.
     """
     idle_timeout, drain_timeout = _resolve_timeouts(idle_timeout, drain_timeout)
+    request_id = bg_tasks.request_id_of(request)  # 태스크 이름용(Bedrock 경로 참조)
     usage: TokenUsage | None = None
     client_disconnected = False
 
@@ -838,7 +865,12 @@ async def stream_response(
                 logger.info("client_disconnected_during_stream")
                 client_disconnected = True
                 # 백그라운드에서 나머지 소비 (bg_tasks.spawn — 강한 참조 + 셧다운 drain 대상)
-                bg_tasks.spawn(consume_remaining(), name="stream_response_drain")
+                bg_tasks.spawn(
+                    consume_remaining(),
+                    name="stream_response_drain",
+                    request_id=request_id,
+                    cancel_on_shutdown=True,
+                )
                 return
 
             parsed_usage = _try_extract_usage(chunk)
@@ -860,7 +892,9 @@ async def stream_response(
     if not client_disconnected and usage and callable(on_usage):
         # 위 세 제너레이터와 같은 이유로 보호한다(마지막 yield 뒤). 호출부 없는 함수지만,
         # 나중에 배선될 때 원장 누락이 함께 따라오지 않게 미리 막아 둔다.
-        await bg_tasks.spawn_shielded(_record_usage(), name="stream_response_finalize")
+        await bg_tasks.spawn_shielded(
+            _record_usage(), name="stream_response_finalize", request_id=request_id
+        )
 
 
 def _try_extract_usage(chunk: bytes) -> TokenUsage | None:

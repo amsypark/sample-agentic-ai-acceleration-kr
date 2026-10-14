@@ -268,6 +268,7 @@ async def _handle_bedrock(request: Request, model_id: str, path_suffix: str, str
                             downgraded_from=state.get("downgraded_from"),
                         ),
                         name="bedrock_passthrough_finalize",
+                        request_id=request_id,
                     )
 
         return StreamingResponse(
@@ -310,6 +311,7 @@ async def _handle_bedrock(request: Request, model_id: str, path_suffix: str, str
                     bedrock_request_id=(headers or {}).get("x-amzn-requestid"),
                 ),
                 name="bedrock_nonstream_finalize",
+                request_id=request_id,
             )
         else:
             # ⚠️ finalize 를 타지 않는 경로다(상류 4xx/5xx, 또는 usage 가 비어 온 응답).
