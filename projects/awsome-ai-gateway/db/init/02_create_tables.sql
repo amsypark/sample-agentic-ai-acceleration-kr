@@ -692,9 +692,21 @@ ALTER TABLE usage.usage_logs ADD COLUMN IF NOT EXISTS context_tier VARCHAR(8);
 -- 계정 → 파드 IRSA). 두 ORM 이 이 컬럼을 명시 열거하므로, 컬럼 없는 DB 에 새 이미지가 붙으면
 -- 모델 조회마다 42703 = 게이트웨이 전면 장애다. 클라우드 모드는 init SQL 을 alembic 보다
 -- 먼저 돌리므로 이 블록이 이미지 교체 전에 컬럼을 만든다.
-ALTER TABLE model.model_aliases
-    ADD COLUMN IF NOT EXISTS account_role_arn    VARCHAR(2048),
-    ADD COLUMN IF NOT EXISTS account_external_id VARCHAR(1224);
+-- ADD COLUMN IF NOT EXISTS 는 컬럼이 있어 no-op 이어도 ACCESS EXCLUSIVE 를 잡는다(0043 docstring,
+-- 실 PG16 측정). 이 파일은 모든 Job 에서 다시 돌므로 있으면 ALTER 자체를 건너뛴다.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'model' AND table_name = 'model_aliases'
+                      AND column_name = 'account_role_arn') THEN
+        ALTER TABLE model.model_aliases ADD COLUMN account_role_arn VARCHAR(2048);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'model' AND table_name = 'model_aliases'
+                      AND column_name = 'account_external_id') THEN
+        ALTER TABLE model.model_aliases ADD COLUMN account_external_id VARCHAR(1224);
+    END IF;
+END $$;
 -- CHECK 두 개 미러. ADD CONSTRAINT 에는 IF NOT EXISTS 가 없어 존재 여부를 먼저 본다(멱등).
 -- 정규식은 0043 과 글자까지 같다(콜론이 [:] 인 이유는 0043 docstring).
 DO $$
@@ -705,7 +717,7 @@ BEGIN
         ALTER TABLE model.model_aliases
             ADD CONSTRAINT ck_model_aliases_account_role_arn
             CHECK (account_role_arn IS NULL
-                   OR account_role_arn ~ '^arn[:]aws[a-z-]*[:]iam[:][:][0-9]{12}[:]role/.+');
+                   OR account_role_arn ~ '^arn[:]aws(-[a-z]+)*[:]iam[:][:][0-9]{12}[:]role/[A-Za-z0-9+=,.@_/-]+$');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
                     WHERE conname = 'ck_model_aliases_account_external_id_needs_role'
@@ -743,12 +755,13 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_aws_accounts_role_arn'
                       AND conrelid = 'model.aws_accounts'::regclass) THEN
         ALTER TABLE model.aws_accounts ADD CONSTRAINT ck_aws_accounts_role_arn
-            CHECK (role_arn ~ '^arn[:]aws[a-z-]*[:]iam[:][:][0-9]{12}[:]role/.+');
+            CHECK (role_arn ~ '^arn[:]aws(-[a-z]+)*[:]iam[:][:][0-9]{12}[:]role/[A-Za-z0-9+=,.@_/-]+$');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_aws_accounts_external_id'
                       AND conrelid = 'model.aws_accounts'::regclass) THEN
         ALTER TABLE model.aws_accounts ADD CONSTRAINT ck_aws_accounts_external_id
-            CHECK (external_id IS NULL OR char_length(external_id) BETWEEN 2 AND 1224);
+            CHECK (external_id IS NULL OR (char_length(external_id) BETWEEN 2 AND 1224
+                                           AND external_id ~ '^[A-Za-z0-9_+=,.@:/-]+$'));
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_aws_accounts_role_arn'
                       AND conrelid = 'model.aws_accounts'::regclass) THEN
@@ -756,7 +769,14 @@ BEGIN
     END IF;
 END $$;
 
-ALTER TABLE model.model_aliases ADD COLUMN IF NOT EXISTS account_name VARCHAR(64);
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'model' AND table_name = 'model_aliases'
+                      AND column_name = 'account_name') THEN
+        ALTER TABLE model.model_aliases ADD COLUMN account_name VARCHAR(64);
+    END IF;
+END $$;
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_model_aliases_account_name'
@@ -775,7 +795,9 @@ DECLARE
     r model.aws_accounts%ROWTYPE;
 BEGIN
     IF NEW.account_name IS NOT NULL THEN
-        SELECT * INTO r FROM model.aws_accounts WHERE name = NEW.account_name;
+        -- FOR SHARE: 겹친 레지스트리 수정과 직렬화한다 — 락 없이 읽으면 사본이 옛 값으로 남는다
+        -- (0044 의 같은 함수 주석, 실 PG16 두 연결 테스트).
+        SELECT * INTO r FROM model.aws_accounts WHERE name = NEW.account_name FOR SHARE;
         IF NOT FOUND THEN
             RAISE EXCEPTION 'aws account "%" does not exist', NEW.account_name
                 USING ERRCODE = 'foreign_key_violation';
@@ -831,4 +853,12 @@ END $$;
 -- migration 0045: 요청을 실제로 서빙한 AWS 계정 12자리(NULL = 게이트웨이 자신의 계정 /
 -- OPENMODEL / 0045 이전 행). cost-recorder-worker 의 INSERT 가 이 컬럼을 명시하므로 0039 와
 -- 같은 이유로 미러링한다. 원장 테이블이라 CHECK 는 걸지 않는다(0045 docstring).
-ALTER TABLE usage.usage_logs ADD COLUMN IF NOT EXISTS aws_account_id VARCHAR(12);
+-- 존재를 먼저 본다: no-op ADD COLUMN IF NOT EXISTS 도 원장 테이블에 ACCESS EXCLUSIVE 를 잡는다.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'usage' AND table_name = 'usage_logs'
+                      AND column_name = 'aws_account_id') THEN
+        ALTER TABLE usage.usage_logs ADD COLUMN aws_account_id VARCHAR(12);
+    END IF;
+END $$;

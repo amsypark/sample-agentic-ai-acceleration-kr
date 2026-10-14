@@ -53,6 +53,10 @@ in-account 호출이 자기 자신에 대한 AssumeRole 이 된다(파드 역할
   * ``ck_model_aliases_account_role_arn`` — IAM **역할** ARN 문법. 오타가 그 alias 의 첫
     호출에서야 STS 오류로 드러나면, 드물게 쓰는 alias 는 편집 후 한참 뒤에야 발견된다.
     문법만 본다(역할이 존재하는지·assume 가능한지는 CHECK 가 알 수 없는 런타임 사실이다).
+    파티션은 ``aws`` / ``aws-<소문자>`` 만(``arn:awsfoo`` 거부), 역할 경로·이름은 IAM 문자
+    집합 ASCII ``[A-Za-z0-9+=,.@_/-]`` 만 받는다 — ``role/*`` · ``role/gw-*`` 같은 와일드카드는
+    STS 에는 실패할 뿐이지만 같은 값이 IAM 정책 Resource 로 가면 그 계정의 모든 역할을 연다.
+    admin-api(``schemas/models.py``) · terraform irsa 변수 · admin-ui 와 같은 문법이다.
   * ``ck_model_aliases_account_external_id_needs_role`` — 역할 없이 ExternalId 만 있는
     조합은 붙일 AssumeRole 이 없어 아무 효과가 없다.
 
@@ -67,8 +71,11 @@ in-account 호출이 자기 자신에 대한 AssumeRole 이 된다(파드 역할
 
 클라우드 모드의 ``run_migration.sh`` 는 ``db/init/*.sql`` 을 alembic **전에** 돌리고, init
 SQL 은 이 컬럼과 CHECK 를 미러링한다. 그래서 기존 DB 에서는 이 마이그레이션이 돌 때 이미
-다 있다. 컬럼은 ``ADD COLUMN IF NOT EXISTS``, 제약은 존재 확인 후 추가한다 — 맨
-``ADD CONSTRAINT`` 는 그 순서에서 DuplicateObject 로 Job 을 실패시킨다.
+다 있다. 컬럼도 제약도 존재를 먼저 보고 없을 때만 추가한다 — 맨 ``ADD CONSTRAINT`` 는 그
+순서에서 DuplicateObject 로 Job 을 실패시킨다. 컬럼에 ``ADD COLUMN IF NOT EXISTS`` 를 쓰지
+않는 이유: 컬럼이 이미 있어 no-op 이어도 ACCESS EXCLUSIVE 를 잡는다(실 PG16 측정 — 그 트랜잭션
+동안 다른 연결의 ``SELECT count(*)`` 가 lock_timeout 으로 실패). 게이트웨이의 모든 모델 조회가
+이 테이블을 읽으므로, 할 일이 없는 재실행이 읽기를 막을 이유가 없다.
 
 ## 배포 순서 — 스키마 먼저
 
@@ -95,21 +102,40 @@ branch_labels = None
 depends_on = None
 
 
+#: 0044 / db/init/02_create_tables.sql 과 글자까지 같다. 콜론이 [:] 인 이유는 위 docstring.
+ROLE_ARN_REGEX = "^arn[:]aws(-[a-z]+)*[:]iam[:][:][0-9]{12}[:]role/[A-Za-z0-9+=,.@_/-]+$"
+
+
+def _add_column_if_missing(column: str, ddl_type: str) -> None:
+    # information_schema 만 읽으면 테이블 락이 없다(실 PG16 측정: pg_locks 에 0건).
+    op.execute(
+        f"""
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'model' AND table_name = 'model_aliases'
+                   AND column_name = '{column}'
+            ) THEN
+                ALTER TABLE model.model_aliases ADD COLUMN {column} {ddl_type};
+            END IF;
+        END $$
+        """
+    )
+
+
 def upgrade() -> None:
+    # 컬럼을 실제로 추가할 때는 ACCESS EXCLUSIVE 가 필요하다. 그 락을 기다리는 동안 뒤에 오는
+    # 게이트웨이 읽기가 전부 줄을 서므로, 5초 상한으로 멈춘 락을 걸린 배포가 아니라 실패한 Job
+    # 으로 바꾼다. transaction_per_migration 이라 SET LOCAL 은 이 리비전에만 걸린다.
+    op.execute("SET LOCAL lock_timeout = '5s'")
     # VARCHAR(2048): 역할 ARN 은 그보다 훨씬 짧지만 role path 는 운영자가 정한다.
     # routing_profiles 의 512 는 깊은 path + 긴 역할 이름에 여유가 없다.
-    op.execute(
-        "ALTER TABLE model.model_aliases "
-        "ADD COLUMN IF NOT EXISTS account_role_arn VARCHAR(2048)"
-    )
+    _add_column_if_missing("account_role_arn", "VARCHAR(2048)")
     # 1224 = sts:AssumeRole ExternalId 의 상한.
-    op.execute(
-        "ALTER TABLE model.model_aliases "
-        "ADD COLUMN IF NOT EXISTS account_external_id VARCHAR(1224)"
-    )
+    _add_column_if_missing("account_external_id", "VARCHAR(1224)")
     # 제약 이름은 테이블 단위로 유일하므로 conrelid 로 범위를 좁혀 확인한다.
     op.execute(
-        """
+        f"""
         DO $$
         BEGIN
             IF NOT EXISTS (
@@ -121,7 +147,7 @@ def upgrade() -> None:
                     ADD CONSTRAINT ck_model_aliases_account_role_arn
                     CHECK (
                         account_role_arn IS NULL
-                        OR account_role_arn ~ '^arn[:]aws[a-z-]*[:]iam[:][:][0-9]{12}[:]role/.+'
+                        OR account_role_arn ~ '{ROLE_ARN_REGEX}'
                     );
             END IF;
             IF NOT EXISTS (

@@ -84,14 +84,16 @@ branch_labels = None
 depends_on = None
 
 #: 0043 / db/init/02_create_tables.sql 과 글자까지 같다. 콜론이 [:] 인 이유는 0043 참고.
-ROLE_ARN_REGEX = "^arn[:]aws[a-z-]*[:]iam[:][:][0-9]{12}[:]role/.+"
+ROLE_ARN_REGEX = "^arn[:]aws(-[a-z]+)*[:]iam[:][:][0-9]{12}[:]role/[A-Za-z0-9+=,.@_/-]+$"
 NAME_REGEX = "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$"
+#: sts:AssumeRole ExternalId 문자 집합(ASCII). 길이 2..1224 는 char_length 로 따로 본다 —
+#: PostgreSQL 정규식의 반복 상한은 255 라 {2,1224} 를 쓸 수 없다.
+EXTERNAL_ID_REGEX = "^[A-Za-z0-9_+=,.@:/-]+$"
 
 
 def upgrade() -> None:
-    # 백필이 도는 동안 admin 쓰기가 들어오면 백필이 못 본 인라인 ARN 이 생길 수 있다. 쓰기만
-    # 기다리게 하고(게이트웨이의 읽기는 막지 않는다), 5초 상한으로 멈춘 락을 걸린 배포가 아니라
-    # 실패한 Job 으로 바꾼다. transaction_per_migration 이라 SET LOCAL 은 이 리비전에만 걸린다.
+    # 기다리는 DDL 뒤에는 이후의 읽기·쓰기가 모두 줄을 선다. 5초 상한으로 멈춘 락을 걸린 배포가
+    # 아니라 실패한 Job 으로 바꾼다. transaction_per_migration 이라 SET LOCAL 은 이 리비전에만 걸린다.
     op.execute("SET LOCAL lock_timeout = '5s'")
 
     op.execute(
@@ -119,7 +121,8 @@ def upgrade() -> None:
         ("ck_aws_accounts_role_arn", f"CHECK (role_arn ~ '{ROLE_ARN_REGEX}')"),
         (
             "ck_aws_accounts_external_id",
-            "CHECK (external_id IS NULL OR char_length(external_id) BETWEEN 2 AND 1224)",
+            "CHECK (external_id IS NULL OR (char_length(external_id) BETWEEN 2 AND 1224 "
+            f"AND external_id ~ '{EXTERNAL_ID_REGEX}'))",
         ),
         ("uq_aws_accounts_role_arn", "UNIQUE (role_arn)"),
     ):
@@ -137,8 +140,20 @@ def upgrade() -> None:
             """
         )
 
+    # ADD COLUMN IF NOT EXISTS 는 no-op 이어도 ACCESS EXCLUSIVE 를 잡는다(0043 docstring, 실 PG16
+    # 측정). 그 락은 커밋까지 유지되므로 아래 백필 내내 게이트웨이의 읽기까지 막는다 — 있으면 건너뛴다.
     op.execute(
-        "ALTER TABLE model.model_aliases ADD COLUMN IF NOT EXISTS account_name VARCHAR(64)"
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'model' AND table_name = 'model_aliases'
+                   AND column_name = 'account_name'
+            ) THEN
+                ALTER TABLE model.model_aliases ADD COLUMN account_name VARCHAR(64);
+            END IF;
+        END $$
+        """
     )
     op.execute(
         """
@@ -164,6 +179,12 @@ def upgrade() -> None:
     )
 
     # ── 백필: 0043 인라인 값 → 레지스트리 항목 ───────────────────────────────────────
+    # 백필이 도는 동안 admin 쓰기가 들어오면 백필이 못 본 인라인 ARN 이 생길 수 있다 — 쓰기만
+    # 막는다. SHARE ROW EXCLUSIVE 는 읽기와 충돌하지 않는다(실 PG16 측정). 단 이 리비전이
+    # account_name 을 실제로 추가한 경우(init SQL 없이 alembic 만 도는 경로)에는 그 ADD COLUMN 의
+    # ACCESS EXCLUSIVE 가 커밋까지 남아 읽기도 그동안 기다린다. 클라우드 Job 은 init SQL 이 컬럼을
+    # 먼저 만들므로 이 리비전에서 잡는 락은 SHARE ROW EXCLUSIVE · SHARE(인덱스 확인) ·
+    # SHARE UPDATE EXCLUSIVE(VALIDATE) 뿐이고, 셋 다 읽기를 막지 않는다.
     op.execute("LOCK TABLE model.model_aliases IN SHARE ROW EXCLUSIVE MODE")
     op.execute(
         """
@@ -230,7 +251,14 @@ def upgrade() -> None:
             r model.aws_accounts%ROWTYPE;
         BEGIN
             IF NEW.account_name IS NOT NULL THEN
-                SELECT * INTO r FROM model.aws_accounts WHERE name = NEW.account_name;
+                -- FOR SHARE: 이 alias 가 커밋될 때까지 그 계정 행의 수정을 막고, 이미 진행 중인
+                -- 수정이 있으면 그 커밋을 기다려 새 값을 읽는다. 락 없이 읽으면 선택과 레지스트리
+                -- 수정이 겹칠 때 사본이 옛 값으로 영구히 남는다 — 실 PG16 에서 네 가지 순서 중
+                -- 셋(선택 먼저·external_id 수정 / 수정 먼저·external_id / 수정 먼저·role_arn)이
+                -- 그랬다. FK 검사(FOR KEY SHARE)는 role_arn 수정만, 그것도 선택이 먼저일 때만
+                -- 직렬화한다. FOR SHARE 는 aws_accounts 의 UPDATE 권한이 필요한데, model_aliases
+                -- 를 쓰는 롤(admin_api_user, 배포의 단일 gateway 유저)은 model 스키마 CRUD 를 갖는다.
+                SELECT * INTO r FROM model.aws_accounts WHERE name = NEW.account_name FOR SHARE;
                 IF NOT FOUND THEN
                     -- FK 도 거부하지만 문장 끝에서야 한다. 사본이 반쯤 채워진 행이 생기기 전에
                     -- 이름을 넣어 여기서 말한다.

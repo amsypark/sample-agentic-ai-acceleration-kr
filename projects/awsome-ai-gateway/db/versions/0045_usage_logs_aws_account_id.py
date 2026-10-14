@@ -62,8 +62,22 @@ depends_on = None
 
 def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
-    # IF NOT EXISTS: init SQL 이 먼저 만든 환경(클라우드 모드)에서 no-op.
-    op.execute("ALTER TABLE usage.usage_logs ADD COLUMN IF NOT EXISTS aws_account_id VARCHAR(12)")
+    # init SQL 이 먼저 만든 환경(클라우드 모드)에서는 건너뛴다. ADD COLUMN IF NOT EXISTS 로 쓰지
+    # 않는다 — no-op 이어도 ACCESS EXCLUSIVE 를 잡아(0043 docstring, 실 PG16 측정) 그동안
+    # 게이트웨이의 usage_logs INSERT 가 기다린다.
+    op.execute(
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'usage' AND table_name = 'usage_logs'
+                   AND column_name = 'aws_account_id'
+            ) THEN
+                ALTER TABLE usage.usage_logs ADD COLUMN aws_account_id VARCHAR(12);
+            END IF;
+        END $$
+        """
+    )
 
 
 def downgrade() -> None:

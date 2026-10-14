@@ -238,6 +238,13 @@ async def test_reserved_and_malformed_names_are_refused(conn, name):
         "111122223333",  # 계정 번호만
         "arn:aws:iam::12345:role/short-account",  # 12자리 아님
         "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude",  # Bedrock ARN
+        # 와일드카드: STS 는 실패할 뿐이지만 같은 문법이 IAM 정책 Resource 로 가면 계정 전체가 열린다.
+        "arn:aws:iam::111122223333:role/*",
+        "arn:aws:iam::111122223333:role/gw-*",
+        "arn:awsfoo:iam::111122223333:role/x",  # 파티션이 아니다
+        "arn:aws:iam::111122223333:role/역할",  # IAM 이름은 ASCII 다
+        "arn:aws:iam::111122223333:role/a b",
+        "arn:aws:iam::111122223333:role/",
     ],
 )
 async def test_only_iam_role_arns_are_accepted(conn, role):
@@ -247,9 +254,32 @@ async def test_only_iam_role_arns_are_accepted(conn, role):
         await _account(conn, "proof-a", role)
 
 
-async def test_other_partitions_are_accepted(conn):
-    await _account(conn, "proof-a", "arn:aws-us-gov:iam::111122223333:role/gov")
+@pytest.mark.parametrize(
+    "role",
+    [
+        "arn:aws-us-gov:iam::111122223333:role/gov",
+        "arn:aws-iso-b:iam::111122223333:role/iso",
+        "arn:aws:iam::111122223333:role/team/a+b=c,d.e@f_g-h",  # path + IAM 이름 문자 전부
+    ],
+)
+async def test_other_partitions_and_the_full_iam_charset_are_accepted(conn, role):
+    await _account(conn, "proof-a", role)
     assert await conn.fetchval("SELECT count(*) FROM model.aws_accounts WHERE name = 'proof-a'") == 1
+
+
+@pytest.mark.parametrize("ext", ["ext id", "외부-아이디", "ext*", "ext\n"])
+async def test_an_external_id_outside_the_sts_charset_is_refused(conn, ext):
+    import asyncpg
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await _account(conn, "proof-a", ROLE_A, ext)
+
+
+async def test_the_full_sts_external_id_charset_is_accepted(conn):
+    await _account(conn, "proof-a", ROLE_A, "Ab0_+=,.@:/-")
+    assert await conn.fetchval("SELECT external_id FROM model.aws_accounts WHERE name = 'proof-a'") == (
+        "Ab0_+=,.@:/-"
+    )
 
 
 async def test_a_one_character_external_id_is_refused(conn):
@@ -282,3 +312,102 @@ async def test_rerunning_the_init_sql_keeps_the_triggers_working(conn):
         "SELECT convalidated FROM pg_constraint WHERE conname = 'ck_model_aliases_account_materialized'"
     )
     assert validated is True, "재실행이 0044 가 검증한 CHECK 를 NOT VALID 로 되돌리면 안 된다"
+
+
+# ── 동시성: 선택과 레지스트리 수정이 겹칠 때 ────────────────────────────────────────────
+#
+# BEFORE 트리거가 레지스트리를 락 없이 읽으면 두 순서 모두에서 사본이 영구히 어긋난다.
+#   선택 먼저: 선택 트랜잭션이 커밋 전이라 레지스트리 수정의 전파 UPDATE 가 그 alias 를 못 보고,
+#             선택은 옛 값을 커밋한다.
+#   수정 먼저: 수정 트랜잭션이 커밋 전이라 선택의 BEFORE 트리거가 옛 값을 읽어 커밋한다(FK 검사는
+#             FOR KEY SHARE 라 external_id 수정을 기다리지 않고, role_arn 수정은 기다리지만 그때는
+#             이미 옛 ARN 이 NEW 에 들어가 있다).
+# 트리거의 FOR SHARE 가 두 순서를 직렬화한다 — 이 테스트는 그 결과(사본 = 레지스트리)를 단정한다.
+
+_NEW_EXT = "ext-rotated"
+
+
+async def _waiting_on_a_lock(c, pid: int) -> bool:
+    return bool(
+        await c.fetchval(
+            "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $1", pid
+        )
+    )
+
+
+async def _run_against_open_tx(first, second, observer, first_sql, second_sql):
+    """first 를 열린 트랜잭션에서 실행하고, second 가 끝나거나 락에서 기다릴 때까지 돌린 뒤
+    first 를 커밋한다. second 가 락을 안 기다리면(=직렬화 없음) 그대로 먼저 끝난다."""
+    import asyncio
+
+    tx = first.transaction()
+    await tx.start()
+    try:
+        await first.execute(*first_sql)
+        task = asyncio.ensure_future(second.execute(*second_sql))
+        pid = second.get_server_pid()
+        for _ in range(200):
+            if task.done() or await _waiting_on_a_lock(observer, pid):
+                break
+            await asyncio.sleep(0.025)
+        await tx.commit()
+    except BaseException:
+        await tx.rollback()
+        raise
+    await asyncio.wait_for(task, timeout=10)
+
+
+@pytest.fixture
+async def conns(dsn, conn):
+    import asyncpg
+
+    a = await asyncpg.connect(dsn)
+    b = await asyncpg.connect(dsn)
+    try:
+        yield a, b
+    finally:
+        await a.close()
+        await b.close()
+
+
+@pytest.mark.parametrize("change", ["external_id", "role_arn"])
+@pytest.mark.parametrize("order", ["selection_first", "registry_edit_first"])
+async def test_a_selection_racing_a_registry_edit_ends_with_the_registry_value(
+    conn, conns, order, change
+):
+    selector, editor = conns
+    await _account(conn, "proof-a", ROLE_A, "ext-a")
+    await _alias(conn, "acctproof-1")
+    select_sql = ("UPDATE model.model_aliases SET account_name = 'proof-a' WHERE alias = 'acctproof-1'",)
+    if change == "external_id":
+        edit_sql = ("UPDATE model.aws_accounts SET external_id = $1 WHERE name = 'proof-a'", _NEW_EXT)
+    else:
+        edit_sql = ("UPDATE model.aws_accounts SET role_arn = $1 WHERE name = 'proof-a'", ROLE_B)
+
+    if order == "selection_first":
+        await _run_against_open_tx(selector, editor, conn, select_sql, edit_sql)
+    else:
+        await _run_against_open_tx(editor, selector, conn, edit_sql, select_sql)
+
+    registry = await conn.fetchrow(
+        "SELECT role_arn, external_id FROM model.aws_accounts WHERE name = 'proof-a'"
+    )
+    assert (registry["role_arn"], registry["external_id"]) != (ROLE_A, "ext-a"), "수정이 반영돼야 한다"
+    assert (await _row(conn, "acctproof-1"))[:3] == (
+        "proof-a",
+        registry["role_arn"],
+        registry["external_id"],
+    ), "사본이 레지스트리와 어긋난 채 커밋됐다 — 게이트웨이는 200 을 주며 옛 계정으로 서명한다"
+
+
+async def test_the_least_privilege_admin_role_can_still_select_an_account(conn):
+    """FOR SHARE 는 잠그는 테이블(aws_accounts)의 UPDATE 권한을 요구한다. model_aliases 를 쓰는
+    최소권한 롤(04_create_users.sql 의 admin_api_user)로 실제로 선택해 본다."""
+    await _account(conn, "proof-a", ROLE_A, "ext-a")
+    await _alias(conn, "acctproof-1")
+    async with conn.transaction():
+        await conn.execute("SET LOCAL ROLE admin_api_user")
+        await conn.execute(
+            "UPDATE model.model_aliases SET account_name = 'proof-a' WHERE alias = 'acctproof-1'"
+        )
+    assert (await _row(conn, "acctproof-1"))[:3] == ("proof-a", ROLE_A, "ext-a")
