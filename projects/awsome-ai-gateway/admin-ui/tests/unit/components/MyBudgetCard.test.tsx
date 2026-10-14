@@ -102,3 +102,28 @@ describe('MyBudgetCard', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 });
+
+describe('MyBudgetCard — team 을 아직 보내지 않는 admin-api (롤링 배포)', () => {
+  // admin-ui 가 admin-api 보다 먼저 배포되면 `/admin/my/budget` 응답에 `team` 이 없다. 예전 카드는
+  // `data.team.assigned` 를 바로 읽어 TypeError 로 카드 전체가 죽었다. 팀 정보가 없으면 team 이전과
+  // 같게 그린다(거부를 지어내지 않는다).
+  function legacy(budget: Partial<MyBudgetResponse['budget']>): MyBudgetResponse {
+    const out: Partial<MyBudgetResponse> = data(budget);
+    delete out.team;
+    return out as MyBudgetResponse;
+  }
+
+  it('개인 예산이 없으면 team 이전처럼 "팀 예산 적용" 으로 그린다', () => {
+    render(<MyBudgetCard data={legacy(UNSET)} />);
+    expect(screen.getByText('$12.34')).toBeInTheDocument();
+    expect(screen.getByText('개인 예산 미설정 (팀 예산 적용)')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('개인 예산이 있으면 한도·사용률을 그대로 그린다', () => {
+    render(<MyBudgetCard data={legacy({})} />);
+    expect(screen.getByText('한도: $100.00')).toBeInTheDocument();
+    expect(screen.getByText('25.0%')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+});

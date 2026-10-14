@@ -21,7 +21,8 @@ export interface MyBudgetResponse {
     policy: string | null;
   };
   // 게이트웨이는 팀 예산이 없으면(팀 미배정 포함) 개인 예산과 무관하게 거부한다(team_budget_unset).
-  team: {
+  // optional — 이 필드를 보내기 전의 admin-api 와 함께 도는 롤링 배포 동안에는 없다.
+  team?: {
     assigned: boolean;
     budget_configured: boolean;
   };

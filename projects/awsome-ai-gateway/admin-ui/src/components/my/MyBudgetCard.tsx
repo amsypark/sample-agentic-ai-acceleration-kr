@@ -28,9 +28,13 @@ export function MyBudgetCard({ data }: { data: MyBudgetResponse }) {
   // ⚠️ 게이트웨이는 **팀 예산이 없으면 거부한다**(gateway-proxy C-1: team_budget_unset — 팀 미배정
   //    사용자도 같다). 개인 예산이 있든 없든 그렇다. 예전 카드는 개인 예산이 없으면 무조건 "팀 예산
   //    적용" 이라고 말해, 실제로는 모든 요청이 거부되는 사용자에게 쓸 수 있는 것처럼 보였다.
-  const teamDenial = !data.team.assigned
+  //    `team` 은 optional 이다 — admin-ui 가 admin-api 보다 먼저 배포되면(롤링) 응답에 없다. 그때는 알 수
+  //    없으므로 team 이전과 같게 그린다(거부를 지어내지 않는다). 예전엔 `data.team.assigned` 가 TypeError.
+  const teamAssigned = data.team?.assigned ?? true;
+  const teamBudgetConfigured = data.team?.budget_configured ?? true;
+  const teamDenial = !teamAssigned
     ? '팀에 배정되지 않아 게이트웨이가 요청을 거부합니다(팀 예산 필요). 관리자에게 문의하세요.'
-    : !data.team.budget_configured
+    : !teamBudgetConfigured
       ? '팀 예산이 설정되지 않아 게이트웨이가 요청을 거부합니다. 관리자에게 문의하세요.'
       : null;
   // ⚠️ $0 한도는 사용률이 없다(서버가 null). HARD_BLOCK/SOFT_WARNING 은 막고(used >= 0) THROTTLE 은
