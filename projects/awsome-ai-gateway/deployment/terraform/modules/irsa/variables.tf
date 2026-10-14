@@ -111,10 +111,13 @@ variable "bedrock_account_assume_role_arns" {
 
   validation {
     # 역할 ARN 만. Bedrock ARN·사용자 ARN 도 apply 는 되지만 AssumeRole 이 불가능하고, 그
-    # 사실은 그 alias 를 처음 호출할 때까지 드러나지 않는다.
+    # 사실은 그 alias 를 처음 호출할 때까지 드러나지 않는다. 경로·이름은 IAM 문자 집합만 받는다 —
+    # "role/.+" 는 role/* · role/gw-* 를 통과시켰고, 그 값은 아래 statement 의 Resource 가 되어 그
+    # 계정의 (해당 접두사) 모든 역할로의 AssumeRole 을 연다. 파티션은 aws / aws-<소문자> 만.
+    # admin-api(schemas/models.py)·DB CHECK(0043/0044)·admin-ui 와 같은 문법이다.
     condition = alltrue([
       for a in var.bedrock_account_assume_role_arns :
-      can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$", a))
+      can(regex("^arn:aws(-[a-z]+)*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$", a))
     ])
     error_message = "각 항목은 IAM 역할 ARN 이어야 합니다: arn:aws:iam::<12자리 계정>:role/<이름> (와일드카드 불가)."
   }
