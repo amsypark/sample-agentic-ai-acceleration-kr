@@ -22,8 +22,10 @@
      쓰기 뒤에서 기다린다).
   7. init SQL 은 트리거를 새 설치(alembic_version 없음)와 이미 0046 이후인 DB 에만 만든다. 0046 에 닿기 전에
      멈춘 0042 DB 에서는 만들지 않으므로, 이전 admin-api 의 단일 슬롯 교체가 그대로 된다(대조군: 트리거가
-     있으면 그 교체가 커밋에서 거부된다). 0024 이전 DB 가 이 차트의 Job 으로 0046 에 닿는지는 실 alembic
-     이 필요해 CI pg-proof 잡의 "a DB below 0024" 스텝이 본다.
+     있으면 그 교체가 커밋에서 거부된다). alembic_version 은 alembic 과 같은 롤의 search_path 로 찾는다 — 롤
+     이름의 스키마에 있어도 같다(대조군: public 으로 못박은 판정은 그 0042 DB 를 새 설치로 보고 트리거를 만들어
+     슬롯 교체가 23514 로 거부됐다). 0024 이전 DB 가 이 차트의 Job 으로 0046 에 닿는지는 실 alembic 이 필요해
+     CI pg-proof 잡의 "a DB below 0024" 스텝이 본다.
   8. 0046 이 USER/TEAM 인덱스의 **이름을 그대로** 쓰는 이유: 이전 차트의 init SQL 이 0046 DB 에서 다시 돌아도
      no-op 이다(대조군: 그 이름이 없으면 같은 문장이 단일 슬롯을 조용히 되살린다).
 
@@ -722,14 +724,23 @@ async def test_rerunning_the_whole_init_sql_does_not_wait_behind_a_rate_limit_wr
 # ── 7. init SQL 이 트리거를 만드는 DB ────────────────────────────────────────────────────────
 
 
-async def _stamp(conn, version: str | None) -> None:
-    """alembic_version 을 그 리비전으로 만든다(None = 테이블 없음 — 새 설치)."""
-    await conn.execute("DROP TABLE IF EXISTS public.alembic_version")
+async def _stamp(conn, version: str | None, schema: str = "public") -> None:
+    """그 스키마의 alembic_version 을 그 리비전으로 만든다(None = 테이블 없음 — 새 설치)."""
+    await conn.execute(f'DROP TABLE IF EXISTS "{schema}".alembic_version')
     if version is not None:
         await conn.execute(
-            "CREATE TABLE public.alembic_version (version_num VARCHAR(32) PRIMARY KEY)"
+            f'CREATE TABLE "{schema}".alembic_version (version_num VARCHAR(32) PRIMARY KEY)'
         )
-        await conn.execute("INSERT INTO public.alembic_version VALUES ($1)", version)
+        await conn.execute(f'INSERT INTO "{schema}".alembic_version VALUES ($1)', version)
+
+
+async def _with_a_role_named_schema(conn) -> str:
+    """접속한 롤과 같은 이름의 스키마를 만들고 search_path 를 PostgreSQL 기본값(``"$user", public``)으로 둔다.
+    그 롤로 도는 alembic(version_table_schema 없음)은 alembic_version 을 이 스키마에 만든다."""
+    role = await conn.fetchval("SELECT current_user")
+    await conn.execute(f'CREATE SCHEMA "{role}"')
+    await conn.execute('SET search_path = "$user", public')
+    return role
 
 
 @pytest.mark.parametrize(
@@ -755,14 +766,14 @@ async def test_init_sql_installs_the_guard_only_on_a_fresh_install_or_at_0046(
         await conn.close()
 
 
-async def _as_a_0042_db(conn) -> None:
+async def _as_a_0042_db(conn, schema: str = "public") -> None:
     """init SQL 로 만든 DB 를 0042 의 모양으로 — 트리거·GLOBAL 인덱스 없음, 0024 의 단일 슬롯 인덱스,
     alembic_version 0042(이 차트의 Job 이 0046 에 닿기 전에 멈춘 DB 가 이렇다)."""
     await conn.execute("DROP TRIGGER rl_global_release_guard ON model.rate_limit_configs")
     await conn.execute("DROP INDEX model.uq_rate_limit_configs_global_active")
     await conn.execute("DROP INDEX model.uq_rate_limit_configs_active")
     await conn.execute(_executed_0024_index_sql("uq_rate_limit_configs_active"))
-    await _stamp(conn, "0042")
+    await _stamp(conn, "0042", schema)
 
 
 _MAIN_SLOT_SWAP = (  # main(이전 릴리스)의 GLOBAL upsert — alias 와 무관하게 활성 GLOBAL 행을 전부 비활성화
@@ -815,6 +826,78 @@ async def test_control_with_the_guard_on_a_0042_db_main_slot_swaps_are_refused(d
         await conn.execute(_release_guard_trigger_ddl())
         with pytest.raises(asyncpg.CheckViolationError, match="claude-opus-4-7"):
             await _main_slot_swap(conn)
+    finally:
+        await conn.close()
+    assert await _all(engine, _ACTIVE_GLOBAL) == [("claude-opus-4-7", 60, None)]
+
+
+@pytest.mark.parametrize(
+    "where, version, guard_installed",
+    [("role", "0042", False), ("role", None, True), ("public", "0045", False)],
+)
+async def test_init_sql_reads_alembic_version_where_alembic_writes_it(dsn, where, version, guard_installed):
+    """롤 이름의 스키마가 있으면 alembic 은 alembic_version 을 그쪽에 둔다. init SQL 도 같은 롤의 search_path
+    로 찾는다 — 그 0042 DB 는 새 설치가 아니고, 그 스키마가 비어 있으면 public 을 본다."""
+    import asyncpg
+
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        role = await _with_a_role_named_schema(conn)
+        await conn.execute("DROP TRIGGER IF EXISTS rl_global_release_guard ON model.rate_limit_configs")
+        await _stamp(conn, None)
+        await _stamp(conn, version, role if where == "role" else "public")
+        await conn.execute(_init_sql_0046_block())
+        installed = await conn.fetchval(
+            "SELECT count(*) FROM pg_trigger WHERE tgname = 'rl_global_release_guard'"
+        )
+        assert installed == (1 if guard_installed else 0), (where, version, installed)
+    finally:
+        await conn.close()
+
+
+def _public_qualified(block: str) -> str:
+    """예전 판정 — alembic_version 을 public 으로 못박았다. 대조군으로만 쓴다."""
+    out = block.replace("to_regclass('alembic_version')", "to_regclass('public.alembic_version')")
+    out = out.replace("FROM alembic_version ", "FROM public.alembic_version ")
+    assert out.count("public.alembic_version") == 2, "판정 문장을 못 찾았다"
+    return out
+
+
+async def test_a_role_schema_0042_db_keeps_main_slot_swaps(dsn, engine):
+    import asyncpg
+
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        role = await _with_a_role_named_schema(conn)
+        await _as_a_0042_db(conn, role)
+        await _global(engine, "claude-opus-4-7", rpm=60)
+        await conn.execute(_init_sql_0046_block())
+        assert await conn.fetchval(
+            "SELECT count(*) FROM pg_trigger WHERE tgname = 'rl_global_release_guard'"
+        ) == 0
+        await _main_slot_swap(conn)
+    finally:
+        await conn.close()
+    assert await _all(engine, _ACTIVE_GLOBAL) == [("claude-sonnet-4-6", 30, None)]
+
+
+async def test_control_a_public_qualified_lookup_takes_a_role_schema_0042_db_for_a_fresh_install(dsn, engine):
+    """대조군 — public 으로 못박은 판정은 롤 이름 스키마의 0042 DB 에 트리거를 만들고, 이전 admin-api 의 정상적인
+    슬롯 교체가 23514(check_violation)로 거부된다."""
+    import asyncpg
+
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        role = await _with_a_role_named_schema(conn)
+        await _as_a_0042_db(conn, role)
+        await _global(engine, "claude-opus-4-7", rpm=60)
+        await conn.execute(_public_qualified(_init_sql_0046_block()))
+        assert await conn.fetchval(
+            "SELECT count(*) FROM pg_trigger WHERE tgname = 'rl_global_release_guard'"
+        ) == 1
+        with pytest.raises(asyncpg.CheckViolationError, match="claude-opus-4-7") as refused:
+            await _main_slot_swap(conn)
+        assert refused.value.sqlstate == "23514"
     finally:
         await conn.close()
     assert await _all(engine, _ACTIVE_GLOBAL) == [("claude-opus-4-7", 60, None)]

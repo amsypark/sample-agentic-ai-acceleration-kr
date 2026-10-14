@@ -311,6 +311,10 @@ $$;
 --    인덱스는 이 블록이 0046 이전 DB 에도 만든다). 리비전 id 는 0 으로 채운 4자리 번호라 문자열 비교가 순서와
 --    같다. 그 모양이 아니면 만들지 않는다(그 DB 는 0046 이 만든다). CONSTRAINT TRIGGER 에는 IF NOT EXISTS 가
 --    없어 pg_trigger 로 본다.
+--    alembic_version 은 스키마를 붙이지 않고 search_path 로 찾는다. 이 SQL(psql, DB_MASTER_USER)과
+--    alembic(DB_MASTER_URL)은 같은 롤로 돌고 version_table_schema 를 정하지 않으므로, alembic 이 쓴 바로 그
+--    테이블이다 — 롤 이름의 스키마가 있으면 그쪽이고 없으면 public 이다. public 으로 못박으면 그런 DB 를 새
+--    설치로 오인해 0042 DB 에 트리거를 만든다.
 DO $$
 DECLARE
     prev_lock_timeout text := current_setting('lock_timeout');
@@ -331,11 +335,11 @@ BEGIN
             ON model.rate_limit_configs (COALESCE(model_alias, ''))
             WHERE is_active = true AND scope = 'GLOBAL';
     END IF;
-    IF to_regclass('public.alembic_version') IS NULL THEN
+    IF to_regclass('alembic_version') IS NULL THEN
         guard_wanted := true;  -- 새 설치: alembic 이 아직 돌지 않았다
     ELSE
         -- 동적 SQL — 테이블이 없는 DB 에서 이 문장이 미리 해석되지 않게 한다.
-        EXECUTE 'SELECT EXISTS (SELECT 1 FROM public.alembic_version '
+        EXECUTE 'SELECT EXISTS (SELECT 1 FROM alembic_version '
              || 'WHERE version_num ~ ''^[0-9]{4}$'' AND version_num >= ''0046'')'
             INTO guard_wanted;
     END IF;
