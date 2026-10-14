@@ -184,8 +184,8 @@ async def test_assume_role_once_per_target_with_the_external_id_and_session_name
 
 
 async def test_external_id_is_omitted_when_not_configured():
-    """None 이나 "" 로 보내지 않는다 — STS 는 빈 ExternalId 를 거부하고, ExternalId 를 요구하지
-    않는 신뢰 정책은 그 키가 있으면 거부한다."""
+    """None 이나 "" 로 보내지 않는다 — STS 의 ExternalId 는 최소 2자라 빈 값은 요청 검증에서
+    거부된다. 설정하지 않은 값은 키째 뺀다(앱 프로필 경로와 같은 규칙)."""
     sts, calls = _sts()
     await _provider(sts).credentials(AccountTarget(ROLE_ALIAS), session_name=SESSION_NAME_RUNTIME)
     assert "ExternalId" not in calls[0]
