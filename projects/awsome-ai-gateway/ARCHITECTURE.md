@@ -207,11 +207,11 @@ codex   → routing_profiles (backend=mantle, account_role_arn NULL, external_id
 
 MantleCredentialBroker.bearer_token(profile):
   cross-account(cowork): sts.assume_role(905 role, ExternalId=cowork-bedrock)  [859 gateway IRSA 신뢰]
-                           → temp creds (캐시 ~1h, refresh −300s skew, keyed by role_arn)
+                           → temp creds (캐시 ~1h, refresh −300s skew, keyed by (role_arn, ExternalId, gw-mantle))
   in-account(codex):    _in_account_creds — assume 없이 pod 자체 IRSA creds 직접 사용
   → BedrockTokenGenerator().get_token(creds, region)
       → bearer (캐시 30m, keyed by (cred_key, region), creds 만료 −60s 상한)
-        bearer 는 SigV4 regional-bound 이라 (role, region) 키잉
+        bearer 는 SigV4 regional-bound 이라 ((role, ExternalId, gw-mantle), region) 키잉
 adapter:
   cowork: MantleAdapter  → POST {endpoint}/v1/messages   (Anthropic Messages, model=anthropic.claude-opus-4-8)
   codex:  MantleOpenAIAdapter → POST {endpoint}/v1/responses (OpenAI Responses, GPT-5.5)
@@ -310,7 +310,10 @@ TEAM 미설정 = deny, USER 미설정 = pass. **per-app(client) 예산:** `PER_A
 INLINE (gateway-proxy, CostRecorder.finalize, ~1–2ms, fail-soft, DB I/O 없음):
   zero-usage guard(release TPM) → calculate_cost(input+output+cache_write[5m|1h]+cache_read)
   → budget_deduct Lua (user + team, returns threshold_triggered)
-  → settle_cost(CPM/CPH — 예약한 스코프·창의 키만, 스코프별 EVAL, TTL 없는 키를 만들지 않음) → settle_tpm
+  → settle_cost(CPM/CPH — 예약한 스코프·창의 키만, 스코프별 EVAL, TTL 없는 키를 만들지 않음)
+  → settle_tpm(예약한 스코프의 예약한 버킷만 — 한 번 회전했으면 prev, 그보다 오래면 쓰지 않음)
+  (거부된 요청은 정산 상태가 없다 — 뒤 스코프·비용 단계가 거부하면 enforce 가 그 요청의 TPM·비용 예약을
+   그 자리에서 되돌린다)
   → XADD cost:stream {CostStreamEntry(... client ...)}     (실패 시 CostStreamSpool 스풀링)
 
 OFFLOADED (cost-recorder-worker):
