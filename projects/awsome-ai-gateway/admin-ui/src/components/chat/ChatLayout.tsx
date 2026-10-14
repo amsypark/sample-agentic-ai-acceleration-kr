@@ -286,7 +286,8 @@ const TOOL_PROGRESS: Record<string, string> = {
   execute_python: 'Python 실행 중…',
 };
 
-function applyEvent(msg: ChatMessage, event: any): ChatMessage {
+/** 스트림 이벤트 1건을 assistant 메시지에 반영한다(순수 함수 — 테스트가 직접 부른다). */
+export function applyEvent(msg: ChatMessage, event: any): ChatMessage {
   switch (event.type) {
     case 'thinking':
       // 첫 토큰 전 "작업 중" 표시. 본문이 이미 있으면 무시(잡음 방지).
@@ -403,8 +404,10 @@ function applyEvent(msg: ChatMessage, event: any): ChatMessage {
         content,
         suggestions,
         pending: false,
-        costUsd: event.costUsd,
-        durationMs: event.durationMs,
+        // `?? msg.x` — done 프레임이 값을 싣지 않으면(구버전 admin-api, 비용 산출 불가) 기존 값을
+        // 지우지 않는다. 예전에는 undefined 로 덮어써 재구독/복원으로 채워진 값까지 날렸다.
+        costUsd: event.costUsd ?? msg.costUsd,
+        durationMs: event.durationMs ?? msg.durationMs,
         // tool_result 가 없는 도구(render_chart 는 chart 이벤트로만 결과 발행)는
         // running 으로 남아 "실행 중..." 이 영구 표시됨 — done 에서 일괄 완료 처리.
         toolCalls: (msg.toolCalls || []).map((c) =>

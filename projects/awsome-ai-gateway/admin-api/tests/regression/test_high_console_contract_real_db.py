@@ -17,6 +17,9 @@
      ``budget_configs.max_budget_usd NUMERIC(12,4)`` 와 **정확히 같은 경계**인지 — 스키마가
      통과시키는 최댓값은 컬럼이 받고, 스키마가 거부하는 최솟값은 컬럼도 거부한다(그 값이
      예전에는 스키마를 통과해 asyncpg overflow → 500 이 됐다).
+  4. 채팅 assistant 메시지 INSERT 가 ``duration_ms`` 를 실제 스키마(0005)에 쓰고, 그 값이 done
+     프레임의 ``durationMs`` 와 같다(⚠️ chat_agent 스키마는 migration 소유라 init SQL 로 만든
+     owned DB 에는 없다 — 이 테스트만 alembic head 의 PROOF_DSN DB 를 쓰고 만든 행을 지운다).
 
 실행::
 
@@ -601,3 +604,71 @@ async def test_schema_rejected_amounts_also_overflow_the_column(owned_dsn, amoun
         SetBudgetRequest(max_budget_usd=Decimal(amount))
     with pytest.raises(asyncpg.exceptions.NumericValueOutOfRangeError):
         await _insert_budget(owned_dsn, amount)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. 채팅 done 프레임의 durationMs ↔ chat_agent.messages.duration_ms
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _Body:
+    """botocore StreamingBody 대역 — AgentCore 가 흘리는 `data: <json>` 라인."""
+
+    def __init__(self, lines: list[bytes]) -> None:
+        self._lines = lines
+
+    def iter_lines(self, chunk_size: int = 1024):  # noqa: ARG002 - 시그니처 호환
+        yield from self._lines
+
+
+async def test_assistant_message_persists_the_done_frame_duration(monkeypatch):
+    import json as _json
+
+    import boto3
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.routers import chat_agent as m
+
+    engine = create_async_engine(PROOF_DSN)
+    sid = uuid.uuid4()
+    try:
+        async with engine.begin() as conn:
+            if await conn.scalar(text("SELECT to_regclass('chat_agent.messages')")) is None:
+                pytest.skip("chat_agent 스키마가 없다 — PROOF_DSN DB 에 alembic upgrade head 를 먼저")
+            await conn.execute(
+                text("INSERT INTO chat_agent.sessions (id, user_id) VALUES (:id, :uid)"),
+                {"id": sid, "uid": SEED_ADMIN_ID},
+            )
+
+        lines = [
+            f"data: {_json.dumps({'type': 'text', 'chunk': '답'})}".encode(),
+            f"data: {_json.dumps({'type': 'done', 'session_id': 's', 'phase': 4})}".encode(),
+        ]
+        client = type("C", (), {"invoke_agent_runtime": lambda self, **_k: {"response": _Body(lines)}})()
+        monkeypatch.setattr(boto3, "client", lambda *_a, **_k: client)
+        monkeypatch.setattr(m, "AsyncSessionLocal", async_sessionmaker(engine, expire_on_commit=False))
+
+        relay = m._StreamRelay()
+        await m._agentcore_producer(relay, str(sid), "질문")
+
+        done = [f.decode() for f in relay.frames if f.decode().startswith("event: done")]
+        assert len(done) == 1, relay.frames
+        frame_ms = _json.loads(done[0].split("data:", 1)[1].strip())["durationMs"]
+
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT content, duration_ms FROM chat_agent.messages "
+                        "WHERE session_id = :sid AND role = 'assistant'"
+                    ),
+                    {"sid": sid},
+                )
+            ).one()
+        assert row.content == "답"
+        assert row.duration_ms == frame_ms, "라이브 footer 와 복원 footer 가 다른 숫자를 보인다"
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(text("DELETE FROM chat_agent.sessions WHERE id = :id"), {"id": sid})
+        await engine.dispose()
