@@ -131,9 +131,13 @@ class BedrockAccountClientProvider:
                 if remember_failure:
                     raise AccountCredentialsUnavailable(target.role_arn, failed[1])
             try:
-                fresh = await self._assume(key, target, now, remember_failure=remember_failure)
+                fresh = await self._assume(key, target, remember_failure=remember_failure)
             except AccountCredentialsUnavailable:
-                if usable is None:
+                # ⚠️ 쓸 수 있는지는 실패한 **지금** 다시 본다. 위의 판단은 STS 호출 전 시각이라,
+                #    STS 가 실패하기까지 오래 걸리면(봇코어 기본 connect/read 60초 × 재시도) 그 사이
+                #    남은 시간이 _STALE_SERVE_MIN 아래로 내려갔거나 이미 만료된 자격증명을 돌려준다.
+                now = self._now()
+                if usable is None or usable.expires_at - _STALE_SERVE_MIN <= now:
                     raise
                 logger.warning(
                     "account_credentials_refresh_failed_serving_cached",
@@ -146,7 +150,7 @@ class BedrockAccountClientProvider:
             return fresh.creds, fresh.expires_at
 
     async def _assume(
-        self, key: _CredKey, target: AccountTarget, now: float, *, remember_failure: bool
+        self, key: _CredKey, target: AccountTarget, *, remember_failure: bool
     ) -> _CachedCreds:
         """호출자가 그 키의 lock 을 잡고 있어야 한다.
 
@@ -168,7 +172,11 @@ class BedrockAccountClientProvider:
             code = err.get("Error", {}).get("Code") if isinstance(err, dict) else None
             reason = f"AssumeRole failed: {code or type(exc).__name__}"
             if remember_failure:
-                self._failures[key] = (now + FAILURE_BACKOFF, reason)
+                # ⚠️ 실패를 **기록하는 지금**부터 센다 — 호출 전에 읽은 시각이 아니라. STS 가
+                #    실패하기까지 FAILURE_BACKOFF 보다 오래 걸리면 "시작 시각 + 30" 은 기록하는 순간
+                #    이미 지나 있다. 그러면 백오프가 한 번도 걸리지 않고, 이 키의 lock 뒤에 줄 선
+                #    요청이 저마다 STS 를 다시 불러 각자의 타임아웃을 차례로 기다린다.
+                self._failures[key] = (self._now() + FAILURE_BACKOFF, reason)
             logger.warning(
                 "account_credentials_assume_failed",
                 role_arn=target.role_arn,

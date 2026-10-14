@@ -22,12 +22,13 @@ import asyncio
 import datetime as dt
 import json
 import re
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from botocore.credentials import Credentials
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ConnectTimeoutError
 
 from app.providers.bedrock_adapter import BedrockAdapter
 from app.providers.bedrock_openai_adapter import BedrockOpenAIAdapter
@@ -816,6 +817,117 @@ async def test_a_refresh_failure_close_to_expiry_is_still_a_typed_failure():
     now[0] = 1000.0 + 3600 - 59
     with pytest.raises(AccountCredentialsUnavailable, match="Throttling"):
         await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+
+
+class _SlowFailingSTS:
+    """실패하기 전에 STS 안에서 ``seconds`` 초를 쓴다 — 제어 시계(``now``)를 그만큼 민다.
+
+    ``fail`` 이 꺼져 있으면 ``expires_at`` 에 끝나는 자격증명을 돌려준다. ``gate`` 를 주면 실패하기
+    전에 그 이벤트를 기다린다 — 다른 요청이 그 키의 lock 뒤에 줄 서게 하려고.
+    """
+
+    def __init__(self, now, *, seconds, expires_at=0.0, gate=None):
+        self.now = now
+        self.seconds = seconds
+        self.expires_at = expires_at
+        self.gate = gate
+        self.fail = True
+        self.calls: list[float] = []
+
+    def assume_role(self, **kw):
+        self.calls.append(self.now[0])
+        if not self.fail:
+            return {
+                "Credentials": {
+                    "AccessKeyId": f"ASIA{len(self.calls)}",
+                    "SecretAccessKey": "s",
+                    "SessionToken": "t",
+                    "Expiration": dt.datetime.fromtimestamp(self.expires_at, dt.UTC),
+                }
+            }
+        if self.gate is not None:
+            self.gate.wait(timeout=5)
+        self.now[0] += self.seconds
+        raise ConnectTimeoutError(endpoint_url="https://sts.us-east-1.amazonaws.com")
+
+
+async def test_a_slow_sts_failure_is_remembered_from_when_it_failed():
+    """STS 안에서 35초를 쓰고 실패하면(봇코어 기본 connect/read 타임아웃은 각 60초) 실패 기억은
+    실패한 시각(1035)부터 30초, 1065 까지다. 호출 전 시각(1000)부터 세면 기록하는 순간 이미 지난
+    1030 이 되어 백오프가 한 번도 걸리지 않는다."""
+    now = [1000.0]
+    sts = _SlowFailingSTS(now, seconds=35)
+    prov = _provider(sts, now=lambda: now[0])
+    t = AccountTarget(ROLE_ALIAS, "ext")
+    with pytest.raises(AccountCredentialsUnavailable, match="ConnectTimeoutError"):
+        await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    assert now[0] == 1035.0
+    for at in (1036.0, 1064.9):
+        now[0] = at
+        with pytest.raises(AccountCredentialsUnavailable):
+            await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    assert sts.calls == [1000.0], f"백오프 안에서 STS 를 다시 불렀다: {sts.calls}"
+    now[0] = 1065.0
+    with pytest.raises(AccountCredentialsUnavailable):
+        await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    assert sts.calls == [1000.0, 1065.0], "실패한 뒤 30초가 지나면 다시 시도한다"
+
+
+async def test_requests_queued_behind_a_slow_sts_failure_fail_fast():
+    """첫 요청이 STS 안에 있는 동안 같은 키의 lock 뒤에 줄 선 요청들은, 그 실패가 기록되면 STS 를
+    부르지 않고 곧바로 실패해야 한다. 기억이 이미 지난 시각으로 기록되면 줄 선 요청마다 STS 를
+    다시 불러 각자의 타임아웃을 차례로 기다린다 — n 번째 요청이 n × 35초를 기다린다."""
+    now = [1000.0]
+    gate = threading.Event()
+    sts = _SlowFailingSTS(now, seconds=35, gate=gate)
+    prov = _provider(sts, now=lambda: now[0])
+    t = AccountTarget(ROLE_ALIAS, "ext")
+
+    async def _request() -> str:
+        try:
+            await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+        except AccountCredentialsUnavailable:
+            return "failed"
+        return "served"
+
+    first = asyncio.create_task(_request())
+    for _ in range(200):  # 첫 요청이 STS 안에 들어갈 때까지
+        if sts.calls:
+            break
+        await asyncio.sleep(0.01)
+    queued = [asyncio.create_task(_request()) for _ in range(3)]
+    await asyncio.sleep(0.05)  # 세 요청이 그 키의 lock 을 기다린다
+    assert sts.calls == [1000.0] and not any(q.done() for q in queued)
+    gate.set()
+    assert await asyncio.gather(first, *queued) == ["failed"] * 4
+    assert sts.calls == [1000.0], f"줄 선 요청이 STS 를 다시 불렀다: {sts.calls}"
+    assert now[0] == 1035.0, "줄 선 요청은 STS 시간을 한 초도 더 쓰지 않는다"
+
+
+@pytest.mark.parametrize(
+    ("sts_seconds", "served"), [(0, True), (35, False)], ids=["fast-failure", "slow-failure"]
+)
+async def test_after_a_failed_refresh_cached_credentials_need_a_minute_left_when_it_failed(
+    sts_seconds, served
+):
+    """갱신이 실패해도 자격증명은 실패한 **그때** 60초 넘게 남아 있어야 돌려준다. 70초 남았을 때
+    STS 가 35초를 쓰고 실패하면 35초밖에 안 남는다 — 그 자격증명으로 시작한 호출이 도중에 만료될
+    수 있으므로 거절한다. 호출 전 시각으로 판단하면 그대로 돌려준다."""
+    now = [1000.0]
+    sts = _SlowFailingSTS(now, seconds=sts_seconds, expires_at=1000.0 + 3600)
+    sts.fail = False
+    prov = _provider(sts, now=lambda: now[0])
+    t = AccountTarget(ROLE_ALIAS, "ext")
+    first, expiry = await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    now[0] = expiry - 70  # 갱신 창 안, 70초 남음(_STALE_SERVE_MIN 60 초과)
+    sts.fail = True
+    if served:
+        creds, exp = await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+        assert creds is first and exp == expiry
+    else:
+        with pytest.raises(AccountCredentialsUnavailable, match="ConnectTimeoutError"):
+            await prov.credentials(t, session_name=SESSION_NAME_RUNTIME)
+    assert len(sts.calls) == 2
 
 
 async def test_a_profile_path_failure_does_not_block_an_alias_on_the_same_role():
