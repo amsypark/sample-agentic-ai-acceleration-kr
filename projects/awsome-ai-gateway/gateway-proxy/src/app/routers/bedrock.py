@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 
 import structlog
@@ -16,6 +15,7 @@ from app.observability.provider_metrics import (
     record_provider_request,
 )
 from app.schemas.domain import ProviderType
+from app.services import bg_tasks
 from app.services.fallback_loop import release_reservations
 from app.services.router_service import RouterService
 
@@ -250,17 +250,25 @@ async def _handle_bedrock(request: Request, model_id: str, path_suffix: str, str
                         cache_read_input_tokens=0,
                     )
                     duration_ms = int((time.monotonic() - start_time) * 1000)
-                    await cost_recorder.finalize(
-                        redis,
-                        auth_context,
-                        model_config,
-                        effective_usage,
-                        request_id,
-                        True,
-                        duration_ms,
-                        ttft_ms=duration_ms,
-                        rate_limit_state=rate_limit_state,
-                        downgraded_from=state.get("downgraded_from"),
+                    # ⚠️ 보호 태스크로 넘긴다(services/bg_tasks.py). 이 finally 는 종결 청크 직후의
+                    #    끊김과 취소 **그 자체** 때문에 돈다. 취소 때문에 도는 finally 안의 await 는
+                    #    그 자체가 다시 취소되므로(anyio level-triggered), 평범한 await 면 finalize
+                    #    가 예산 차감과 원장 XADD 사이에서 조용히 잘린다.
+                    await bg_tasks.spawn_shielded(
+                        cost_recorder.finalize(
+                            redis,
+                            auth_context,
+                            model_config,
+                            effective_usage,
+                            request_id,
+                            True,
+                            duration_ms,
+                            ttft_ms=duration_ms,
+                            rate_limit_state=rate_limit_state,
+                            downgraded_from=state.get("downgraded_from"),
+                        ),
+                        name="bedrock_passthrough_finalize",
+                        request_id=request_id,
                     )
 
         return StreamingResponse(
@@ -282,20 +290,28 @@ async def _handle_bedrock(request: Request, model_id: str, path_suffix: str, str
             record_provider_error(_pm, _pm_labels, status=status)
         if auth_context and (usage.input_tokens + usage.output_tokens) > 0:
             duration_ms = int((time.monotonic() - start_time) * 1000)
-            await cost_recorder.finalize(
-                redis,
-                auth_context,
-                model_config,
-                usage,
-                request_id,
-                False,
-                duration_ms,
-                ttft_ms=duration_ms,
-                rate_limit_state=rate_limit_state,
-                downgraded_from=state.get("downgraded_from"),
-                # Join key to the Bedrock model-invocation log record (adapter.invoke
-                # returns it in the headers dict; not forwarded to the client).
-                bedrock_request_id=(headers or {}).get("x-amzn-requestid"),
+            # 비스트리밍은 응답을 돌려주기 **전에** finalize 가 끝나므로 "본문을 받고 떠난
+            # 클라이언트" 창이 없다(그 race 는 StreamingResponse 전용). 그래도 보호하는 이유는
+            # 프로세스 셧다운이다 — 정상 경로에서는 지금과 똑같이 기다리고, 셧다운 취소가 차감과
+            # XADD 를 갈라놓지 못하며, 남은 것은 lifespan 의 bg_tasks.drain() 이 마저 끝낸다.
+            await bg_tasks.spawn_shielded(
+                cost_recorder.finalize(
+                    redis,
+                    auth_context,
+                    model_config,
+                    usage,
+                    request_id,
+                    False,
+                    duration_ms,
+                    ttft_ms=duration_ms,
+                    rate_limit_state=rate_limit_state,
+                    downgraded_from=state.get("downgraded_from"),
+                    # Join key to the Bedrock model-invocation log record (adapter.invoke
+                    # returns it in the headers dict; not forwarded to the client).
+                    bedrock_request_id=(headers or {}).get("x-amzn-requestid"),
+                ),
+                name="bedrock_nonstream_finalize",
+                request_id=request_id,
             )
         else:
             # ⚠️ finalize 를 타지 않는 경로다(상류 4xx/5xx, 또는 usage 가 비어 온 응답).

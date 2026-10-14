@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 
 from app.observability.provider_metrics import record_rate_limit_hit
 from app.schemas.domain import AuthContext, BudgetStatus, DegradationLevel, ModelConfigSchema
+from app.services.cost_recorder import resolve_tier_for_prompt_total
 from app.services.rate_limit_config_loader import (
     AllScopeLimits,
     ScopeLimits,
@@ -70,6 +71,70 @@ def _estimate_input_tokens(body: dict) -> int:
     except Exception:
         return _DEFAULT_MAX_OUTPUT
     return max(1, len(serialized.encode("utf-8")) // _BYTES_PER_TOKEN)
+
+
+#: 티어 판정에서 빼는 미디어 — AWS 가 해상도·길이 기반 토큰으로 세는 것만.
+_TOKENIZED_BY_SHAPE = ("image/", "audio/")
+
+
+def _is_shape_media(mime: object) -> bool:
+    return isinstance(mime, str) and mime.lower().startswith(_TOKENIZED_BY_SHAPE)
+
+
+def _base64_media_chars(node) -> int:
+    """티어 판정에서 뺄 base64 이미지·오디오 페이로드의 문자 수 합(base64 는 ASCII = 바이트 수).
+
+    ⚠️ 이미지·오디오만 뺀다. 문서(PDF 등)와 텍스트는 그 **내용**이 프롬프트 토큰으로 청구되므로
+       빼면 short 예약·long 청구가 된다 — MIME 을 보지 않고 data URL·``bytes``·base64 dict 를
+       전부 빼던 처음 구현에서 1MB PDF 가 33 티어 토큰이 됐다(리뷰 프로브로 실측).
+
+    잡는 모양:
+      · data URL ``data:image/*`` / ``data:audio/*`` — Responses ``input_image.image_url``,
+        Chat ``image_url.url``
+      · Chat ``input_audio.data`` (data URL 이 아닌 맨 base64)
+      · Anthropic ``{"type": "base64", "media_type": "image/*"|"audio/*", "data": ...}``
+    """
+    if isinstance(node, str):
+        if node.startswith("data:"):
+            head, sep, payload = node.partition(";base64,")
+            if sep and "," not in head and _is_shape_media(head[len("data:"):]):
+                return len(payload)
+        return 0
+    if isinstance(node, list):
+        return sum(_base64_media_chars(v) for v in node)
+    if not isinstance(node, dict):
+        return 0
+    total = 0
+    for key, value in node.items():
+        if (
+            key == "data"
+            and isinstance(value, str)
+            and node.get("type") == "base64"
+            and _is_shape_media(node.get("media_type"))
+        ):
+            total += len(value)
+        elif key == "input_audio" and isinstance(value, dict):
+            audio = value.get("data")
+            total += len(audio) if isinstance(audio, str) else 0
+        else:
+            total += _base64_media_chars(value)
+    return total
+
+
+def _tier_prompt_tokens(model_config: ModelConfigSchema, body: dict, estimated_input: int) -> int:
+    """272K 티어 **판정**에 쓰는 프롬프트 크기 — 예약량(``estimated_input``)은 바꾸지 않는다.
+
+    ⚠️ bytes/4 는 base64 이미지·오디오를 텍스트처럼 센다. AWS 는 그것을 해상도·길이 기반 수백~수천
+       토큰으로 세므로, ~1.1MB data URL 하나가 판정을 long 으로 밀어 CPM/CPH 를 2배로 잡고 멀티모달
+       요청에 거짓 429 를 낸다. 그래서 판정에서만 그 바이트를 뺀다(문서·텍스트는 빼지 않는다 —
+       ``_base64_media_chars``). 이미지 토큰은 세지 않으므로 임계 근처의 텍스트+이미지 요청은 short
+       로 볼 수 있다 — 예약은 추정이고 settle 이 차액을 맞춘다.
+
+    body 를 훑는 비용은 bytes/4 가 이미 long 일 때만 낸다(빼면 작아질 뿐이라 short 는 그대로).
+    """
+    if resolve_tier_for_prompt_total(estimated_input, model_config) != "long":
+        return estimated_input
+    return max(1, estimated_input - _base64_media_chars(body) // _BYTES_PER_TOKEN)
 
 
 def _apply_budget_throttle(
@@ -181,7 +246,12 @@ async def enforce_rate_limits(
         return _build_429(tpm_result, metrics)
 
     # CPM/CPH 체크 (Pre-reserve, FR-4.6 — USER+TEAM 2 스코프)
-    estimated_cost = _estimate_cost(model_config, estimated_input, max_output)
+    estimated_cost = _estimate_cost(
+        model_config,
+        estimated_input,
+        max_output,
+        tier_prompt_tokens=_tier_prompt_tokens(model_config, body, estimated_input),
+    )
     cost_result = await svc.reserve_cost(
         redis,
         user_id=auth_context.user_id,
@@ -205,17 +275,43 @@ async def enforce_rate_limits(
 
 
 def _estimate_cost(
-    model_config: ModelConfigSchema, estimated_input: int, max_output: int
+    model_config: ModelConfigSchema,
+    estimated_input: int,
+    max_output: int,
+    *,
+    tier_prompt_tokens: int | None = None,
 ) -> Decimal:
     """Pre-reserve용 보수적 비용 추정 (USD).
 
-    ``pricing.input_per_1k × input + pricing.output_per_1k × max_output`` 로
-    *과대* 예약. post-settle에서 실제 비용과의 차액이 환불됨.
+    ``input_per_1k × input + output_per_1k × max_output`` 로 *과대* 예약.
+    post-settle에서 실제 비용과의 차액이 환불됨.
     Cache 단가는 Pre-reserve 단계에서 판정 불가하므로 제외.
+
+    ⚠️ 272K long-context 티어(0038)를 반영한다. 빠뜨리면 이 함수의 존재 이유인 과대 예약
+       불변식이 깨진다: GPT-5.6 은 프롬프트가 임계를 넘는 순간 입력 2배·출력 1.5배로 청구되는데
+       short 단가로 예약하면 예약이 실제의 절반 수준이 된다. 예: gpt-5.6-terra 에 500K 프롬프트 +
+       max_output 4,000 → 예약 $1.1528 vs 실제 $2.2396(출력 2,000). CPM/CPH 가 $2 남은 사용자가
+       게이트를 통과한 뒤 한도를 넘긴다 — settle 이 사후에 차액을 맞추므로 원장은 정상으로 보인다.
+
+       판정은 ``cost_recorder.resolve_tier_for_prompt_total`` 에 위임한다(청구와 같은 함수).
+       ``estimated_input`` 은 body 전체 크기 기반이라 캐시 분해 전의 프롬프트 총량에 대응하고,
+       티어 판정이 쓰는 양(input + cache_read + cache_write)이 바로 그것이다.
+       ``tier_prompt_tokens`` 를 주면 판정에만 그 값을 쓴다(base64 미디어 제외 —
+       ``_tier_prompt_tokens``). 예약 크기는 언제나 ``estimated_input`` 이다.
     """
     pricing = model_config.pricing
-    input_cost = (Decimal(estimated_input) / Decimal(1000)) * pricing.input_per_1k
-    output_cost = (Decimal(max_output) / Decimal(1000)) * pricing.output_per_1k
+    tier_tokens = estimated_input if tier_prompt_tokens is None else tier_prompt_tokens
+    long_ctx = resolve_tier_for_prompt_total(tier_tokens, model_config) == "long"
+
+    def _rate(short_rate: Decimal, long_rate: Decimal | None) -> Decimal:
+        # long 단가가 비면 short 로 폴백 — calculate_cost 의 `_rate` 와 같은 fail-safe.
+        # 둘이 다르게 폴백하면 예약과 청구가 또 갈라진다.
+        return long_rate if (long_ctx and long_rate is not None) else short_rate
+
+    input_rate = _rate(pricing.input_per_1k, pricing.long_input_per_1k)
+    output_rate = _rate(pricing.output_per_1k, pricing.long_output_per_1k)
+    input_cost = (Decimal(estimated_input) / Decimal(1000)) * input_rate
+    output_cost = (Decimal(max_output) / Decimal(1000)) * output_rate
     return (input_cost + output_cost).quantize(Decimal("0.000001"))
 
 
