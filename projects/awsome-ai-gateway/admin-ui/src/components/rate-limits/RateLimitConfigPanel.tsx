@@ -63,23 +63,36 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
   const [usage, setUsage] = useState<RateLimitUsage | null>(null);
   const [confirmingRelease, setConfirmingRelease] = useState(false);
 
-  // node가 변경될 때 폼 값 초기화.
+  // 폼 값 초기화 — 다른 노드를 골랐거나 **이 노드 자신의 저장값**이 바뀌었을 때만.
   //
   // ⚠️ 프리필 조건은 "config 가 있는가" 가 아니라 **"이 노드 자신의 설정인가"** 다. 상속 중인
   //    USER 노드의 `config` 는 팀의 행(config.scope="TEAM", inherited_from 설정)이다. 그 값을
   //    입력칸에 채우면 CPH 하나만 고치려고 저장해도 PUT 이 전체 교체이므로 팀의 RPM/TPM 이 그대로
   //    **새 USER 행**에 굳는다. 이후 팀 한도를 올려도 그 사용자만 옛 값에 고정된다(gateway-proxy 는
   //    스코프별로 독립 집행한다). 상속값은 placeholder 로만 보여준다.
+  //
+  // ⚠️ effect 를 노드 **객체**에 걸면 안 된다. 선택은 id 로 매 렌더 새 트리에서 찾으므로(RateLimitTreeView)
+  //    트리를 새로 받을 때마다 같은 노드도 새 객체다. 409 분기는 새 슬롯 주인을 보여 주려고 트리를 다시
+  //    받는다(revalidatePath) — 객체에 걸려 있던 동안 409 가 나는 순간 입력값과 409 문구가 함께 지워졌다.
+  const nodeId = node?.id ?? null;
+  const inheritedFrom = node?.inherited_from ?? null;
+  const own = node?.config && !node.inherited_from ? node.config : null;
+  const ownRpm = own?.rpm != null ? String(own.rpm) : '';
+  const ownTpm = own?.tpm != null ? String(own.tpm) : '';
+  // cpm/cph 는 와이어에서 문자열(Decimal)이다 — String() 은 방어적 통일용.
+  const ownCpm = own?.cpm != null ? String(own.cpm) : '';
+  const ownCph = own?.cph != null ? String(own.cph) : '';
   useEffect(() => {
-    const own = node?.config && !node.inherited_from ? node.config : null;
-    setRpm(own?.rpm != null ? String(own.rpm) : '');
-    setTpm(own?.tpm != null ? String(own.tpm) : '');
-    // cpm/cph 는 와이어에서 문자열(Decimal)이다 — String() 은 방어적 통일용.
-    setCpm(own?.cpm != null ? String(own.cpm) : '');
-    setCph(own?.cph != null ? String(own.cph) : '');
+    setRpm(ownRpm);
+    setTpm(ownTpm);
+    setCpm(ownCpm);
+    setCph(ownCph);
+  }, [nodeId, inheritedFrom, ownRpm, ownTpm, ownCpm, ownCph]);
+  // 에러와 해제 확인은 **다른 노드를 골랐을 때만** 지운다 — 같은 노드의 새로고침은 409 문구를 지우면 안 된다.
+  useEffect(() => {
     setError(null);
     setConfirmingRelease(false);
-  }, [node]);
+  }, [nodeId]);
 
   // 실시간 RPM 사용량(§60.9) — node 선택 시 + 10초마다 폴링(gateway-proxy Redis 카운터).
   // GLOBAL 도 폴링한다: proxy 는 GLOBAL 스코프에도 카운터를 쌓고(키의 scope_id 자리는 리터럴

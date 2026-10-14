@@ -299,3 +299,62 @@ describe('실시간 사용량 표시', () => {
     expect(screen.getByText('12')).toBeInTheDocument();
   });
 });
+
+describe('트리를 새로 받아도(revalidatePath) 운영자의 입력과 에러가 남는다', () => {
+  // 409 분기(lib/actions/rate-limits.ts)는 새 슬롯 주인을 보여 주려고 revalidatePath 로 트리를 다시 받는다.
+  // 내용이 같아도 노드는 **새 객체**다(M1 이후 선택은 id 로 매 렌더 새 트리에서 찾는다). 예전 리셋 effect 는
+  // 노드 객체에 걸려 있어, 409 가 나는 순간 입력값과 409 문구가 함께 지워졌다.
+  const fresh = (id: string): RateLimitTreeNode => {
+    const copy = JSON.parse(JSON.stringify(nodes)) as RateLimitTreeNode[];
+    const all = copy.flatMap((n) => [n, ...n.children]);
+    return all.find((n) => n.id === id)!;
+  };
+  const CONFLICT = 'The GLOBAL limit is held by another model';
+
+  it('409 뒤 같은 노드의 새 객체로 다시 그려도 입력값과 409 문구가 그대로다', async () => {
+    const user = userEvent.setup();
+    setRateLimitAction.mockResolvedValue({ success: false, error: CONFLICT });
+    const { rerender } = render(
+      <RateLimitConfigPanel node={globalUncapped} globalSlotHolder={globalCapped} />,
+    );
+    await user.type(rpmInput(), '40');
+    await user.type(tpmInput(), '7000');
+    await user.click(screen.getByRole('button', { name: 'save' }));
+    await user.click(screen.getByRole('button', { name: 'releaseAndSave' }));
+    await waitFor(() => expect(screen.getByText(CONFLICT)).toBeInTheDocument());
+
+    rerender(
+      <RateLimitConfigPanel node={fresh(globalUncapped.id)} globalSlotHolder={fresh(globalCapped.id)} />,
+    );
+
+    expect(rpmInput()).toHaveValue(40);
+    expect(tpmInput()).toHaveValue(7000);
+    expect(screen.getByText(CONFLICT)).toBeInTheDocument();
+  });
+
+  it('다른 노드를 고르면 그 노드의 값으로 바뀌고 에러는 지워진다 (대조군)', async () => {
+    const user = userEvent.setup();
+    setRateLimitAction.mockResolvedValue({ success: false, error: CONFLICT });
+    const { rerender } = render(<RateLimitConfigPanel node={ownUserNode} />);
+    await user.clear(rpmInput());
+    await user.type(rpmInput(), '99');
+    await user.click(screen.getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(screen.getByText(CONFLICT)).toBeInTheDocument());
+
+    rerender(<RateLimitConfigPanel node={fresh(teamlessNode.id)} />);
+
+    expect(rpmInput()).toHaveValue(null);
+    expect(screen.queryByText(CONFLICT)).toBeNull();
+  });
+
+  it('같은 노드라도 자기 저장값이 바뀌면 입력칸이 새 값을 따른다 (대조군)', async () => {
+    const { rerender } = render(<RateLimitConfigPanel node={ownUserNode} />);
+    expect(rpmInput()).toHaveValue(60);
+
+    const saved = fresh(ownUserNode.id);
+    saved.config = { ...saved.config!, rpm: 61 };
+    rerender(<RateLimitConfigPanel node={saved} />);
+
+    expect(rpmInput()).toHaveValue(61);
+  });
+});
