@@ -1023,8 +1023,21 @@ async def test_cut_without_output_text_still_bills_the_prompt(dialect, kind):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("dialect", ["responses", "chat"])
-async def test_an_error_only_stream_does_not_bill_a_prompt(dialect):
+@pytest.mark.parametrize(
+    ("dialect", "frames"),
+    [
+        ("responses", _response_frames("error")),
+        # 어댑터가 실제로 내보내는 모양 — type 없는 {"error": ...}(bedrock_openai_adapter 의
+        # _error_chunk 가 responses 와이어에 내는 것, Mantle OpenAI 어댑터의 오류 청크).
+        (
+            "responses",
+            [json.dumps({"error": {"type": "provider_error", "message": "bad"}}).encode()],
+        ),
+        ("chat", _chat_frames("error")),
+    ],
+    ids=["responses-typed", "responses-untyped", "chat"],
+)
+async def test_an_error_only_stream_does_not_bill_a_prompt(dialect, frames):
     """대조군 — 오류 프레임만 온 스트림은 상류가 받지 않은 것이다. 프롬프트를 청구하면 안 된다."""
     from app.schemas.domain import TokenUsage
 
@@ -1032,7 +1045,6 @@ async def test_an_error_only_stream_does_not_bill_a_prompt(dialect):
         return TokenUsage(cache_read_input_tokens=555)
 
     helper = responses_sse_stream if dialect == "responses" else openai_sse_stream
-    frames = _response_frames("error") if dialect == "responses" else _chat_frames("error")
     usage = await _cut_after(helper, frames, prompt_hook)
     assert usage.cache_read_input_tokens == 0 and usage.input_tokens == 0, usage
 
