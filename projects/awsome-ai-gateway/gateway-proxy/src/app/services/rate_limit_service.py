@@ -24,6 +24,14 @@ _DEFAULT_WINDOW_MS = 60_000
 #: TPM 키의 TTL — rate_limit_tpm_check.lua 의 ``window_sec * 2 + 60`` (enforce 가 쓰는 60초 창).
 #: 정산이 이 수정 이전 코드가 TTL 없이 남긴 키를 만났을 때만 쓴다.
 _TPM_KEY_TTL = 60 * 2 + 60
+#: 정산 표지(한 예약을 한 번만 정산)의 수명. 같은 예약을 두 번 정산하려는 경우는 (1) 응답을
+#: 받지 못한 명령을 redis-py 가 재시도하는 것(밀리초~초)과 (2) 한 요청 안에서 정산 상태의
+#: 사본으로 다시 부르는 것(release 직후의 finalize, 1초 안)뿐이다 — 120초는 둘 다를 두 자릿수
+#: 넘게 덮는다. 메모리: 표지는 정산된 스코프마다 키 하나다. redis 7 실측 MEMORY USAGE 136바이트
+#: (비용 표지) ~ 200바이트(TPM 표지, 긴 모델 id), TPM 표지 6만 개를 실제로 만들면 used_memory
+#: +13.6MB. 초당 100요청 × 스코프 5(TPM 3 + 비용 2) 이면 120초 동안 6만 개 ≈ 12MB 가 상한이고
+#: 늘 그만큼 있다(만료가 생성과 같은 속도). 시간 단위로 두면 30배(≈ 360MB)가 된다.
+_SETTLE_MARKER_TTL = 120
 
 # 관측성 hook(deepdive Q50 Phase 3) — rate-limit eval 이 예외로 fail-open(집행 못함)
 # 한 횟수를 셀 카운터. main.py lifespan 에서 set_fail_open_metric(metrics.rl_fail_open_total)
@@ -35,6 +43,28 @@ def set_fail_open_metric(counter) -> None:
     """fail-open 카운터 주입(startup). counter 는 OTel Counter(.add(n, attrs))."""
     global _fail_open_counter
     _fail_open_counter = counter
+
+
+# 정산 이상 관측(카운터 주입은 fail-open 과 같은 방식): 음수가 될 뻔해 0 으로 둔 정산(clamped)과,
+# 이미 정산된 예약을 다시 정산하려 한 호출(duplicate). 둘 다 0 이 정상이다 — clamped 는 이 수정 이전
+# 코드가 남긴 음수나 축출, duplicate 는 재시도나 이중 정산 결함의 신호다.
+_settle_clamped_counter = None
+_settle_duplicate_counter = None
+
+
+def set_settle_metrics(*, clamped, duplicate) -> None:
+    """정산 이상 카운터 주입(startup). None 이면 no-op(테스트 등)."""
+    global _settle_clamped_counter, _settle_duplicate_counter
+    _settle_clamped_counter = clamped
+    _settle_duplicate_counter = duplicate
+
+
+def _count(counter, kind: str) -> None:
+    if counter is not None:
+        try:
+            counter.add(1, {"kind": kind})
+        except Exception:  # 메트릭 실패가 정산을 깨면 안 됨
+            pass
 
 
 def _record_fail_open(scope: str, limit_type: str) -> None:
@@ -133,6 +163,20 @@ async def _guarded_eval(redis, *args):
     return out
 
 
+def _cost_settle_marker(cpm_key: str, reservation_id: str) -> str:
+    """``rl:cost:<scope>:{<id>}:cpm:<ts>`` → ``rl:cost-settled:<scope>:{<id>}:<예약 id>``.
+
+    같은 hash tag({<id>}) = 정산 대상 키와 같은 슬롯이다. ``rl:cost:*`` 패턴에는 걸리지 않는다.
+    """
+    head = cpm_key.rsplit(":cpm:", 1)[0]  # rl:cost:<scope>:{<id>}
+    return "rl:cost-settled:" + head[len("rl:cost:"):] + ":" + reservation_id
+
+
+def _tpm_settle_marker(cur_key: str, reservation_id: str) -> str:
+    """``{SCOPE:id:model}:tpm:cur`` → ``{SCOPE:id:model}:tpm-settled:<예약 id>`` (같은 hash tag)."""
+    return cur_key.rsplit(":tpm:", 1)[0] + ":tpm-settled:" + reservation_id
+
+
 class RateLimitService:
     """Redis Lua 기반 멀티 스코프 Sliding Window RPM/TPM + CPM/CPH 비용 Rate Limit.
 
@@ -213,6 +257,7 @@ class RateLimitService:
         descriptors: list[ScopeDescriptor],
         reserved_tokens: int,
         window_sec: int = 60,
+        reservation_id: str | None = None,
     ) -> RateLimitResult:
         """TPM Sliding Window Counter Pre-reserve 체크 — **스코프별 1회 Lua 호출**.
 
@@ -241,6 +286,7 @@ class RateLimitService:
         now_sec = int(time.time())
         # rate_limit_tpm_check.lua 의 current_bucket = floor(now / window_sec) 와 같은 값.
         bucket = now_sec // window_sec
+        rid = reservation_id or uuid4().hex
         script = LuaScriptLoader.get("rate_limit_tpm_check")
 
         reserved: list[tuple[str, str, str, int]] = []
@@ -264,12 +310,14 @@ class RateLimitService:
                 logger.exception("rate_limit_tpm_scope_failed", scope=d.scope.value)
                 blocked = _on_eval_failure(d.scope.value, "tpm")
                 if blocked is not None:
-                    await self._settle_tpm_keys(redis, tuple(reserved), -int(reserved_tokens))
+                    await self._settle_tpm_keys(
+                        redis, tuple(reserved), -int(reserved_tokens), rid
+                    )
                     return blocked
                 continue
             if not result["allowed"]:
                 # 거부 — 앞 스코프에 이 요청이 넣은 예약을 되돌린다(docstring).
-                await self._settle_tpm_keys(redis, tuple(reserved), -int(reserved_tokens))
+                await self._settle_tpm_keys(redis, tuple(reserved), -int(reserved_tokens), rid)
                 return RateLimitResult(
                     allowed=False,
                     remaining=result.get("remaining", -1),
@@ -300,6 +348,7 @@ class RateLimitService:
         reserved_tokens: int,
         actual_tokens: int,
         reserved_keys: tuple[tuple[str, str, str, int], ...] | None = None,
+        reservation_id: str | None = None,
     ) -> None:
         """TPM 사후 정산 — 실제 토큰과 예약분의 차액을 **예약한 버킷에만** 반영한다 (설계 §D2).
 
@@ -316,6 +365,9 @@ class RateLimitService:
         ``descriptors`` 는 하위 호환으로 받기만 한다(조정할 키는 ``reserved_keys`` 뿐이다).
         ``reserved_keys`` 가 None(이 필드 이전 모양의 정산 상태)이면 아무것도 쓰지 않는다 —
         settle_cost 와 같은 이유다. 실패는 경고만 남긴다.
+
+        ``reservation_id`` = 예약할 때 정한 id(``rate_limit_state["reservation_id"]``). 같은 예약은
+        스크립트의 표지로 **한 번만** 정산된다 — 두 번째 호출은 아무것도 쓰지 않고 경고를 남긴다.
         """
         adjustment = int(actual_tokens) - int(reserved_tokens)
         if adjustment == 0:
@@ -323,10 +375,16 @@ class RateLimitService:
         if reserved_keys is None:
             logger.warning("tpm_settle_skipped_no_reserved_keys", adjustment=adjustment)
             return
-        await self._settle_tpm_keys(redis, reserved_keys, adjustment)
+        await self._settle_tpm_keys(
+            redis, reserved_keys, adjustment, reservation_id or uuid4().hex
+        )
 
     async def _settle_tpm_keys(
-        self, redis, reserved_keys: tuple[tuple[str, str, str, int], ...], adjustment: int
+        self,
+        redis,
+        reserved_keys: tuple[tuple[str, str, str, int], ...],
+        adjustment: int,
+        reservation_id: str,
     ) -> None:
         if not reserved_keys:
             return
@@ -338,7 +396,16 @@ class RateLimitService:
             pipe = redis.pipeline(transaction=False)
             for cur, prev, win, bucket in reserved_keys:
                 pipe.eval(
-                    script, 3, cur, prev, win, str(adjustment), str(bucket), str(_TPM_KEY_TTL)
+                    script,
+                    4,
+                    cur,
+                    prev,
+                    win,
+                    _tpm_settle_marker(cur, reservation_id),
+                    str(adjustment),
+                    str(bucket),
+                    str(_TPM_KEY_TTL),
+                    str(_SETTLE_MARKER_TTL),
                 )
             results = await pipe.execute(raise_on_error=False)
         except Exception:
@@ -352,7 +419,18 @@ class RateLimitService:
                     adjustment=adjustment,
                     error=type(res).__name__,
                 )
-            elif res == 0:
+                continue
+            applied, clamped, duplicate = (int(x) for x in res)
+            if duplicate:
+                # 같은 예약을 두 번째로 정산하려 했다 — 스크립트가 아무것도 쓰지 않았다.
+                logger.warning(
+                    "tpm_settle_duplicate", key=cur, reservation_id=reservation_id
+                )
+                _count(_settle_duplicate_counter, "tpm")
+            elif clamped:
+                logger.warning("tpm_settle_clamped", key=cur, adjustment=adjustment)
+                _count(_settle_clamped_counter, "tpm")
+            elif not applied:
                 # 예약한 버킷이 이미 회전해 나갔거나 만료됐다 — 아무것도 쓰지 않았다(스크립트 참조).
                 logger.debug(
                     "tpm_settle_bucket_gone", key=cur, bucket=bucket, adjustment=adjustment
@@ -424,6 +502,7 @@ class RateLimitService:
         team_id: str | None = None,
         team_cpm_limit: Decimal | None = None,
         team_cph_limit: Decimal | None = None,
+        reservation_id: str | None = None,
     ) -> CostLimitResult:
         """CPM/CPH 사전 예약 (USER + TEAM) — **스코프별 1회 Lua 호출**.
 
@@ -458,6 +537,7 @@ class RateLimitService:
         cpm_window_ts = (now // 60) * 60
         cph_window_ts = (now // 3600) * 3600
         script = LuaScriptLoader.get("cost_rate_limit_scope")
+        rid = reservation_id or uuid4().hex
 
         # 검사할 스코프 목록 (USER → TEAM fast-fail 순서). 한도 미설정 scope 는 스킵.
         scopes: list[tuple[str, str, str, Decimal, Decimal]] = []
@@ -488,7 +568,9 @@ class RateLimitService:
                 logger.exception("cost_reserve_scope_failed", scope=label, user_id=user_id)
                 _record_fail_open(label, "cost")
                 if _fail_closed():
-                    await self._settle_cost_keys(redis, tuple(reserved), -estimated_cost, user_id)
+                    await self._settle_cost_keys(
+                        redis, tuple(reserved), -estimated_cost, user_id, rid
+                    )
                     return CostLimitResult(
                         allowed=False,
                         scope=label,
@@ -499,7 +581,9 @@ class RateLimitService:
                 continue
             if not result["allowed"]:
                 # 거부 — 앞 스코프에 이 요청이 넣은 예약을 되돌린다(docstring).
-                await self._settle_cost_keys(redis, tuple(reserved), -estimated_cost, user_id)
+                await self._settle_cost_keys(
+                    redis, tuple(reserved), -estimated_cost, user_id, rid
+                )
                 return CostLimitResult(
                     allowed=False,
                     scope=result.get("scope"),
@@ -535,6 +619,7 @@ class RateLimitService:
         reserved_cost: Decimal,
         team_id: str | None = None,
         reserved_keys: tuple[tuple[str, str], ...] | None = None,
+        reservation_id: str | None = None,
     ) -> None:
         """CPM/CPH 사후 정산 — 실제 비용과 예약분의 차액을 **예약한 키에만** 반영한다.
 
@@ -562,6 +647,12 @@ class RateLimitService:
         그 대가는 그 예약이 창 끝까지 남는 것(과잉제한, 최대 cpm 1분·cph 1시간)이다. 정산 상태는
         요청을 받은 프로세스 안에만 있으므로(라우터 → finalize / release_reservations), 이 모양은
         이 코드가 만든 예약에서는 생기지 않는다.
+
+        ``reservation_id`` = 예약할 때 정한 id(``rate_limit_state["reservation_id"]``). 같은 예약은
+        스크립트의 표지로 **한 번만** 정산된다. 두 번째 호출 — redis-py 가 응답을 못 받은
+        파이프라인을 다시 보내는 경우, 정산 상태의 사본으로 다시 부르는 경우 — 은 아무것도 쓰지
+        않고 경고를 남긴다. 예전에는 0 하한이 이중 환불을 가렸다: 같은 창 키에 다른 요청의 예약이
+        있으면 그것을 조용히 깎았고(실측 0.031337 → 0.019337), 음수도 로그도 남지 않았다.
         """
         adjustment = actual_cost - reserved_cost
         if adjustment == Decimal("0"):
@@ -574,10 +665,17 @@ class RateLimitService:
             )
             return
 
-        await self._settle_cost_keys(redis, reserved_keys, adjustment, user_id)
+        await self._settle_cost_keys(
+            redis, reserved_keys, adjustment, user_id, reservation_id or uuid4().hex
+        )
 
     async def _settle_cost_keys(
-        self, redis, reserved_keys: tuple[tuple[str, str], ...], adjustment: Decimal, user_id: str
+        self,
+        redis,
+        reserved_keys: tuple[tuple[str, str], ...],
+        adjustment: Decimal,
+        user_id: str,
+        reservation_id: str,
     ) -> None:
         """예약한 스코프마다 cost_settle_scope EVAL 한 번(정산·되돌리기 공용)."""
         if not reserved_keys:
@@ -589,7 +687,15 @@ class RateLimitService:
             script = LuaScriptLoader.get("cost_settle_scope")
             pipe = redis.pipeline(transaction=False)
             for cpm_key, cph_key in reserved_keys:
-                pipe.eval(script, 2, cpm_key, cph_key, str(adjustment))
+                pipe.eval(
+                    script,
+                    3,
+                    cpm_key,
+                    cph_key,
+                    _cost_settle_marker(cpm_key, reservation_id),
+                    str(adjustment),
+                    str(_SETTLE_MARKER_TTL),
+                )
             results = await pipe.execute(raise_on_error=False)
         except Exception:
             logger.warning("cost_settle_failed", user_id=user_id, adjustment=str(adjustment))
@@ -603,12 +709,24 @@ class RateLimitService:
                     adjustment=str(adjustment),
                     error=type(res).__name__,
                 )
-            elif isinstance(res, list | tuple) and 0 in [int(x) for x in res]:
+                continue
+            applied_cpm, applied_cph, clamped, duplicate = (int(x) for x in res)
+            if duplicate:
+                # 같은 예약을 두 번째로 정산하려 했다 — 스크립트가 아무것도 쓰지 않았다.
+                logger.warning(
+                    "cost_settle_duplicate", key=cpm_key, reservation_id=reservation_id
+                )
+                _count(_settle_duplicate_counter, "cost")
+                continue
+            if clamped:
+                logger.warning("cost_settle_clamped", key=cpm_key, adjustment=str(adjustment))
+                _count(_settle_clamped_counter, "cost")
+            if not (applied_cpm and applied_cph):
                 # 예약한 창의 키가 이미 만료됐다 — 그 키는 조정하지 않았다(스크립트 docstring).
                 logger.debug(
                     "cost_settle_window_expired",
                     key=cpm_key,
-                    applied=[int(x) for x in res],
+                    applied=[applied_cpm, applied_cph],
                     adjustment=str(adjustment),
                 )
 

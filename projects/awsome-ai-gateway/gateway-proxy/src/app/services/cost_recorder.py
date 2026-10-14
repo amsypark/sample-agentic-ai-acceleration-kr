@@ -201,6 +201,7 @@ class CostRecorder:
                         rate_limit_state.get("tpm_reserved", 0),
                         0,  # actual=0 → 전액 환불
                         reserved_keys=rate_limit_state.get("tpm_reserved_keys"),
+                        reservation_id=rate_limit_state.get("reservation_id"),
                     )
                 except Exception:
                     logger.warning(
@@ -219,6 +220,7 @@ class CostRecorder:
                             reserved_cost=reserved_cost,
                             team_id=str(auth_context.team_id) if auth_context.team_id else None,
                             reserved_keys=rate_limit_state.get("cost_reserved_keys"),
+                            reservation_id=rate_limit_state.get("reservation_id"),
                         )
                     except Exception:
                         logger.warning(
@@ -353,6 +355,7 @@ class CostRecorder:
                     reserved_cost=cost_reserved,
                     team_id=auth_context.team_id,
                     reserved_keys=(rate_limit_state or {}).get("cost_reserved_keys"),
+                    reservation_id=(rate_limit_state or {}).get("reservation_id"),
                 )
             except Exception:
                 logger.warning("cost_settle_failed", user_id=auth_context.user_id)
@@ -372,6 +375,7 @@ class CostRecorder:
                     tpm_reserved,
                     actual_tpm,
                     reserved_keys=rate_limit_state.get("tpm_reserved_keys"),
+                    reservation_id=rate_limit_state.get("reservation_id"),
                 )
             except Exception:
                 logger.warning("tpm_settle_failed", user_id=auth_context.user_id)

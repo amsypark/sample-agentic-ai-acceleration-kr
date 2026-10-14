@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from uuid import uuid4
 
 import structlog
 from fastapi.responses import JSONResponse
@@ -181,6 +182,7 @@ async def enforce_rate_limits(
             - ``tpm_reserved_keys``: 예약한 스코프마다 (cur, prev, window 키, 버킷 번호)
             - ``cost_reserved``: Decimal (예약한 키가 없으면 0)
             - ``cost_reserved_keys``: 예약한 스코프마다 (cpm 키, cph 키)
+            - ``reservation_id``: 이 예약의 id(정산 표지 — 한 번만 정산)
     """
     if redis is None:
         # Redis 다운 — fail-open (NFR-2.4). Middleware의 in-memory fallback이 처리 중.
@@ -229,6 +231,10 @@ async def enforce_rate_limits(
     )
 
     svc = RateLimitService()
+    # 이 요청의 예약 id — TPM·비용 정산이 같은 예약을 한 번만 반영하는 표지의 이름이다
+    # (settle_* 참조). 요청 id 가 아니라 enforce 호출마다 새로 만든다: 폴백 루프는 후보마다
+    # enforce 를 다시 부르고, 같은 비용 창 키에 후보마다의 예약이 따로 들어간다.
+    reservation_id = uuid4().hex
 
     # RPM 체크 (요청 수)
     rpm_result = await svc.check_multi_scope_rpm(
@@ -246,7 +252,7 @@ async def enforce_rate_limits(
     )
 
     tpm_result = await svc.check_multi_scope_tpm(
-        redis, descriptors, reserved_tokens=reserved
+        redis, descriptors, reserved_tokens=reserved, reservation_id=reservation_id
     )
     if not tpm_result.allowed:
         return _build_429(tpm_result, metrics)
@@ -267,12 +273,20 @@ async def enforce_rate_limits(
         team_id=auth_context.team_id,
         team_cpm_limit=limits.team.cpm,
         team_cph_limit=limits.team.cph,
+        reservation_id=reservation_id,
     )
     if not cost_result.allowed:
         # 이 요청은 거부된다 — 위에서 넣은 TPM 예약을 되돌린다. 거부된 요청은 정산 상태를 받지 않아
         # 다른 곳에서는 되돌릴 수 없고, 남기면 그 분(가중 추정으로 약 2분) 동안 과잉제한한다.
         # 비용 쪽 앞 스코프의 예약은 reserve_cost 가 이미 되돌렸다.
-        await svc.settle_tpm(redis, [], reserved, 0, reserved_keys=tpm_result.reserved_keys)
+        await svc.settle_tpm(
+            redis,
+            [],
+            reserved,
+            0,
+            reserved_keys=tpm_result.reserved_keys,
+            reservation_id=reservation_id,
+        )
         return _build_cost_429(cost_result, metrics)
 
     # 통과 — settle용 정보 주입
@@ -284,6 +298,8 @@ async def enforce_rate_limits(
         "cost_reserved": cost_result.reserved_cost,
         # 실제로 예약한 스코프·창의 키. 비용 정산은 이 키만 조정한다(RateLimitService.settle_cost).
         "cost_reserved_keys": cost_result.reserved_keys,
+        # 이 예약의 id — 정산·되돌리기는 이 id 의 표지로 한 번만 반영된다.
+        "reservation_id": reservation_id,
     }
     return None
 

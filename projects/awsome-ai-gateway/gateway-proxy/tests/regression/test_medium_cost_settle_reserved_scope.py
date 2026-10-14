@@ -58,6 +58,7 @@ from types import SimpleNamespace
 import pytest
 from structlog.testing import capture_logs
 
+import app
 from app.schemas.domain import (
     ApiFormat,
     AuthContext,
@@ -76,6 +77,9 @@ from app.services.rate_limit_config_loader import AllScopeLimits, ScopeLimits
 from app.services.rate_limit_enforcement import enforce_rate_limits
 
 _SRC = Path(__file__).resolve().parents[2] / "src" / "app"
+#: 테스트하는 패키지 자신의 Lua — ``pytest -o pythonpath=<다른 트리>/src`` 로 다른 코드를 돌리면 그
+#: 트리의 스크립트도 같이 쓴다(대조군이 정산 스크립트까지 그 트리 것이어야 한다).
+_SCRIPTS = Path(app.__file__).resolve().parent / "redis_scripts"
 REDIS_PROOF_URL = os.environ.get("REDIS_PROOF_URL")
 REDIS_CLUSTER_URL = os.environ.get("REDIS_CLUSTER_URL")
 
@@ -109,7 +113,7 @@ def _client(kind: str):
 async def real_redis(request):
     """실 Redis — 단일 노드(REDIS_PROOF_URL)와 진짜 클러스터(REDIS_CLUSTER_URL)에서 한 번씩."""
     client = _client(request.param)
-    LuaScriptLoader.load_all(_SRC / "redis_scripts")
+    LuaScriptLoader.load_all(_SCRIPTS)
     try:
         yield client
     finally:
@@ -119,7 +123,7 @@ async def real_redis(request):
 @pytest.fixture
 async def cluster_redis():
     client = _client("cluster")
-    LuaScriptLoader.load_all(_SRC / "redis_scripts")
+    LuaScriptLoader.load_all(_SCRIPTS)
     try:
         yield client
     finally:
@@ -576,4 +580,54 @@ async def test_cluster_rejects_a_two_scope_settle(cluster_redis, monkeypatch):
         for key in (u_cpm, u_cph, t_cpm, t_cph):
             assert float(_text(await r.get(key))) == pytest.approx(_reserved(state)), key
     finally:
+        await _cleanup(r, auth)
+
+
+class _CounterSpy:
+    """OTel Counter 대역 — add(1, {"kind": ...}) 를 센다(정산 이상 카운터 배선 확인용)."""
+
+    def __init__(self) -> None:
+        self.kinds: list[str] = []
+
+    def add(self, n, attrs=None) -> None:
+        self.kinds.extend([(attrs or {}).get("kind")] * n)
+
+
+async def test_a_negative_counter_left_by_the_old_settlement_is_clamped_and_counted(
+    real_redis, monkeypatch
+):
+    """이 수정 이전 정산이 지금 창에 남긴 음수·TTL 없는 키(−0.05) 위에서 예약하고 환불하면,
+    결과가 음수가 되는 대신 0 이 되고 TTL 을 갖는다 — 그리고 그 0 하한은 **조용하지 않다**:
+    경고 로그와 ``gateway_rl_settle_clamped_total{kind=cost}`` 가 남는다. 남은 음수는 그 창
+    동안 남의 한도를 빌려 준다.
+    """
+    from app.services import rate_limit_service as rls
+
+    r = real_redis
+    auth = _auth()
+    clamped, duplicate = _CounterSpy(), _CounterSpy()
+    rls.set_settle_metrics(clamped=clamped, duplicate=duplicate)
+    await _clear_of_window_edge()
+    now = int(time.time())
+    legacy = [
+        f"rl:cost:user:{{{auth.user_id}}}:cpm:{(now // 60) * 60}",
+        f"rl:cost:user:{{{auth.user_id}}}:cph:{(now // 3600) * 3600}",
+    ]
+    try:
+        for key in legacy:
+            await r.set(key, "-0.05")  # 옛 정산이 남긴 모양: 음수, TTL 없음
+        state, keys = await _reserve(monkeypatch, r, auth, user=True, team=False)
+        assert keys == set(legacy)
+        with capture_logs() as logs:
+            await _finalize(r, auth, state, TokenUsage())
+
+        keyspace = await _cost_keyspace(r)
+        _assert_no_ttl_less_or_negative(keyspace)
+        assert all(v[0] == 0.0 for v in _of(keyspace, auth).values()), _of(keyspace, auth)
+        assert [e["event"] for e in logs if e.get("event") == "cost_settle_clamped"] == [
+            "cost_settle_clamped"
+        ]
+        assert clamped.kinds == ["cost"] and duplicate.kinds == []
+    finally:
+        rls.set_settle_metrics(clamped=None, duplicate=None)
         await _cleanup(r, auth)

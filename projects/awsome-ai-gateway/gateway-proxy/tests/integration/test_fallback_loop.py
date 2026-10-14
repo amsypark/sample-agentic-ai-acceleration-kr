@@ -233,7 +233,9 @@ class TestFallsBackOn502ThenSucceeds:
             }
             return None
 
-        async def _fake_settle_tpm(redis, descriptors, reserved, actual, reserved_keys=None):
+        async def _fake_settle_tpm(
+            redis, descriptors, reserved, actual, reserved_keys=None, reservation_id=None
+        ):
             settle_tpm_calls.append(
                 {
                     "descriptors": descriptors,
@@ -244,7 +246,14 @@ class TestFallsBackOn502ThenSucceeds:
             )
 
         async def _fake_settle_cost(
-            redis, *, user_id, actual_cost, reserved_cost, team_id, reserved_keys=None
+            redis,
+            *,
+            user_id,
+            actual_cost,
+            reserved_cost,
+            team_id,
+            reserved_keys=None,
+            reservation_id=None,
         ):
             settle_cost_calls.append(
                 {

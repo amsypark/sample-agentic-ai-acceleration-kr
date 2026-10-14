@@ -174,7 +174,9 @@ async def test_finalize_zero_usage_only_settles_tpm_ki08(
     assert pipe.incrby.call_count == 0
     assert pipe.eval.call_count == 2
     for call in pipe.eval.call_args_list:
-        assert call.args[1] == 3 and call.args[5:7] == ("-5000", "29000000")
+        # script, 4, cur, prev, window, 정산 표지, 차액, 예약 버킷, TTL, 표지 TTL
+        assert call.args[1] == 4 and call.args[6:8] == ("-5000", "29000000")
+        assert ":tpm-settled:" in call.args[5]
     # budget_deduct Lua / XADD 모두 호출 안 됨
     mock_redis.eval.assert_not_called()
     mock_redis.xadd.assert_not_called()

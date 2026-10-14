@@ -235,6 +235,7 @@ async def release_reservations(
                 tpm_reserved,
                 0,
                 reserved_keys=rls.get("tpm_reserved_keys"),
+                reservation_id=rls.get("reservation_id"),
             )
         except Exception:
             logger.warning("fallback_unwind_tpm_failed")
@@ -249,6 +250,7 @@ async def release_reservations(
                 reserved_cost=cost_reserved,
                 team_id=str(auth_context.team_id) if auth_context.team_id else None,
                 reserved_keys=rls.get("cost_reserved_keys"),
+                reservation_id=rls.get("reservation_id"),
             )
         except Exception:
             logger.warning("fallback_unwind_cost_failed")

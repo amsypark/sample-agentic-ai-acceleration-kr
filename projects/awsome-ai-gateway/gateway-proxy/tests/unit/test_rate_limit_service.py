@@ -548,12 +548,15 @@ async def test_settle_tpm_refund(mock_redis):
     )
     svc = RateLimitService()
     await svc.settle_tpm(
-        mock_redis, descriptors, reserved_tokens=5000, actual_tokens=3500, reserved_keys=keys
+        mock_redis, descriptors, reserved_tokens=5000, actual_tokens=3500, reserved_keys=keys,
+        reservation_id="rid-1",
     )
     pipe = mock_redis.pipeline.return_value
     assert pipe.incrby.call_count == 0
     assert [c.args[2:] for c in pipe.eval.call_args_list] == [
-        (cur, prev, win, "-1500", "29000000", "180") for cur, prev, win, _b in keys
+        (cur, prev, win, cur.replace(":tpm:cur", ":tpm-settled:rid-1"), "-1500", "29000000",
+         "180", "120")
+        for cur, prev, win, _b in keys
     ]
     pipe.execute.assert_awaited_once()
 
@@ -768,12 +771,13 @@ async def test_settle_cost_evals_each_reserved_scope_once(mock_redis):
         reserved_cost=Decimal("0.010"),
         team_id="t1",
         reserved_keys=(_USER_KEYS, _TEAM_KEYS),
+        reservation_id="rid-1",
     )
     pipe = mock_redis.pipeline.return_value
     calls = [c.args for c in pipe.eval.call_args_list]
     assert calls == [
-        ("-- mock", 2, *_USER_KEYS, "-0.007"),
-        ("-- mock", 2, *_TEAM_KEYS, "-0.007"),
+        ("-- mock", 3, *_USER_KEYS, "rl:cost-settled:user:{u1}:rid-1", "-0.007", "120"),
+        ("-- mock", 3, *_TEAM_KEYS, "rl:cost-settled:team:{t1}:rid-1", "-0.007", "120"),
     ]
     pipe.incrbyfloat.assert_not_called()  # 키를 직접 만들 수 있는 INCRBYFLOAT 는 쓰지 않는다
     pipe.execute.assert_awaited_once()
@@ -1004,8 +1008,9 @@ async def test_a_later_scope_denial_releases_the_earlier_reservations(mock_redis
     assert not r.allowed and r.reserved_cost == Decimal("0")
     released = [c.args for c in mock_redis.pipeline.return_value.eval.call_args_list]
     assert len(released) == 1
-    script, numkeys, cpm_key, cph_key, adj = released[0]
-    assert (script, numkeys, adj) == ("-- cost_settle_scope", 2, "-0.5")
+    script, numkeys, cpm_key, cph_key, marker, adj, _marker_ttl = released[0]
+    assert (script, numkeys, adj) == ("-- cost_settle_scope", 3, "-0.5")
+    assert marker.startswith("rl:cost-settled:user:{u1}:")
     assert cpm_key.startswith("rl:cost:user:{u1}:cpm:")
     assert cph_key.startswith("rl:cost:user:{u1}:cph:")
 
@@ -1022,5 +1027,5 @@ async def test_a_later_scope_denial_releases_the_earlier_reservations(mock_redis
     assert not t.allowed and t.reserved_keys == ()
     released = [c.args for c in mock_redis.pipeline.return_value.eval.call_args_list]
     assert len(released) == 1
-    assert released[0][0] == "-- rate_limit_tpm_settle" and released[0][1] == 3
-    assert released[0][2] == "{USER:u1:m1}:tpm:cur" and released[0][5] == "-500"
+    assert released[0][0] == "-- rate_limit_tpm_settle" and released[0][1] == 4
+    assert released[0][2] == "{USER:u1:m1}:tpm:cur" and released[0][6] == "-500"

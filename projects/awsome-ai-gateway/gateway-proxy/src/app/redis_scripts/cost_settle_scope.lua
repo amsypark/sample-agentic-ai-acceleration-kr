@@ -11,7 +11,13 @@
 --
 -- KEYS[1] = rl:cost:<scope>:{<scope_id>}:cpm:<예약 때의 window_ts>
 -- KEYS[2] = rl:cost:<scope>:{<scope_id>}:cph:<예약 때의 window_ts>
+-- KEYS[3] = rl:cost-settled:<scope>:{<scope_id>}:<예약 id>   (정산 표지, 같은 hash tag)
 -- ARGV[1] = adjustment (USD, actual - reserved. 음수 = 환불)
+-- ARGV[2] = 표지 TTL (초)
+--
+-- 한 예약은 **한 번만** 정산된다. 표지를 SET NX 로 먼저 세우고, 이미 있으면(같은 예약을 두 번째로 정산 —
+-- 응답을 못 받은 명령을 클라이언트가 재시도했거나, 정산 상태의 사본으로 다시 부른 경우) 아무것도 쓰지
+-- 않는다. 확인과 표지와 조정이 한 EVAL 이라 사이에 끼어들 틈이 없다.
 --
 -- 키마다:
 --   * 키가 없으면 **아무것도 쓰지 않는다**(키를 만들지 않는다). 예약한 키가 없어지는 경우는 TTL 만료
@@ -27,11 +33,18 @@
 -- 증분은 예약과 같은 경로(tonumber → redis.call 의 숫자 인자)로 넘긴다. 예약액 전액을 환불하면 두 증분이
 -- 같은 문자열로 직렬화돼 카운터가 정확히 원래 값으로 돌아간다.
 --
--- Returns: {cpm_applied, cph_applied}  (1 = 조정함, 0 = 키 없음 → 건너뜀)
+-- Returns: {cpm_applied, cph_applied, clamped, duplicate}
+--   applied 1 = 조정함, 0 = 키 없음 → 건너뜀. clamped 1 = 어느 키가 음수가 될 뻔해 0 으로 뒀다(호출자가
+--   로그·카운트한다 — 조용히 넘기지 않는다). duplicate 1 = 이미 정산된 예약이라 아무것도 하지 않았다.
+
+if not redis.call('SET', KEYS[3], '1', 'NX', 'EX', tonumber(ARGV[2])) then
+    return {0, 0, 0, 1}
+end
 
 local adj = tonumber(ARGV[1])
 local ttls = {120, 7200}
 local applied = {0, 0}
+local clamped = 0
 
 for i = 1, 2 do
     local key = KEYS[i]
@@ -39,6 +52,7 @@ for i = 1, 2 do
         local v = tonumber(redis.call('INCRBYFLOAT', key, adj))
         if v < 0 then
             redis.call('SET', key, '0', 'KEEPTTL')
+            clamped = 1
         end
         if redis.call('TTL', key) < 0 then
             redis.call('EXPIRE', key, ttls[i])
@@ -47,4 +61,4 @@ for i = 1, 2 do
     end
 end
 
-return applied
+return {applied[1], applied[2], clamped, 0}

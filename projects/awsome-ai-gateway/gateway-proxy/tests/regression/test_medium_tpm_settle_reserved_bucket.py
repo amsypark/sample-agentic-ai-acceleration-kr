@@ -469,16 +469,32 @@ async def test_a_negative_counter_left_by_the_old_settlement_is_clamped_and_gets
     """이 수정 이전 정산이 지금 분에 남긴 음수·TTL 없는 cur(−5000) 위에서 예약하고 환불하면,
     결과가 음수가 되는 대신 0 이 되고 세 키 모두 TTL 을 갖는다. 남은 음수는 그 분 동안 남의 한도를
     빌려 준다."""
+    from app.services import rate_limit_service as rls
+
     r, case, clock = real_redis, _Case(), _Clock(monkeypatch)
+    clamped = []
+
+    class _Spy:
+        def add(self, n, attrs=None):
+            clamped.extend([(attrs or {}).get("kind")] * n)
+
+    rls.set_settle_metrics(clamped=_Spy(), duplicate=None)
     try:
         for cur, _prev, win in case.groups.values():
             await r.set(cur, -5000)
             await r.set(win, clock.bucket)
         state, rejected = await _reserve(monkeypatch, r, case)
         assert rejected is None
-        await _finalize(r, case, state, _USAGE)
+        with capture_logs() as logs:
+            await _finalize(r, case, state, _USAGE)
         keyspace = await _tpm_keyspace(r)
         _assert_no_ttl_less_or_negative(keyspace)
         assert all(v["cur"] == 0 for v in _values(keyspace, case).values())
+        # 0 하한은 조용하지 않다 — 스코프마다 경고와 카운터.
+        assert [e["event"] for e in logs if e.get("event") == "tpm_settle_clamped"] == [
+            "tpm_settle_clamped"
+        ] * 3
+        assert clamped == ["tpm"] * 3
     finally:
+        rls.set_settle_metrics(clamped=None, duplicate=None)
         await _cleanup(r, case)

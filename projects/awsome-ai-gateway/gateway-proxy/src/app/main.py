@@ -47,7 +47,7 @@ from app.services.fallback_resolver import FallbackResolver
 from app.services.health_checker import HealthChecker
 from app.services.lua_loader import LuaScriptLoader
 from app.services.mantle_credentials import MantleCredentialBroker
-from app.services.rate_limit_service import set_fail_open_metric
+from app.services.rate_limit_service import set_fail_open_metric, set_settle_metrics
 from app.services.routing_profile_loader import RoutingProfileLoader
 from app.services.sigv4_signer import SigV4Signer
 from app.services.tokenizer import TokenizerService
@@ -186,6 +186,11 @@ async def lifespan(app: FastAPI):
     cost_stream_spool.set_metrics(gateway_metrics.usage_records_dropped_total)
     # rate-limit fail-open 관측성(deepdive Q50 Phase 3) — eval 예외로 집행 못한 횟수.
     set_fail_open_metric(gateway_metrics.rl_fail_open_total)
+    # 정산 이상 관측 — 0 하한(clamped)과 이미 정산된 예약의 재정산(duplicate).
+    set_settle_metrics(
+        clamped=gateway_metrics.rl_settle_clamped_total,
+        duplicate=gateway_metrics.rl_settle_duplicate_total,
+    )
 
     # 12. Provider Registry
     provider_registry = ProviderRegistry()

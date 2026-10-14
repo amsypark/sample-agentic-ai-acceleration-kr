@@ -65,6 +65,7 @@ from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 from starlette.datastructures import Headers
 
+import app
 from app.schemas.domain import (
     ApiFormat,
     AuthContext,
@@ -79,6 +80,8 @@ from app.services.account_credentials import ACCOUNT_UNAVAILABLE_MESSAGE
 from app.services.cost_recorder import CostRecorder
 
 _SRC = Path(__file__).resolve().parents[2] / "src" / "app"
+#: 테스트하는 패키지 자신의 Lua(대조군을 다른 트리로 돌리면 그 트리의 스크립트를 쓴다).
+_SCRIPTS = Path(app.__file__).resolve().parent / "redis_scripts"
 REDIS_PROOF_URL = os.environ.get("REDIS_PROOF_URL")
 
 _redis_required = pytest.mark.skipif(
@@ -328,7 +331,7 @@ async def _drive(monkeypatch, r, *, route: str, exit_: str, scenario: str, strea
     from app.services.router_service import RouterService
     from app.services.sigv4_signer import SigV4Signer
 
-    LuaScriptLoader.load_all(_SRC / "redis_scripts")
+    LuaScriptLoader.load_all(_SCRIPTS)
     monkeypatch.setattr("app.services.rate_limit_enforcement.load_all_scope_limits", _limits)
     await _clear_of_window_edge()
 
