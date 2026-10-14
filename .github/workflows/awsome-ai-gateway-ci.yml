@@ -257,6 +257,7 @@ jobs:
             tests/regression/test_high_budget_redis_clobber.py \
             tests/regression/test_high_init_sql_matches_orm.py \
             tests/regression/test_high_aws_price_sync_real_db.py \
+            tests/regression/test_high_aws_account_registry_real_db.py \
             > /tmp/proof.txt 2>&1
           status=$?
           tail -40 /tmp/proof.txt
