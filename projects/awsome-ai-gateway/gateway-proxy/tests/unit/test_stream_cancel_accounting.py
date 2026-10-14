@@ -783,7 +783,7 @@ class _CapturingRecorder:
         self.usages.append(usage)
 
 
-async def _cut_route_stream(monkeypatch, route: str):
+async def _cut_route_stream(monkeypatch, route: str, *, mcp=None):
     """실제 라우터(_handle_openai / _handle_responses)로 200 스트림을 받다가 상류 도중 끊는다."""
     from types import SimpleNamespace
 
@@ -824,6 +824,7 @@ async def _cut_route_stream(monkeypatch, route: str):
     profile = RoutingProfileSchema(
         client="codex", backend="bedrock_openai", account_role_arn=None,
         region="us-east-2", default_model=cfg.alias, external_id=None,
+        web_search_enabled=mcp is not None,
     )
 
     async def _load(*_a, **_k):
@@ -837,7 +838,7 @@ async def _cut_route_stream(monkeypatch, route: str):
         tokenizer=_CharTokenizer(),
         body_logger=None,
         metrics=None,
-        agentcore_mcp_client=None,
+        agentcore_mcp_client=mcp,
         routing_profile_loader=SimpleNamespace(load=_load),
     )
     auth = AuthContext(
@@ -888,3 +889,167 @@ async def test_cut_stream_bills_the_prompt_instead_of_zero(monkeypatch, route):
     assert prompt == len(prompt_text(body))
     assert usage.cache_read_input_tokens == prompt, "캐시 단가가 있으면 하한 버킷으로"
     assert usage.output_tokens == len("partial") and usage.estimated
+
+
+# ── 추정의 정확도와 비용 — 불투명 필드 · 이벤트 루프 · 트리거 조건 ─────────────────
+
+
+def test_prompt_text_skips_opaque_replay_fields():
+    """무상태 클라이언트(Codex 등)는 reasoning.encrypted_content 를 매 턴 다시 보낸다.
+
+    불투명 blob 이라 프롬프트 토큰과 무관한데 토크나이저에 넣으면 8,000 자가 5,749 토큰이 되어
+    실제 청구를 넘고, 추정을 272K 위로 밀 수도 있다(리뷰 프로브로 실측). thinking 블록의 signature,
+    항목 id 도 같다.
+    """
+    from app.services.tokenizer import prompt_text
+
+    blob = "Q" * 8000
+    sig = "S" * 600
+    body = {
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "fix the bug"}]},
+            {"type": "reasoning", "id": "rs_123", "summary": [], "encrypted_content": blob},
+        ],
+        "messages": [
+            {"role": "assistant",
+             "content": [{"type": "thinking", "thinking": "plan first", "signature": sig}]},
+        ],
+    }
+    text = prompt_text(body)
+    assert "fix the bug" in text and "plan first" in text
+    assert blob not in text, "encrypted_content 가 프롬프트로 세어진다"
+    assert sig not in text and "rs_123" not in text
+
+
+class _SlowEncoder:
+    """GIL 을 놓는 느린 인코더 — tiktoken 처럼(실측: 1M 토큰 인라인 252ms 정지)."""
+
+    def encode(self, text: str) -> list[int]:
+        time.sleep(0.25)
+        return [0] * (len(text) // 4)
+
+
+@pytest.mark.asyncio
+async def test_large_prompt_estimate_does_not_block_the_event_loop():
+    """SIGTERM 은 모든 스트림을 한꺼번에 자르고, 그 drain 들이 각자 프롬프트를 토크나이즈한다.
+
+    루프 스레드에서 동기로 돌리면 그동안 다른 요청·셧다운 drain 이 전부 멈춘다.
+    """
+    from app.services.tokenizer import TokenizerService, estimate_prompt_usage
+
+    tok = TokenizerService()
+    tok._tiktoken_encoding = _SlowEncoder()  # _get_tiktoken 이 이것을 돌려준다
+    body = {"input": "x" * 400_000}
+    stalls: list[float] = []
+    stop = False
+
+    async def ticker():
+        last = time.perf_counter()
+        while not stop:
+            await asyncio.sleep(0.002)
+            now = time.perf_counter()
+            stalls.append(now - last - 0.002)
+            last = now
+
+    t = asyncio.create_task(ticker())
+    await asyncio.sleep(0.02)
+    est = await estimate_prompt_usage(tok, body, _gpt_model())
+    stop = True
+    await t
+    assert est.cache_read_input_tokens == len("x" * 400_000) // 4
+    worst_ms = max(stalls) * 1000
+    assert max(stalls) < 0.1, f"이벤트 루프가 {worst_ms:.0f}ms 멈췄다(토크나이즈가 루프에서 돈다)"
+
+
+def _response_frames(kind: str) -> list[bytes]:
+    created = json.dumps({"type": "response.created", "response": {"id": "r1"}}).encode()
+    if kind == "reasoning":
+        return [created, json.dumps(
+            {"type": "response.reasoning_summary_text.delta", "delta": "thinking..."}).encode()]
+    if kind == "tool_call":
+        return [created, json.dumps(
+            {"type": "response.output_item.added", "output_index": 0,
+             "item": {"type": "function_call", "name": "shell", "call_id": "c1"}}).encode(),
+                json.dumps({"type": "response.function_call_arguments.delta",
+                            "output_index": 0, "delta": '{"cmd": "ls"'}).encode()]
+    return [json.dumps({"type": "error", "error": {"type": "throttling"}}).encode()]
+
+
+def _chat_frames(kind: str) -> list[bytes]:
+    if kind == "tool_call":
+        return [b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":'
+                b'{"name":"shell","arguments":"{\\"cmd\\""}}]}}]}\n\n']
+    if kind == "reasoning":
+        return [b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n']
+    return [b'data: {"error":{"type":"provider_error","message":"bad"}}\n\n']
+
+
+async def _cut_after(helper, frames, prompt_hook):
+    seen = []
+
+    async def on_usage(usage, first_token_time):
+        seen.append(usage)
+
+    gen = helper(_FakeRequest(), _stalling(frames), on_usage=on_usage,
+                 prompt_usage_hook=prompt_hook, **_TIMEOUTS)
+    consumer = asyncio.create_task(_consume(gen))
+    await asyncio.sleep(0.05)
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await asyncio.wait_for(_until(lambda: seen), timeout=2.0)
+    return seen[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", ["responses", "chat"])
+@pytest.mark.parametrize("kind", ["reasoning", "tool_call"])
+async def test_cut_without_output_text_still_bills_the_prompt(dialect, kind):
+    """출력 텍스트 없이 끊긴 턴(추론 중, 도구 호출만) — 상류는 프롬프트를 이미 처리했다.
+
+    고치기 전에는 추정이 텍스트가 있을 때만 돌아 프롬프트 0, 그리고 usage 가 전부 0 이라
+    원장 행 자체가 없었다.
+    """
+    from app.schemas.domain import TokenUsage
+
+    async def prompt_hook():
+        return TokenUsage(cache_read_input_tokens=555)
+
+    helper = responses_sse_stream if dialect == "responses" else openai_sse_stream
+    frames = _response_frames(kind) if dialect == "responses" else _chat_frames(kind)
+    usage = await _cut_after(helper, frames, prompt_hook)
+    assert usage.cache_read_input_tokens == 555 and usage.estimated, usage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", ["responses", "chat"])
+async def test_an_error_only_stream_does_not_bill_a_prompt(dialect):
+    """대조군 — 오류 프레임만 온 스트림은 상류가 받지 않은 것이다. 프롬프트를 청구하면 안 된다."""
+    from app.schemas.domain import TokenUsage
+
+    async def prompt_hook():
+        return TokenUsage(cache_read_input_tokens=555)
+
+    helper = responses_sse_stream if dialect == "responses" else openai_sse_stream
+    frames = _response_frames("error") if dialect == "responses" else _chat_frames("error")
+    usage = await _cut_after(helper, frames, prompt_hook)
+    assert usage.cache_read_input_tokens == 0 and usage.input_tokens == 0, usage
+
+
+@pytest.mark.asyncio
+async def test_web_search_passthrough_cut_stream_bills_the_prompt(monkeypatch):
+    """웹서치 프로파일인데 MCP 초기화가 실패하면 일반 스트림으로 내려간다(패스스루).
+
+    그 경로의 SSE 헬퍼에도 프롬프트 훅이 가야 한다 — 고치기 전에는 끊기면 프롬프트 0 이었다.
+    """
+    from app.services.tokenizer import prompt_text
+
+    class _BrokenMcp:
+        async def ensure_initialized(self):
+            raise RuntimeError("mcp down")
+
+    usages, body = await _cut_route_stream(monkeypatch, "responses", mcp=_BrokenMcp())
+    (usage,) = usages
+    prompt = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    assert prompt == len(prompt_text(body)) > 0, f"패스스루가 프롬프트를 청구하지 않았다: {usage}"

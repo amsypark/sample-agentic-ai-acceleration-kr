@@ -33,8 +33,10 @@ PromptUsageHook = Callable[[], Awaitable[TokenUsage | None]] | None
 async def _with_prompt_estimate(usage: TokenUsage, hook: PromptUsageHook) -> TokenUsage:
     """usage 이벤트 없이 끊긴 스트림의 입력 0 을 추정으로 채운다(KI-08 의 입력 쪽).
 
-    호출자는 "usage 이벤트를 하나도 못 받았고, 생성된 텍스트는 있다" 일 때만 부른다 — 텍스트가
-    있으면 상류가 프롬프트를 처리한 것이 확실하다. 실패하면 원래 usage 그대로(크래시 없음).
+    호출자는 "usage 이벤트를 하나도 못 받았고, 상류가 요청을 받아들인 이벤트를 하나라도 보냈다"
+    일 때만 부른다 — 출력 텍스트가 없어도(추론 중이거나 도구 호출만) 프롬프트는 이미 처리됐다.
+    오류 프레임만 온 스트림은 받아들여지지 않은 것이라 부르지 않는다. 실패하면 원래 usage
+    그대로(크래시 없음).
     """
     if hook is None:
         return usage
@@ -420,6 +422,8 @@ async def openai_sse_stream(
     usage_fired = False  # 과금 멱등 가드 — bedrock_anthropic_sse_stream 과 동일 계약
     accumulated_frames: list[str] = []  # 본문 로깅용(on_complete 없으면 미사용)
     complete_fired = False
+    #: 상류가 생성 청크(choices)를 하나라도 보냈는지 — 요청을 받아들였다는 뜻(PromptUsageHook).
+    upstream_started = False
 
     def _emit_error_chunk(err_type: str, message: str) -> bytes:
         payload = {"error": {"type": err_type, "message": message}}
@@ -427,7 +431,7 @@ async def openai_sse_stream(
 
     def _scan_usage(chunk: bytes) -> TokenUsage | None:
         """Scan a (possibly multi-frame) chunk for usage + accumulate delta content."""
-        nonlocal first_token_time
+        nonlocal first_token_time, upstream_started
         try:
             text = chunk.decode("utf-8", errors="ignore")
         except Exception:
@@ -444,6 +448,8 @@ async def openai_sse_stream(
                 data = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            if isinstance(data, dict) and "choices" in data:
+                upstream_started = True  # 오류 청크({"error": ...})에는 choices 가 없다
             # KI-08: delta content 누적. OpenAI SSE: {"choices":[{"delta":{"content":"..."}}]}
             for choice in data.get("choices", []) or []:
                 delta = choice.get("delta") or {}
@@ -519,8 +525,9 @@ async def openai_sse_stream(
             cache_creation_input_tokens=0,
             cache_read_input_tokens=0,
         )
-        if latest_usage is None and accumulated_text:
+        if latest_usage is None and upstream_started:
             # usage 는 마지막 청크에만 온다 — 그 전에 끊기면 입력이 0 이다(PromptUsageHook).
+            # 텍스트가 없어도(도구 호출만, 추론 중) 프롬프트는 이미 처리됐다.
             usage = await _with_prompt_estimate(usage, prompt_usage_hook)
         try:
             await on_usage(usage, first_token_time)
@@ -651,6 +658,9 @@ async def responses_sse_stream(
     usage_fired = False  # 과금 멱등 가드 — bedrock_anthropic_sse_stream 과 동일 계약
     accumulated_frames: list[str] = []  # 본문 로깅용(on_complete 없으면 미사용)
     complete_fired = False
+    #: 상류가 요청을 받아들인 이벤트(response.created, 추론·도구 델타 등)를 보냈는지 —
+    #: PromptUsageHook 의 조건. 오류 이벤트는 세지 않는다.
+    upstream_started = False
 
     def _emit_error_chunk(err_type: str, message: str) -> bytes:
         payload = {"error": {"type": err_type, "message": message}}
@@ -672,7 +682,7 @@ async def responses_sse_stream(
         Malformed JSON is passed through as a bare `data:` frame (no crash), matching
         bedrock_anthropic_sse_stream's defensive behaviour.
         """
-        nonlocal latest_usage, first_token_time
+        nonlocal latest_usage, first_token_time, upstream_started
         try:
             data = json.loads(chunk)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -680,6 +690,8 @@ async def responses_sse_stream(
             return f"data: {raw}\n\n".encode()
         if isinstance(data, dict):
             etype = data.get("type", "")
+            if etype and etype not in ("error", "response.failed"):
+                upstream_started = True
             if etype == "response.output_text.delta":
                 if (d := data.get("delta")) and isinstance(d, str):
                     if first_token_time is None:
@@ -763,8 +775,9 @@ async def responses_sse_stream(
         estimated_usage = await _estimate_output_tokens()
         if estimated_usage is not None:
             usage = estimated_usage
-        if latest_usage is None and accumulated_text:
+        if latest_usage is None and upstream_started:
             # usage 는 종결 이벤트에만 온다 — 그 전에 끊기면 입력이 0 이다(PromptUsageHook).
+            # 출력 텍스트가 없어도(추론 중, 도구 호출만) 프롬프트는 이미 처리됐다.
             usage = await _with_prompt_estimate(usage, prompt_usage_hook)
         try:
             await on_usage(usage, first_token_time)

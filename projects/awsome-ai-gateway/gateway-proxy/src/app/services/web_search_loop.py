@@ -1387,6 +1387,9 @@ async def run_web_search_loop(
     #: 경로의 스트림이 그 전에 끊기면 역산 없이는 usage 가 전부 0 이 되고 usage_logs
     #: 행이 아예 만들어지지 않는다(services/streaming.py 의 같은 주석 참조).
     tokenizer_hook: Callable[[str], Awaitable[int | None]] | None = None,
+    #: 같은 이유의 입력 쪽 — 패스스루 Responses 스트림이 usage 없이 끊기면 프롬프트를 추정한다
+    #: (services/streaming.py PromptUsageHook). 2xx 스트림에만 넘긴다.
+    prompt_usage_hook: Callable[[], Awaitable[TokenUsage | None]] | None = None,
     response_headers: Optional[dict] = None,
     on_stream_complete: Callable[[str, str], Awaitable[None]] | None = None,
     on_nonstream_complete: Callable[[int, bytes], Awaitable[None]] | None = None,
@@ -1458,9 +1461,15 @@ async def run_web_search_loop(
                 bedrock_anthropic_sse_stream,
                 responses_sse_stream,
             )
-            gen = (bedrock_anthropic_sse_stream if dialect == "anthropic" else responses_sse_stream)(
-                request, chunk_iter, on_usage=_stream_on_usage,
-                tokenizer_hook=tokenizer_hook)
+            if dialect == "anthropic":
+                gen = bedrock_anthropic_sse_stream(
+                    request, chunk_iter, on_usage=_stream_on_usage,
+                    tokenizer_hook=tokenizer_hook)
+            else:
+                gen = responses_sse_stream(
+                    request, chunk_iter, on_usage=_stream_on_usage,
+                    tokenizer_hook=tokenizer_hook,
+                    prompt_usage_hook=prompt_usage_hook if 200 <= status < 300 else None)
             return StreamingResponse(_log_stream(gen), status_code=status,
                                      media_type="text/event-stream", headers=response_headers)
         base.pop("stream", None)
@@ -1508,7 +1517,8 @@ async def run_web_search_loop(
             else:
                 gen = responses_sse_stream(
                     request, chunk_iter, on_usage=_stream_on_usage,
-                    tokenizer_hook=tokenizer_hook)
+                    tokenizer_hook=tokenizer_hook,
+                    prompt_usage_hook=prompt_usage_hook if 200 <= status < 300 else None)
             return StreamingResponse(_log_stream(gen), status_code=status,
                                      media_type="text/event-stream", headers=response_headers)
         status, body, _h, usage = await invoke(base)

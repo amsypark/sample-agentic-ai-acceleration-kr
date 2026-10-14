@@ -723,6 +723,10 @@ async def _handle_responses(request: Request):
             model_id=model_config.provider_model_id,
         )
 
+    async def _estimate_prompt() -> TokenUsage | None:
+        # 잘린 스트림의 프롬프트(PromptUsageHook). _estimate 와 같은 이유로 웹서치 분기보다 앞.
+        return await estimate_prompt_usage(_tokenizer, req_data, model_config)
+
     # --- Server-side web search (Architecture C) — opt-in per routing profile ---
     # When the codex profile enables web search AND the AgentCore MCP client is present,
     # run the Responses-dialect tool-use loop instead of the plain single dispatch below.
@@ -838,6 +842,7 @@ async def _handle_responses(request: Request):
             max_searches_per_turn=_settings_ws.web_search_max_searches_per_turn,
             handshake_timeout=_settings_ws.agentcore_handshake_timeout,
             tokenizer_hook=_estimate,
+            prompt_usage_hook=_estimate_prompt,
             on_stream_complete=_ws_log_stream if _ws_logging else None,
             on_nonstream_complete=_ws_log_nonstream if _ws_logging else None,
         )
@@ -905,9 +910,6 @@ async def _handle_responses(request: Request):
         )
 
         from app.services.streaming import responses_sse_stream
-
-        async def _estimate_prompt() -> TokenUsage | None:
-            return await estimate_prompt_usage(_tokenizer, req_data, model_config)
 
         return StreamingResponse(
             responses_sse_stream(

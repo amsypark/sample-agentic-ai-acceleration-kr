@@ -14,6 +14,9 @@ from app.schemas.domain import ModelConfigSchema, ProviderType, TokenUsage
 logger = structlog.get_logger(__name__)
 
 
+#: 이 길이까지는 루프에서 바로 센다(~1ms). 그보다 긴 텍스트는 스레드로(estimate_output_tokens).
+_INLINE_TOKENIZE_MAX_CHARS = 32_768
+
 # Cross-region inference profile 접두사 제거용 (예: `us.anthropic.claude-...` → `anthropic.claude-...`).
 # Bedrock CountTokens API는 profile ID를 받지 않고 base model ID만 허용.
 _REGION_PREFIX_RE = re.compile(r"^(us|eu|apac|global|us-gov)\.")
@@ -71,7 +74,13 @@ class TokenizerService:
                 return n
             logger.info("bedrock_count_tokens_fallback_to_tiktoken", model_id=model_id)
 
-        return self._tiktoken_count(text)
+        if len(text) <= _INLINE_TOKENIZE_MAX_CHARS:
+            return self._tiktoken_count(text)
+        # ⚠️ 큰 텍스트(잘린 스트림의 프롬프트 추정)는 루프 밖에서 센다. tiktoken 은 GIL 을 놓고
+        #    돌아서 스레드로 옮기면 루프가 멈추지 않는다 — 실측: 1M 토큰 인라인 252ms 정지,
+        #    to_thread 5.6ms. SIGTERM 은 모든 스트림을 한꺼번에 자르므로 인라인이면 이 정지가
+        #    drain 수만큼 겹친다.
+        return await asyncio.to_thread(self._tiktoken_count, text)
 
     async def _bedrock_count_tokens(self, text: str, model_id: str) -> int | None:
         """Bedrock CountTokens API 호출. 실패 시 `None`."""
@@ -117,9 +126,15 @@ class TokenizerService:
 
 # ── 잘린 스트림의 프롬프트 추정 (KI-08 의 입력 쪽) ───────────────────────────────
 
-#: 값이 base64 페이로드인 필드(Chat input_audio.data, Anthropic source.data, Converse bytes,
-#: Responses/Chat file_data). data URL 은 접두사로 따로 거른다.
-_MEDIA_KEYS = frozenset({"data", "bytes", "file_data"})
+#: 값이 프롬프트 텍스트가 아닌 필드.
+#:   · base64 페이로드 — Chat input_audio.data, Anthropic source.data, Converse bytes,
+#:     Responses/Chat file_data(data URL 은 접두사로 따로 거른다)
+#:   · 불투명 재전송 값 — Responses reasoning.encrypted_content(무상태 클라이언트가 매 턴 다시
+#:     보낸다: 8,000 자가 5,749 토큰으로 세어졌다, 리뷰 프로브로 실측), thinking 의 signature,
+#:     항목 id
+_NON_PROMPT_KEYS = frozenset(
+    {"data", "bytes", "file_data", "encrypted_content", "signature", "id"}
+)
 #: 프롬프트를 이루는 최상위 필드(Responses / Chat / Anthropic). model·max_tokens 등은 아니다.
 _PROMPT_KEYS = ("instructions", "system", "messages", "input", "tools")
 
@@ -127,15 +142,16 @@ _PROMPT_KEYS = ("instructions", "system", "messages", "input", "tools")
 def prompt_text(body: dict) -> str:
     """프롬프트 토큰 역산용 텍스트 — 대화·지시·도구 정의의 문자열 값만 모은다.
 
-    ⚠️ base64 미디어는 뺀다. 이미지는 해상도 기반 수백~수천 토큰인데 base64 를 토크나이저에
-       넣으면 수십만 토큰으로 부풀어 과청구가 된다. 대가로 이미지 토큰과 JSON 구조 토큰은
-       0 으로 센다 — 추정은 아래쪽으로 기운다(estimate_prompt_usage 의 하한 원칙과 같은 방향).
+    ⚠️ base64 미디어와 불투명 재전송 값(encrypted_content·signature·id)은 뺀다(_NON_PROMPT_KEYS).
+       이미지는 해상도 기반 수백~수천 토큰인데 base64 를 토크나이저에 넣으면 수십만 토큰으로
+       부풀어 과청구가 된다. 대가로 이미지 토큰과 JSON 구조 토큰은 0 으로 센다 — 추정은
+       아래쪽으로 기운다(estimate_prompt_usage 의 하한 원칙과 같은 방향).
     """
     parts: list[str] = []
 
     def walk(node: Any, key: str | None) -> None:
         if isinstance(node, str):
-            if key not in _MEDIA_KEYS and not node.startswith("data:"):
+            if key not in _NON_PROMPT_KEYS and not node.startswith("data:"):
                 parts.append(node)
         elif isinstance(node, list):
             for item in node:
