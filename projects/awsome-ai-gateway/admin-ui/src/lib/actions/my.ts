@@ -16,8 +16,14 @@ export interface MyBudgetResponse {
     limit_usd: number | null;
     used_usd: number;
     remaining_usd: number | null;
+    // $0 한도면 null 이다(0 으로 나눈 비율은 없다 — 0.0% 는 '아직 안 씀' 으로 읽힌다).
     usage_pct: number | null;
     policy: string | null;
+  };
+  // 게이트웨이는 팀 예산이 없으면(팀 미배정 포함) 개인 예산과 무관하게 거부한다(team_budget_unset).
+  team: {
+    assigned: boolean;
+    budget_configured: boolean;
   };
 }
 

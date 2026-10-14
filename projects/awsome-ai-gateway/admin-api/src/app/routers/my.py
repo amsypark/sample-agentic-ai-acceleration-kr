@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import CurrentUser, get_current_user
 from app.core.db import get_db_session
 from app.core.usage_filters import cost_period_filter, current_kst_period
+from app.models.auth import User
 from app.models.budget import BudgetConfig, BudgetScope, BudgetUsage
 from app.models.usage import UsageLog
 
@@ -72,7 +73,32 @@ async def get_my_budget(
         usage_pct: float | None = None
     else:
         remaining = limit_usd - used_usd
-        usage_pct = (used_usd / limit_usd * 100) if limit_usd > 0 else 0.0
+        # ⚠️ $0 한도의 사용률은 **없다**(null). 예전엔 0.0 을 보내 카드가 초록 막대 "0.0%" 로 '아직 안
+        #    씀' 처럼 그렸는데, HARD_BLOCK 의 $0 은 모든 요청을 막는다(gateway used >= limit).
+        usage_pct = (used_usd / limit_usd * 100) if limit_usd > 0 else None
+
+    # 팀 예산 상태 — 게이트웨이는 **팀 예산이 없으면 거부한다**(gateway-proxy budget_service C-1:
+    # TEAM config 미설정 → team_budget_unset, 팀 미배정 사용자도 같다). 개인 예산이 없을 때 카드가
+    # "팀 예산 적용" 이라고 말하려면 그게 사실인지 알아야 한다. 팀은 JWT 가 아니라 DB 의 현재 소속이다
+    # (게이트웨이도 DB 소속으로 판정한다).
+    team_id = (
+        await session.execute(select(User.team_id).where(User.id == user.user_id))
+    ).scalar_one_or_none()
+    team_budget_configured = False
+    if team_id is not None:
+        team_cfg = (
+            await session.execute(
+                select(BudgetConfig.id)
+                .where(
+                    BudgetConfig.scope == BudgetScope.TEAM,
+                    BudgetConfig.scope_id == team_id,
+                    BudgetConfig.is_active.is_(True),
+                    BudgetConfig.client.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        team_budget_configured = team_cfg is not None
 
     return {
         "user_id": str(user.user_id),
@@ -84,6 +110,7 @@ async def get_my_budget(
             "usage_pct": round(usage_pct, 1) if usage_pct is not None else None,
             "policy": policy,
         },
+        "team": {"assigned": team_id is not None, "budget_configured": team_budget_configured},
     }
 
 

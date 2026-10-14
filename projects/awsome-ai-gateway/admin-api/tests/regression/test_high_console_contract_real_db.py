@@ -1005,3 +1005,50 @@ async def test_leader_cannot_overwrite_another_teams_user_budget(session):
     await svc.allocate_team_budget(session, team_id=SEED_TEAM_ID, data=ok, actor=leader)
     await session.commit()
     assert await _user_budget(session, U_A) == Decimal("10")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. /admin/my/budget — 팀 예산 상태와 $0 한도
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _my_budget(session, user_id):
+    from unittest.mock import MagicMock
+
+    from app.core.auth import CurrentUser
+    from app.models.auth import UserRole
+    from app.routers.my import get_my_budget
+
+    # JWT 의 team_id 는 일부러 비운다 — 라우트는 DB 의 현재 소속을 읽어야 한다(게이트웨이도 그렇다).
+    me = CurrentUser(user_id=user_id, email="me@example.com", role=UserRole.DEVELOPER, team_id=None)
+    return await get_my_budget(request=MagicMock(), user=me, session=session)
+
+
+async def test_my_budget_reports_the_team_budget_the_gateway_will_check(session):
+    """게이트웨이는 팀 예산이 없으면 거부한다(team_budget_unset). 카드가 "팀 예산 적용" 이라고 말하려면
+    그게 사실이어야 한다 — 시드 팀(팀 예산 있음) / TEAM_B(없음) / 팀 미배정을 실제 행으로 가른다."""
+    assert (await _my_budget(session, U_A))["team"] == {"assigned": True, "budget_configured": True}
+    assert (await _my_budget(session, U_B))["team"] == {"assigned": True, "budget_configured": False}
+    assert (await _my_budget(session, U_TEAMLESS))["team"] == {"assigned": False, "budget_configured": False}
+
+
+async def test_my_budget_zero_limit_has_no_usage_ratio(session):
+    """$0 HARD_BLOCK 은 모든 요청을 막는다 — 사용률 0.0% 가 아니라 null 이고 한도는 0 으로 남는다."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.core.auth import CurrentUser
+    from app.models.auth import UserRole
+    from app.schemas.budgets import SetBudgetRequest
+    from app.services.budget_service import BudgetService
+
+    cache = MagicMock()
+    cache.invalidate = AsyncMock()
+    cache._redis = AsyncMock()
+    admin = CurrentUser(user_id=SEED_ADMIN_ID, email="admin@example.com", role=UserRole.ADMIN, team_id=None)
+    await BudgetService(cache_mgr=cache).set_user_budget(
+        session, user_id=U_TEAMLESS, data=SetBudgetRequest(max_budget_usd=Decimal("0")), actor=admin
+    )
+    await session.commit()
+
+    b = (await _my_budget(session, U_TEAMLESS))["budget"]
+    assert (b["limit_usd"], b["usage_pct"], b["policy"]) == (0, None, "HARD_BLOCK")

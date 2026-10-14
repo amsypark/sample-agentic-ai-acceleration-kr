@@ -34,19 +34,36 @@ def _user() -> CurrentUser:
     )
 
 
-def _session(config, used: str) -> AsyncMock:
-    cfg_result = MagicMock()
-    cfg_result.scalar_one_or_none.return_value = config
-    used_result = MagicMock()
-    used_result.scalar_one.return_value = Decimal(used)
+TEAM_ID = uuid.UUID("77777777-7777-4777-8777-777777777777")
+
+
+def _result(**attrs) -> MagicMock:
+    r = MagicMock()
+    for name, value in attrs.items():
+        getattr(r, name).return_value = value
+    return r
+
+
+def _session(config, used: str, *, team_id=TEAM_ID, team_budget: bool = True) -> AsyncMock:
+    """조회 순서: 개인 예산 행 → 이번 달 지출 → 사용자의 팀 → (팀이 있으면) 팀 활성 예산 행."""
+    results = [
+        _result(scalar_one_or_none=config),
+        _result(scalar_one=Decimal(used)),
+        _result(scalar_one_or_none=team_id),
+    ]
+    if team_id is not None:
+        results.append(_result(scalar_one_or_none=uuid.uuid4() if team_budget else None))
     session = AsyncMock()
-    session.execute = AsyncMock(side_effect=[cfg_result, used_result])
+    session.execute = AsyncMock(side_effect=results)
     return session
 
 
+async def _my(config, used="12.34", **team) -> dict:
+    return await get_my_budget(request=MagicMock(), user=_user(), session=_session(config, used, **team))
+
+
 async def _budget(config, used="12.34") -> dict:
-    out = await get_my_budget(request=MagicMock(), user=_user(), session=_session(config, used))
-    return out["budget"]
+    return (await _my(config, used))["budget"]
 
 
 async def test_no_budget_row_is_reported_as_unset_not_hard_block():
@@ -73,10 +90,33 @@ async def test_configured_budget_is_reported_as_numbers():
 
 
 async def test_zero_limit_is_a_real_limit_not_unset():
-    """0 원 한도는 '미설정' 과 다른 사실이다 — null 로 접으면 실재하는 차단을 숨긴다."""
+    """0 원 한도는 '미설정' 과 다른 사실이다 — null 로 접으면 실재하는 차단을 숨긴다.
+
+    ⚠️ 사용률은 null 이다(0 으로 나눈 비율은 없다). 예전엔 0.0% 를 보내 카드가 초록 막대와 "0.0%" 로
+       '아직 안 씀' 처럼 그렸는데, HARD_BLOCK 의 $0 한도는 모든 요청을 막는다(used >= 0)."""
     cfg = SimpleNamespace(max_budget_usd=Decimal("0"), policy=BudgetPolicy.HARD_BLOCK)
     b = await _budget(cfg, used="1.00")
     assert b["limit_usd"] == 0
-    assert b["usage_pct"] == 0.0
+    assert b["usage_pct"] is None
     assert b["remaining_usd"] == -1.0
     assert b["policy"] == "HARD_BLOCK"
+
+
+# ── 팀 예산 — 게이트웨이는 팀 예산이 없으면 거부한다(C-1, team_budget_unset) ─────────
+
+
+async def test_teamless_user_is_reported_as_without_a_team():
+    """팀 미배정 사용자에게 "팀 예산 적용" 은 거짓이다 — 게이트웨이는 팀 예산이 없으니 거부한다."""
+    out = await _my(None, team_id=None)
+    assert out["team"] == {"assigned": False, "budget_configured": False}
+
+
+async def test_team_without_a_budget_is_reported():
+    out = await _my(None, team_budget=False)
+    assert out["team"] == {"assigned": True, "budget_configured": False}
+
+
+async def test_team_with_a_budget_is_reported_as_configured():
+    """대조군 — 팀 예산이 있으면 그대로 적용된다."""
+    out = await _my(None)
+    assert out["team"] == {"assigned": True, "budget_configured": True}
