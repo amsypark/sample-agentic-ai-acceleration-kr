@@ -108,7 +108,34 @@ class TestGatewayCacheInvalidation:
 
     Without this, gateway can serve stale policies for up to the 5-min TTL
     (`_CONFIG_CACHE_TTL_SEC` in gateway-proxy/.../rate_limit_config_loader.py).
+
+    ⚠️ 무효화는 **커밋 뒤에** 일어나야 한다. 서비스는 지울 대상을 세션에 쌓기만 하고, 라우터가
+       ``session.commit()`` 뒤 ``invalidate_after_commit`` 으로 비운다. 커밋 전에 지우면 그 창의
+       게이트웨이 캐시 미스가 아직 커밋 안 된(=옛) 행을 300초 다시 캐시한다(실 PG+Redis 재현:
+       test_high_rate_limit_invalidate_after_commit_real.py).
     """
+
+    async def test_drain_runs_once_and_is_a_no_op_when_nothing_is_queued(
+        self,
+        rate_limit_service: RateLimitService,
+        mock_session: AsyncMock,
+        mock_redis: AsyncMock,
+        admin_user: CurrentUser,
+    ):
+        await rate_limit_service.invalidate_after_commit(mock_session)  # 쌓인 것 없음
+        mock_redis.scan_iter.assert_not_called()
+        mock_redis.delete.assert_not_called()
+
+        with patch("app.services.rate_limit_service.RateLimitConfigRepository") as MockRepo, \
+             patch("app.services.rate_limit_service.audit_logger") as mock_audit:
+            MockRepo.return_value.upsert = AsyncMock()
+            mock_audit.log = AsyncMock()
+            await rate_limit_service.set_team_rate_limit(
+                mock_session, team_id=uuid.uuid4(), data=RateLimitSetRequest(rpm=1), actor=admin_user
+            )
+        await rate_limit_service.invalidate_after_commit(mock_session)
+        await rate_limit_service.invalidate_after_commit(mock_session)  # 두 번째는 비어 있다
+        assert mock_redis.scan_iter.call_count == 1
 
     @staticmethod
     def _scan_iter_returning(keys: list[str]):
@@ -145,6 +172,10 @@ class TestGatewayCacheInvalidation:
                 mock_session, user_id=user_id, data=data, actor=admin_user
             )
 
+        # 커밋 전에는 아무것도 지우지 않는다 — 라우터가 커밋한 뒤 비운다(아래 클래스 docstring).
+        mock_redis.scan_iter.assert_not_called()
+        await rate_limit_service.invalidate_after_commit(mock_session)
+
         mock_redis.scan_iter.assert_called_once()
         match_arg = mock_redis.scan_iter.call_args.kwargs.get("match") \
             or mock_redis.scan_iter.call_args.args[0]
@@ -176,6 +207,9 @@ class TestGatewayCacheInvalidation:
             await rate_limit_service.set_team_rate_limit(
                 mock_session, team_id=team_id, data=data, actor=admin_user
             )
+
+        mock_redis.scan_iter.assert_not_called()
+        await rate_limit_service.invalidate_after_commit(mock_session)
 
         match_arg = mock_redis.scan_iter.call_args.kwargs.get("match") \
             or mock_redis.scan_iter.call_args.args[0]
@@ -214,6 +248,10 @@ class TestGatewayCacheInvalidation:
             await rate_limit_service.set_global_rate_limit(
                 mock_session, model_alias="claude-opus", data=data, actor=admin_user
             )
+
+        mock_redis.scan_iter.assert_not_called()
+        mock_redis.delete.assert_not_called()
+        await rate_limit_service.invalidate_after_commit(mock_session)
 
         match_arg = mock_redis.scan_iter.call_args.kwargs.get("match") \
             or mock_redis.scan_iter.call_args.args[0]

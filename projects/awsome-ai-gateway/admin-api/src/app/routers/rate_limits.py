@@ -63,7 +63,7 @@ async def set_user_rate_limit(
     from app.services.rate_limit_service import RateLimitService
 
     svc: RateLimitService = request.app.state.rate_limit_service
-    return await svc.set_user_rate_limit(
+    result = await svc.set_user_rate_limit(
         session,
         user_id=uuid.UUID(user_id),
         data=body,
@@ -71,6 +71,11 @@ async def set_user_rate_limit(
         ip_address=request.client.host if request.client else "0.0.0.0",
         request_id=request.headers.get("x-request-id", ""),
     )
+    # 커밋 **뒤에** 캐시를 지운다 — 먼저 지우면 그 창의 게이트웨이 캐시 미스가 옛 행을 300초
+    # 다시 캐시한다(RateLimitService.invalidate_after_commit).
+    await session.commit()
+    await svc.invalidate_after_commit(session)
+    return result
 
 
 @router.delete("/user/{user_id}", response_model=RateLimitDeleteResponse)
@@ -88,13 +93,16 @@ async def delete_user_rate_limit(
     from app.services.rate_limit_service import RateLimitService
 
     svc: RateLimitService = request.app.state.rate_limit_service
-    return await svc.delete_user_rate_limit(
+    result = await svc.delete_user_rate_limit(
         session,
         user_id=user_id,
         actor=admin,
         ip_address=request.client.host if request.client else "0.0.0.0",
         request_id=request.headers.get("x-request-id", ""),
     )
+    await session.commit()  # 커밋 뒤에 지운다(set_user_rate_limit 주석)
+    await svc.invalidate_after_commit(session)
+    return result
 
 
 @router.put("/team/{team_id}", response_model=RateLimitResponse)
@@ -106,7 +114,7 @@ async def set_team_rate_limit(
     session: AsyncSession = Depends(get_db_session),
 ):
     svc: RateLimitService = request.app.state.rate_limit_service
-    return await svc.set_team_rate_limit(
+    result = await svc.set_team_rate_limit(
         session,
         team_id=uuid.UUID(team_id),
         data=body,
@@ -114,6 +122,9 @@ async def set_team_rate_limit(
         ip_address=request.client.host if request.client else "0.0.0.0",
         request_id=request.headers.get("x-request-id", ""),
     )
+    await session.commit()  # 커밋 뒤에 지운다(set_user_rate_limit 주석)
+    await svc.invalidate_after_commit(session)
+    return result
 
 
 @router.put("/global/{model_alias}", response_model=RateLimitResponse)
@@ -125,7 +136,7 @@ async def set_global_rate_limit(
     session: AsyncSession = Depends(get_db_session),
 ):
     svc: RateLimitService = request.app.state.rate_limit_service
-    return await svc.set_global_rate_limit(
+    result = await svc.set_global_rate_limit(
         session,
         model_alias=model_alias,
         data=body,
@@ -133,3 +144,8 @@ async def set_global_rate_limit(
         ip_address=request.client.host if request.client else "0.0.0.0",
         request_id=request.headers.get("x-request-id", ""),
     )
+    # ⚠️ GLOBAL 은 저장이 **다른 모델**의 한도를 해제한다 — 커밋 전에 지우면 해제된 한도가 그 창에서
+    #    다시 캐시돼 5분 더 집행된다(set_user_rate_limit 주석).
+    await session.commit()
+    await svc.invalidate_after_commit(session)
+    return result

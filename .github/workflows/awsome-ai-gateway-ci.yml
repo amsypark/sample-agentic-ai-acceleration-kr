@@ -259,6 +259,7 @@ jobs:
             tests/regression/test_high_aws_price_sync_real_db.py \
             tests/regression/test_high_console_contract_real_db.py \
             tests/regression/test_high_rate_limit_live_usage_real_redis.py \
+            tests/regression/test_high_rate_limit_invalidate_after_commit_real.py \
             > /tmp/proof.txt 2>&1
           status=$?
           tail -40 /tmp/proof.txt

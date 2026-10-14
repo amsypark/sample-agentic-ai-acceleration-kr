@@ -13,7 +13,11 @@ from __future__ import annotations
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from fastapi import Request
 from httpx import AsyncClient
+
+from app.core.db import SESSION_STATE_ATTR, get_db_session
 
 USER_ID = uuid.UUID("33333333-3333-4333-8333-333333333333")
 
@@ -74,3 +78,70 @@ async def test_usage_route_passes_the_session_for_the_measured_flag(
     body = resp.json()
     assert (body["available"], body["measured"], body["limit_rpm"]) == (True, True, 60)
     assert body["rpm_used_total"] == 0
+
+
+# ── 커밋 뒤에 무효화 ──────────────────────────────────────────────────────────
+#
+# 예전: 서비스가 upsert/비활성화 직후(커밋 전) rl:config:* 를 지웠고 커밋은 CommittingRoute 가
+# 응답 직전에 했다. 그 사이 게이트웨이 요청의 캐시 미스는 **커밋된(=옛)** 행을 읽어 300초 다시
+# 캐시한다 — 해제한 GLOBAL 한도·지운 개인 한도가 콘솔과 달리 5분 더 집행된다(실 PG+Redis 재현:
+# tests/regression/test_high_rate_limit_invalidate_after_commit_real.py).
+
+TEAM_ID = uuid.UUID("44444444-4444-4444-8444-444444444444")
+
+
+def _recording_session(events: list[str]):
+    async def _override(request: Request):
+        session = AsyncMock()
+        session.info = {}
+        session.add = MagicMock()
+        session.scalar = AsyncMock(return_value="claude-opus-4-7")  # GLOBAL alias 존재 확인
+        open_tx = {"value": True}
+        session.in_transaction = MagicMock(side_effect=lambda: open_tx["value"])
+
+        async def _commit():
+            events.append("commit")
+            open_tx["value"] = False
+
+        session.commit = AsyncMock(side_effect=_commit)
+        session.rollback = AsyncMock()
+        setattr(request.state, SESSION_STATE_ATTR, session)
+        yield session
+
+    return _override
+
+
+@pytest.mark.parametrize(
+    "method, path, body, pattern",
+    [
+        ("PUT", f"/admin/rate-limits/user/{USER_ID}", {"rpm": 5}, f"rl:config:USER:{USER_ID}:*"),
+        ("PUT", f"/admin/rate-limits/team/{TEAM_ID}", {"rpm": 5}, f"rl:config:TEAM:{TEAM_ID}:*"),
+        ("PUT", "/admin/rate-limits/global/claude-opus-4-7", {"rpm": 5}, "rl:config:GLOBAL:NULL:*"),
+        ("DELETE", f"/admin/rate-limits/user/{USER_ID}", None, f"rl:config:USER:{USER_ID}:*"),
+    ],
+)
+async def test_mutations_invalidate_the_proxy_cache_only_after_commit(
+    client: AsyncClient, admin_headers: dict, test_app, method, path, body, pattern
+):
+    events: list[str] = []
+    test_app.dependency_overrides[get_db_session] = _recording_session(events)
+
+    def _scan(*_a, **kw):
+        events.append(f"scan:{kw.get('match') or _a[0]}")
+        return _no_keys()
+
+    test_app.state.redis.scan_iter = MagicMock(side_effect=_scan)
+    test_app.state.redis.delete = AsyncMock(side_effect=lambda key: events.append(f"del:{key}"))
+
+    with patch("app.services.rate_limit_service.RateLimitConfigRepository") as MockRepo, patch(
+        "app.services.rate_limit_service.audit_logger"
+    ) as mock_audit:
+        MockRepo.return_value.upsert = AsyncMock()
+        MockRepo.return_value.deactivate_configs = AsyncMock(return_value=1)
+        mock_audit.log = AsyncMock()
+        resp = await client.request(method, path, json=body, headers=admin_headers)
+
+    assert resp.status_code == 200, resp.text
+    assert f"scan:{pattern}" in events, events  # 대조군 — 무효화 자체는 일어난다
+    first_invalidation = min(i for i, e in enumerate(events) if e.startswith(("scan:", "del:")))
+    assert "commit" in events[:first_invalidation], f"커밋 전에 캐시를 지웠다: {events}"

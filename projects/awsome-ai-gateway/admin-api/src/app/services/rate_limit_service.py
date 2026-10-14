@@ -38,9 +38,39 @@ def _glob_escape(value: str) -> str:
     return "".join(f"\\{ch}" if ch in _GLOB_META else ch for ch in value)
 
 
+#: ``session.info`` 키 — 커밋 뒤에 지울 gateway-proxy 정책 캐시(키 목록, 패턴 목록).
+_PENDING_INVALIDATIONS = "rate_limit.pending_cache_invalidations"
+
+
+def _queue_invalidation(
+    session: AsyncSession, *, keys: tuple[str, ...] = (), patterns: tuple[str, ...] = ()
+) -> None:
+    pending = session.info.setdefault(_PENDING_INVALIDATIONS, {"keys": [], "patterns": []})
+    pending["keys"].extend(keys)
+    pending["patterns"].extend(patterns)
+
+
 class RateLimitService:
     def __init__(self, cache_mgr: CacheInvalidationManager) -> None:
         self._cache_mgr = cache_mgr
+
+    async def invalidate_after_commit(self, session: AsyncSession) -> None:
+        """이 세션의 rate-limit 변경이 쌓아 둔 캐시 무효화를 실행한다. **``session.commit()`` 뒤에** 호출한다.
+
+        ⚠️ 커밋 전에 지우면 안 된다. 지운 뒤 · 커밋 전 사이에 들어온 게이트웨이 요청의 캐시 미스는
+           자기 커넥션으로 **커밋된(=옛)** 행을 읽어 300초 다시 캐시한다. GLOBAL 저장은 다른 모델의
+           한도를 해제하므로 해제된 한도가 콘솔이 '한도 없음' 으로 보여주는 동안 5분 더 집행됐고,
+           지운 개인 한도·새로 건 한도도 같은 창에서 5분씩 어긋났다(실 PG+Redis 재현:
+           tests/regression/test_high_rate_limit_invalidate_after_commit_real.py).
+           실패는 CacheInvalidationManager 가 세션에 기록한다 — 커밋 뒤라 새 트랜잭션이 열리고
+           CommittingRoute 가 응답 전에 커밋한다.
+        """
+        pending = session.info.pop(_PENDING_INVALIDATIONS, None)
+        if not pending:
+            return
+        await self._cache_mgr.invalidate(pending["keys"], session=session)
+        for pattern in pending["patterns"]:
+            await self._cache_mgr.invalidate_pattern(pattern, session=session)
 
     async def set_user_rate_limit(
         self,
@@ -392,11 +422,12 @@ class RateLimitService:
         removed = await repo.deactivate_configs(RateLimitScope.USER, user_id)
 
         # _set_rate_limit 이 심는 스냅샷 키와 gateway-proxy 정책 캐시를 함께 지운다 — 남겨 두면
-        # 제거 후에도 최대 5분(TTL) 동안 옛 정책이 집행된다.
-        await self._cache_mgr.invalidate([f"ratelimit:config:user:{user_id}"], session=session)
-        await self._cache_mgr.invalidate_pattern(
-            f"rl:config:{RateLimitScope.USER.value}:{user_id}:*",
-            session=session,
+        # 제거 후에도 최대 5분(TTL) 동안 옛 정책이 집행된다. ⚠️ 지우는 것은 라우터가 커밋한 **뒤**다
+        # (invalidate_after_commit). 여기서는 대상만 쌓는다.
+        _queue_invalidation(
+            session,
+            keys=(f"ratelimit:config:user:{user_id}",),
+            patterns=(f"rl:config:{RateLimitScope.USER.value}:{user_id}:*",),
         )
 
         await audit_logger.log(
@@ -459,22 +490,17 @@ class RateLimitService:
         # takes effect on the next request instead of waiting for the 5-min TTL.
         # Gateway uses keys: rl:config:{SCOPE}:{scope_id_or_NULL}:{model_alias}
         # USER/TEAM with model_alias=None covers all models → wildcard delete.
+        # ⚠️ 지우는 것은 라우터가 커밋한 **뒤**다(invalidate_after_commit). 여기서는 대상만 쌓는다.
         sid = str(scope_id) if scope_id is not None else "NULL"
         if model_alias is not None and scope != RateLimitScope.GLOBAL:
-            await self._cache_mgr.invalidate(
-                [f"rl:config:{scope.value}:{sid}:{model_alias}"],
-                session=session,
-            )
+            _queue_invalidation(session, keys=(f"rl:config:{scope.value}:{sid}:{model_alias}",))
         else:
             # ⚠️ GLOBAL 도 패턴으로 지운다. upsert 는 alias 와 무관하게 그 scope 의 활성 행을
             #    **전부** 비활성화하므로(GLOBAL 은 한 번에 한 모델만 — get_rate_limit_tree 참조),
             #    방금 해제된 **다른** 모델의 캐시(rl:config:GLOBAL:NULL:<그 모델>)가 남으면
             #    gateway-proxy 는 콘솔이 "한도 없음" 으로 보여주는 동안에도 최대 5분 그 한도를
             #    계속 집행한다.
-            await self._cache_mgr.invalidate_pattern(
-                f"rl:config:{scope.value}:{sid}:*",
-                session=session,
-            )
+            _queue_invalidation(session, patterns=(f"rl:config:{scope.value}:{sid}:*",))
 
         await audit_logger.log(
             session,

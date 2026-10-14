@@ -65,6 +65,10 @@ class TestDeleteUserOverride:
         svc = RateLimitService(cache_mgr=CacheInvalidationManager(mock_redis))
 
         await delete_override(svc, mock_session, admin_user)
+        # 커밋 전에는 지우지 않는다 — 라우터가 커밋한 뒤 비운다(지운 오버라이드가 그 창에 다시 캐시된다).
+        mock_redis.delete.assert_not_called()
+        mock_redis.scan_iter.assert_not_called()
+        await svc.invalidate_after_commit(mock_session)
 
         deleted = [c.args[0] for c in mock_redis.delete.call_args_list]
         assert f"ratelimit:config:user:{USER_ID}" in deleted
