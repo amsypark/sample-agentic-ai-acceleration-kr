@@ -19,6 +19,17 @@ interface TeamOption {
   name: string;
 }
 
+/**
+ * 허용 모델 조회의 3-state.
+ *
+ * boolean `loaded` 하나이던 동안 조회 **실패** 가 "제한 없음 (전체 허용)" 배지와 같은 화면이었다 —
+ * 서버는 빈 목록으로 "제한 없음" 을 표현하는데(행 존재 규약), 실패 분기도 똑같이
+ * `setAllowedAliases([])` 를 했기 때문이다. whitelist 가 걸린 팀이 무제한으로 읽히면 운영자는 통제가
+ * 없다고 판단하고, 그 상태에서 체크해 저장하면 실제 whitelist 를 모르는 채 덮어쓴다. 'failed' 는
+ * "모른다" 이고 'ok' 만이 서버가 실제로 답한 상태다 — 배지와 편집 UI 는 'ok' 에서만 그린다.
+ */
+type LoadState = 'unknown' | 'ok' | 'failed';
+
 interface TeamModelPermissionPanelProps {
   teams: TeamOption[];
   allTeams?: TeamOption[];
@@ -32,8 +43,12 @@ export function TeamModelPermissionPanel({ teams, allTeams, models }: TeamModelP
   const [selectedTeamId, setSelectedTeamId] = useState('');
   const [allowedAliases, setAllowedAliases] = useState<string[]>([]);
   const [hasRestrictions, setHasRestrictions] = useState(false);
-  const [loaded, setLoaded] = useState(false);
+  const [load, setLoad] = useState<LoadState>('unknown');
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // 다시 시도용 트리거 — 같은 팀을 다시 조회해야 하므로 selectedTeamId 만으로는 effect 가 돌지 않는다.
+  const [reloadNonce, setReloadNonce] = useState(0);
   const [showInactive, setShowInactive] = useState(false);
+  const loaded = load === 'ok';
 
   const visibleTeams = showInactive && allTeams ? allTeams : teams;
 
@@ -43,21 +58,43 @@ export function TeamModelPermissionPanel({ teams, allTeams, models }: TeamModelP
     if (!selectedTeamId) {
       setAllowedAliases([]);
       setHasRestrictions(false);
-      setLoaded(false);
+      setLoad('unknown');
+      setLoadError(null);
       return;
     }
+    // 팀을 바꾸면 이전 팀의 응답 상태를 즉시 버린다 — 'ok' 로 남겨 두면 조회가 끝나기 전에 이전 팀의
+    // 체크박스가 **새 팀의 정책인 것처럼** 그려진다.
+    setLoad('unknown');
+    setLoadError(null);
+    let cancelled = false;
     startTransition(async () => {
-      const result = await getTeamAllowedModelsAction(selectedTeamId);
+      let result;
+      try {
+        result = await getTeamAllowedModelsAction(selectedTeamId);
+      } catch (err) {
+        // server action 안의 try/catch 는 **서버 쪽**이다. 클라이언트→서버 RPC 자체가 끊기면
+        // (배포 스큐, 오프라인) 이 프로미스가 거부되고, 예전엔 화면이 영원히 "로딩 중" 이었다.
+        if (cancelled) return;
+        setLoad('failed');
+        setLoadError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      if (cancelled) return;
       if (result.success) {
         setAllowedAliases(result.data.model_aliases);
         setHasRestrictions(result.data.model_aliases.length > 0);
+        setLoad('ok');
       } else {
-        setAllowedAliases([]);
-        setHasRestrictions(false);
+        // ★ allowedAliases / hasRestrictions 는 **건드리지 않는다**. 빈 목록은 서버가 "제한 없음" 을
+        //   뜻하는 실제 값이므로, 읽지도 못한 상태를 그 값으로 덮으면 실패가 "제한 없음" 주장이 된다.
+        setLoad('failed');
+        setLoadError(result.error);
       }
-      setLoaded(true);
     });
-  }, [selectedTeamId]);
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedTeamId, reloadNonce]);
 
   const toggleModel = (alias: string) => {
     setAllowedAliases(prev =>
@@ -189,7 +226,27 @@ export function TeamModelPermissionPanel({ teams, allTeams, models }: TeamModelP
         </>
       )}
 
-      {selectedTeamId && !loaded && (
+      {/* ★ 실패는 "제한 없음" 도 아니고 "로딩 중" 도 아니다. 스피너로 그리면 화면이 영원히 로딩처럼
+          보이고, 배지로 그리면 읽지도 못한 상태를 "전체 허용" 이라고 단정한다. 그래서 이 자리는
+          "모른다 + 다시 시도" 만 말한다 — 편집 UI 는 닫혀 있다. */}
+      {selectedTeamId && load === 'failed' && (
+        <div
+          role="alert"
+          className="space-y-2 rounded-apple-md border border-destructive/40 bg-destructive/5 p-3"
+        >
+          <p className="text-sm text-destructive">{t('teamPermissionLoadFailed', { error: loadError ?? '' })}</p>
+          <button
+            type="button"
+            onClick={() => setReloadNonce(n => n + 1)}
+            disabled={isPending}
+            className="text-xs text-primary hover:underline disabled:opacity-50"
+          >
+            {t('retryLoad')}
+          </button>
+        </div>
+      )}
+
+      {selectedTeamId && load === 'unknown' && (
         <div className="flex items-center gap-2 text-sm text-muted-foreground py-4">
           <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
           {t('loadingText')}

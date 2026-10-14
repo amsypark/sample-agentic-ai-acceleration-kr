@@ -20,6 +20,8 @@
   4. 채팅 assistant 메시지 INSERT 가 ``duration_ms`` 를 실제 스키마(0005)에 쓰고, 그 값이 done
      프레임의 ``durationMs`` 와 같다(⚠️ chat_agent 스키마는 migration 소유라 init SQL 로 만든
      owned DB 에는 없다 — 이 테스트만 alembic head 의 PROOF_DSN DB 를 쓰고 만든 행을 지운다).
+  5. /admin/monitoring/models 의 status 가 등록부 LEFT JOIN 으로 ACTIVE / INACTIVE /
+     UNREGISTERED 를 실제로 구분하고, 등록부에 없는 alias 의 트래픽이 사라지지 않는다.
 
 실행::
 
@@ -672,3 +674,48 @@ async def test_assistant_message_persists_the_done_frame_duration(monkeypatch):
         async with engine.begin() as conn:
             await conn.execute(text("DELETE FROM chat_agent.sessions WHERE id = :id"), {"id": sid})
         await engine.dispose()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. 모니터링 모델 상태 — 등록부 LEFT JOIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def test_monitoring_status_reflects_the_registry(owned_dsn):
+    """최근 1시간 트래픽: 활성 alias / 비활성 alias(시드에서 INACTIVE 로 내림) / 등록부에 없는 alias."""
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.routers.monitoring import UNREGISTERED_MODEL_STATUS, monitoring_models
+
+    asyncpg = pytest.importorskip("asyncpg")
+    conn = await asyncpg.connect(_asyncpg_dsn(owned_dsn))
+    try:
+        dept_id = await conn.fetchval("SELECT dept_id FROM auth.teams WHERE id = $1", SEED_TEAM_ID)
+        for alias in ("claude-opus-4-8", RETIRED_ALIAS, "ghost-model-proof", "ghost-model-proof"):
+            await conn.execute(
+                "INSERT INTO usage.usage_logs "
+                "(id, request_id, user_id, team_id, dept_id, model_alias, provider, status, "
+                " requested_at, completed_at, cost_usd, input_tokens, output_tokens, latency_ms) "
+                "VALUES (gen_random_uuid(), gen_random_uuid()::text, $1, $2, $3, $4, 'BEDROCK', "
+                "        'SUCCESS'::usage.usage_status, now() - interval '5 minutes', now(), 0.01, 1, 1, 50)",
+                U_A, SEED_TEAM_ID, dept_id, alias,
+            )
+    finally:
+        await conn.close()
+
+    engine = create_async_engine(owned_dsn)
+    try:
+        async with async_sessionmaker(engine)() as session:
+            out = await monitoring_models(request=MagicMock(), admin=MagicMock(), session=session)
+    finally:
+        await engine.dispose()
+
+    by_alias = {m["alias"]: m for m in out["models"]}
+    assert by_alias["claude-opus-4-8"]["status"] == "ACTIVE"
+    assert by_alias[RETIRED_ALIAS]["status"] == "INACTIVE", "비활성 모델이 ACTIVE 로 보인다"
+    ghost = by_alias.get("ghost-model-proof")
+    assert ghost is not None, "등록부에 없는 alias 의 트래픽이 조인에서 사라졌다"
+    assert ghost["status"] == UNREGISTERED_MODEL_STATUS
+    assert ghost["last_1h_requests"] == 2, "GROUP BY 가 status 때문에 행을 쪼개거나 합쳤다"

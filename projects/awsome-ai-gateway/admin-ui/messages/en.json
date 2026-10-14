@@ -389,6 +389,8 @@
     "minOneModel": "Select at least one model.",
     "teamPermissionSaved": "Team model access saved.",
     "restrictionCleared": "Model access restriction cleared.",
+    "teamPermissionLoadFailed": "Could not load the team model access — the current restriction is unknown. ({error})",
+    "retryLoad": "Retry",
     "deactivateSuccess": "Model {alias} has been deactivated.",
     "deactivateTarget": "Model",
     "deactivateTargetSuffix": "will be deactivated.",
