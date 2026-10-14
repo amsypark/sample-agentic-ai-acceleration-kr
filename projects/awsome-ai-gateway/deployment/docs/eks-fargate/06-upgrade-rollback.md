@@ -185,6 +185,58 @@ helm install llm-gateway ./deployment/charts/llm-gateway \
 
 ⚠️ 마이그레이션 Job 이 재실행됨. 이미 진행된 migration 은 skip되므로 안전.
 
+### 4.4 Migration 0046 — GLOBAL rate limit 을 모델별로
+
+0046 은 활성 GLOBAL rate limit 행의 유일성을 "전체에서 1개" 에서 "model alias 당 1개" 로 바꾼다
+(USER/TEAM 은 그대로 주체당 1개). 데이터는 바꾸지 않는다 — 0045 까지 활성 GLOBAL 행은 많아야 1개였으므로
+새 제약이 이미 성립한다. 이후 한 모델의 GLOBAL 저장은 다른 모델의 GLOBAL 한도를 해제하지 않는다.
+
+**업그레이드 순서.** 평소의 `helm upgrade` 그대로다. 마이그레이션 Job(pre-upgrade 훅)이 init SQL →
+`alembic upgrade head` 를 마친 뒤 Deployment 가 롤링된다.
+
+- gateway-proxy 는 순서 제약이 없다. 이전 게이트웨이도 GLOBAL 한도를 요청의 alias 로 읽고 카운터를 alias 별로
+  두므로(`{GLOBAL:*:<alias>}`), 활성 GLOBAL 행이 여러 개인 DB 에서도 모델마다 자기 행만 집행한다. 실 PG + 실
+  Redis 증명은 gateway-proxy `tests/regression/test_high_global_rate_limit_per_model_real.py`, Redis Cluster 는
+  `tests/integration/test_rate_limit_cluster.py`.
+- **롤링이 끝날 때까지 GLOBAL 한도를 편집하지 않는다.** 그동안 섞이는 조합:
+  - 이전 admin-api 파드가 받은 GLOBAL 저장은 이전 의미대로 다른 모델의 GLOBAL 한도를 해제한다. 새 파드가 이미 두
+    모델 이상에 저장했다면, 단일 슬롯 409 가 있는 이전 버전은 활성 GLOBAL 행을 하나로 가정하고 읽다가 **500**
+    이다(`MultipleResultsFound`, 아무것도 바뀌지 않는다). 그보다 이전 버전은 저장이 성공하면서 다른 모델의
+    GLOBAL 행을 전부 비활성화한다.
+  - 이전 콘솔은 다른 모델이 한도를 가진 동안 "그 한도가 해제된다" 고 확인받은 뒤 `release_alias` 를 보낸다.
+    새 admin-api 는 이를 **409** 로 거절하고 아무것도 바꾸지 않는다. 콘솔을 새로 고친다.
+  - 이전·새 admin-api 의 GLOBAL 저장은 같은 advisory lock 키로 직렬화되므로 서로 끼어들어 유니크 위반을 내지 않는다.
+
+**롤백.**
+
+- `helm rollback` 은 마이그레이션 훅을 돌리지 않는다(훅은 pre-install·pre-upgrade 뿐이다). 이미지만 되돌리면
+  DB 는 0046 에 남는다. 이전 gateway-proxy 는 위와 같이 모델별로 집행하므로 안전하다. 이전 admin-api 는 위
+  "섞이는 조합" 의 이전 파드처럼 동작한다 — 두 모델 이상이 GLOBAL 행을 가진 동안 GLOBAL 저장이 500 이거나,
+  저장할 때 한 모델만 남긴다.
+- 단일 슬롯으로 정말 돌아가려면 **이미지를 되돌리기 전에**, 0046 이 있는 마이그레이션 이미지로
+  `alembic downgrade 0045` 를 돌린다.
+  - 실제 한도(rpm 또는 tpm)를 가진 활성 GLOBAL 행이 2개 이상이면 **실패하고 아무것도 바꾸지 않는다.** 메시지에
+    모델·한도 목록과 정리 SQL 이 있다. 남길 모델을 정해 나머지를 비운 뒤(콘솔에서 입력을 비우고 저장, 또는 아래
+    UPDATE) 다시 돌린다.
+
+    ```sql
+    SELECT model_alias, rpm_limit, tpm_limit FROM model.rate_limit_configs
+     WHERE scope = 'GLOBAL' AND is_active ORDER BY model_alias;
+    UPDATE model.rate_limit_configs SET is_active = false
+     WHERE scope = 'GLOBAL' AND is_active AND model_alias IS DISTINCT FROM '<남길 alias>';
+    ```
+
+  - rpm·tpm 이 모두 비어 있는 활성 GLOBAL 행은 아무것도 집행하지 않으므로 다운그레이드가 비활성화한다(삭제가
+    아니다, 이력은 남는다).
+  - 자동으로 하나만 남기지 않는 이유: 나머지 모델의 Bedrock 쿼터 보호가 아무 신호 없이 사라진다. 어느 모델을
+    남길지는 운영 판단이다.
+- **부분 다운그레이드와 다음 Job.** 0045 로 내린 뒤 0046 이 있는 차트로 Job 이 다시 돌면 init SQL 이 GLOBAL
+  인덱스를 다시 만들고 alembic 이 0046 을 다시 적용한다. 0045 로 남기려면 다운그레이드 직후 `helm rollback` 으로
+  이전 차트로 돌아간다(롤백은 Job 을 돌리지 않는다).
+- 다운그레이드하지 않고 이전 차트로 `helm upgrade` 하면 그 Job 은 실패한다. 이전 init SQL 은 같은 이름의 인덱스가
+  있어 no-op 이라 모델별 GLOBAL 은 그대로지만, 이어지는 `alembic upgrade head` 가
+  `Can't locate revision identified by '0046'` 로 끝난다. 먼저 위 다운그레이드를 한다.
+
 ---
 
 ## 5. 카나리/블루그린 (추가 구성 필요)
