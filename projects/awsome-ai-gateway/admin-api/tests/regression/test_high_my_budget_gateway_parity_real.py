@@ -189,3 +189,53 @@ async def test_redis_down_falls_back_to_budget_usages(db, redis_client):
         assert await _card_says_exhausted(db, other, down) is False
     finally:
         await down.aclose()
+
+
+# ── 판정 산술 — budget_check.lua 는 double 로 계산한다 ─────────────────────────────────────────────────
+#
+# 같은 상태라도 십진수(Decimal)로 계산하면 경계에서 Lua 와 갈린다. 예: SOFT_WARNING · 한도 $0.01 · 사용 $0.0110 —
+# Lua 는 0.011*100 = 1.0999999999999999 < 0.01*110 = 1.1 이라 **통과**시키는데, Decimal 로는 1.1000 >= 1.10 이라
+# '소진' 이다. 그리드는 리뷰어가 쓴 것과 같다(정책 3 × 한도 6 × 경계 근처 사용액).
+
+GRID_POLICIES = ("HARD_BLOCK", "SOFT_WARNING", "THROTTLE")
+GRID_LIMITS = ("0", "0.01", "1", "100", "1000.5", "5000")
+
+
+def _grid_useds(limit: str) -> list[str]:
+    cap = Decimal(limit)
+    values = {
+        Decimal("0"), Decimal("0.0001"), cap * Decimal("0.5"), cap * Decimal("0.999"), cap,
+        cap * Decimal("1.0999"), cap * Decimal("1.1"), cap * Decimal("1.2"), cap + Decimal("0.0001"),
+    }
+    return sorted({str(v.quantize(Decimal("0.0001"))) for v in values})  # 같은 문자열로 접히는 값은 한 번
+
+
+async def test_the_card_agrees_with_budget_check_lua_on_the_whole_grid(db, redis_client):
+    cases = denied = 0
+    mismatches = []
+    for policy in GRID_POLICIES:
+        for limit in GRID_LIMITS:
+            team = await _team(db, redis_client, limit, policy)
+            for used in _grid_useds(limit):
+                await redis_client.set(team.usage_key, used)  # 카운터 문자열 — Lua 도 카드도 이 값을 읽는다
+                lua = await _gateway_denies(redis_client, team)
+                card = await _card_says_exhausted(db, team, redis_client)
+                cases += 1
+                denied += lua
+                if lua != card:
+                    mismatches.append(f"{policy} limit={limit} used={used}: lua_denies={lua} card={card}")
+    # 3 정책 × 45 칸(리뷰어 그리드와 같은 135) — 거부되는 칸이 있어야 공허하지 않다.
+    assert (cases, denied > 0) == (135, True), f"그리드가 바뀌었거나 공허하다: cases={cases} denied={denied}"
+    assert mismatches == [], "카드가 게이트웨이와 다르게 판정했다:\n" + "\n".join(mismatches)
+
+
+async def test_the_float_edge_soft_warning_one_cent(db, redis_client):
+    """SOFT_WARNING · $0.01 · $0.0110 — Lua 는 통과(double), 십진수로 계산하면 '소진' 이 된다."""
+    team = await _team(db, redis_client, "0.01", "SOFT_WARNING")
+    await redis_client.set(team.usage_key, "0.0110")
+    assert await _gateway_denies(redis_client, team) is False, "전제: Lua 는 이 요청을 통과시킨다"
+    assert await _card_says_exhausted(db, team, redis_client) is False
+
+    await redis_client.set(team.usage_key, "0.0111")  # 대조군 — 조금 더 쓰면 둘 다 거부
+    assert await _gateway_denies(redis_client, team) is True
+    assert await _card_says_exhausted(db, team, redis_client) is True

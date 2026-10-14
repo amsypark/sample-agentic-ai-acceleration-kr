@@ -163,6 +163,9 @@ async def test_team_with_a_budget_is_reported_as_configured():
         (BudgetPolicy.SOFT_WARNING, "100", "109.99", False),
         (BudgetPolicy.SOFT_WARNING, "100", "110", True),
         (BudgetPolicy.SOFT_WARNING, "0", "0", True),
+        # float64 경계 — Lua: 0.011*100 = 1.0999999999999999 < 0.01*110 = 1.1 → 통과(십진수로는 '소진' 이 된다)
+        (BudgetPolicy.SOFT_WARNING, "0.01", "0.0110", False),
+        (BudgetPolicy.SOFT_WARNING, "0.01", "0.0111", True),
         (BudgetPolicy.THROTTLE, "100", "500", False),
         (BudgetPolicy.THROTTLE, "0", "0", False),
     ],

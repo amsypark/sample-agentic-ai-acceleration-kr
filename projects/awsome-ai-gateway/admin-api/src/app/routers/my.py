@@ -24,6 +24,26 @@ router = APIRouter(prefix="/admin/my", tags=["My Usage"])
 _GATEWAY_SOFT_LIMIT_PCT = 110
 
 
+def _gateway_denies_team(policy: BudgetPolicy, limit: Decimal, used: Decimal) -> bool:
+    """budget_check.lua 의 팀 계층 거부 판정 — **같은 식, 같은 피연산자, float64**.
+
+    Lua 의 숫자는 double 이다. limit 은 config 캐시의 문자열(str(Decimal))을, used 는 카운터 문자열을
+    ``tonumber`` 한 값이고, ``float()`` 는 같은 십진 문자열에서 같은 double 을 만든다.
+      hard_block    ``used >= limit``
+      soft_warning  ``used * 100 >= limit * soft_limit_pct``  (soft_limit_pct 는 config 에 없어 Lua 기본값 110)
+      throttle      거부하지 않는다(RPM 만 줄인다)
+    ⚠️ 십진수(Decimal)로 계산하면 경계에서 Lua 와 갈린다. SOFT_WARNING · 한도 $0.01 · 사용 $0.0110 은 Lua 에서
+       0.011*100 = 1.0999999999999999 < 0.01*110 = 1.1 이라 **통과**인데, Decimal 로는 1.1000 >= 1.10 이라 '소진'
+       이었다(실 Redis 의 Lua 와 그리드로 대조 — tests/regression/test_high_my_budget_gateway_parity_real.py).
+    """
+    limit_f, used_f = float(limit), float(used)
+    if policy == BudgetPolicy.HARD_BLOCK:
+        return used_f >= limit_f
+    if policy == BudgetPolicy.SOFT_WARNING:
+        return used_f * 100 >= limit_f * _GATEWAY_SOFT_LIMIT_PCT
+    return False
+
+
 async def _team_used_usd(redis, session: AsyncSession, team_id: uuid.UUID, period: str) -> Decimal:
     """게이트웨이가 팀 계층을 판정할 때 보는 이번 달 팀 사용액 — 원천과 해석이 게이트웨이와 같아야 한다.
 
@@ -119,7 +139,7 @@ async def get_my_budget(
     team_budget_configured = False
     # ⚠️ 팀 예산 행이 **있어도** 게이트웨이가 거부하는 상태가 있다 — 그 팀 예산이 소진됐을 때다. 행이 있다는
     #    사실(budget_configured)과 따로 낸다: 소진을 "미설정" 으로 접으면 카드가 있는 예산을 없다고 말한다.
-    #    규칙은 게이트웨이 팀 계층 판정(redis_scripts/budget_check.lua) 그대로다 — 실 Redis 에서 확인:
+    #    규칙은 게이트웨이 팀 계층 판정(redis_scripts/budget_check.lua) 그대로다(_gateway_denies_team, float64):
     #      HARD_BLOCK   used >= limit               ($0 은 항상 거부)
     #      SOFT_WARNING used * 100 >= limit * 110   ($0 은 항상 거부. Redis 가 죽었을 때의 DB 폴백만
     #                                                `limit > 0` 조건 때문에 $0 을 통과시킨다 — 평소 경로를 따른다)
@@ -143,11 +163,7 @@ async def get_my_budget(
         team_budget_configured = team_cfg is not None
         if team_cfg is not None:
             team_used = await _team_used_usd(request.app.state.redis, session, team_id, period)
-            team_limit = team_cfg.max_budget_usd
-            if team_cfg.policy == BudgetPolicy.HARD_BLOCK:
-                team_budget_exhausted = team_used >= team_limit
-            elif team_cfg.policy == BudgetPolicy.SOFT_WARNING:
-                team_budget_exhausted = team_used * 100 >= team_limit * _GATEWAY_SOFT_LIMIT_PCT
+            team_budget_exhausted = _gateway_denies_team(team_cfg.policy, team_cfg.max_budget_usd, team_used)
 
     return {
         "user_id": str(user.user_id),
