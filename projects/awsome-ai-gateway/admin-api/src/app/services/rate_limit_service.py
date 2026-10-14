@@ -359,7 +359,8 @@ class RateLimitService:
             rows = [r for r in result.scalars().all() if r.rpm_limit and r.rpm_limit > 0]
             if not rows:
                 return None
-            # model_alias IS NULL 행(전 모델 합산)이 모든 모델을 지배하므로 우선한다.
+            # USER/TEAM 은 활성 행이 하나뿐이다(0024 유니크 인덱스). 그래도 여러 행이 보이면
+            # 전 모델 행(model_alias IS NULL)을 대표값으로 쓴다 — 화면 게이지 분모는 하나여야 한다.
             for row in rows:
                 if row.model_alias is None:
                     return int(row.rpm_limit)
