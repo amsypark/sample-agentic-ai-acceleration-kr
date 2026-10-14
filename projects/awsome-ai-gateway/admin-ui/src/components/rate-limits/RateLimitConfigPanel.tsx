@@ -63,7 +63,7 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
   const [usage, setUsage] = useState<RateLimitUsage | null>(null);
   const [confirmingRelease, setConfirmingRelease] = useState(false);
 
-  // 폼 값 초기화 — 다른 노드를 골랐거나 **이 노드 자신의 저장값**이 바뀌었을 때만.
+  // 폼 값·에러 초기화 — 다른 노드를 골랐거나 **이 노드 자신의 저장값**이 바뀌었을 때만.
   //
   // ⚠️ 프리필 조건은 "config 가 있는가" 가 아니라 **"이 노드 자신의 설정인가"** 다. 상속 중인
   //    USER 노드의 `config` 는 팀의 행(config.scope="TEAM", inherited_from 설정)이다. 그 값을
@@ -71,9 +71,11 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
   //    **새 USER 행**에 굳는다. 이후 팀 한도를 올려도 그 사용자만 옛 값에 고정된다(gateway-proxy 는
   //    스코프별로 독립 집행한다). 상속값은 placeholder 로만 보여준다.
   //
-  // ⚠️ effect 를 노드 **객체**에 걸면 안 된다. 선택은 id 로 매 렌더 새 트리에서 찾으므로(RateLimitTreeView)
-  //    트리를 새로 받을 때마다 같은 노드도 새 객체다. 409 분기는 새 슬롯 주인을 보여 주려고 트리를 다시
-  //    받는다(revalidatePath) — 객체에 걸려 있던 동안 409 가 나는 순간 입력값과 409 문구가 함께 지워졌다.
+  // ⚠️ effect 를 노드 **객체**에 걸면 안 된다(아래 사용량 폴링도). 선택은 id 로 매 렌더 새 트리에서 찾으므로
+  //    (RateLimitTreeView) 트리를 새로 받을 때마다 같은 노드도 새 객체다. 409 분기는 새 슬롯 주인을 보여 주려고
+  //    트리를 다시 받는다(revalidatePath) — 객체에 걸려 있던 동안 409 가 나는 순간 입력값과 409 문구가 함께 지워졌다.
+  //    반대로 이 노드의 저장값이 바뀌었다면(다른 운영자가 저장했다) 입력칸은 새 값을 따르고 409 문구와 해제 확인도
+  //    지운다 — 그 409 는 이제 낡았다. 예전엔 입력칸만 바뀌고 문구가 남아 새 값에 대한 충돌처럼 읽혔다.
   const nodeId = node?.id ?? null;
   const inheritedFrom = node?.inherited_from ?? null;
   const own = node?.config && !node.inherited_from ? node.config : null;
@@ -87,30 +89,29 @@ export function RateLimitConfigPanel({ node, globalSlotHolder = null }: RateLimi
     setTpm(ownTpm);
     setCpm(ownCpm);
     setCph(ownCph);
-  }, [nodeId, inheritedFrom, ownRpm, ownTpm, ownCpm, ownCph]);
-  // 에러와 해제 확인은 **다른 노드를 골랐을 때만** 지운다 — 같은 노드의 새로고침은 409 문구를 지우면 안 된다.
-  useEffect(() => {
     setError(null);
     setConfirmingRelease(false);
-  }, [nodeId]);
+  }, [nodeId, inheritedFrom, ownRpm, ownTpm, ownCpm, ownCph]);
 
   // 실시간 RPM 사용량(§60.9) — node 선택 시 + 10초마다 폴링(gateway-proxy Redis 카운터).
   // GLOBAL 도 폴링한다: proxy 는 GLOBAL 스코프에도 카운터를 쌓고(키의 scope_id 자리는 리터럴
   // '*', 모델은 model_alias 자리) GLOBAL 노드 id 가 곧 model alias 다.
+  // 노드 객체가 아니라 (scope, id) 에 건다 — 트리를 새로 받을 때마다 즉시 다시 부르고 주기를 처음부터 시작했다.
+  const nodeScope = node?.scope ?? null;
   useEffect(() => {
-    if (!node) {
+    if (nodeScope == null || nodeId == null) {
       setUsage(null);
       return;
     }
     let alive = true;
     const load = () =>
-      fetchRateLimitUsage(node.scope, node.id)
+      fetchRateLimitUsage(nodeScope, nodeId)
         .then((u) => { if (alive) setUsage(u); })
         .catch(() => { if (alive) setUsage(null); });
     load();
     const t = setInterval(load, 10_000);
     return () => { alive = false; clearInterval(t); };
-  }, [node]);
+  }, [nodeScope, nodeId]);
 
   if (!node) {
     return (

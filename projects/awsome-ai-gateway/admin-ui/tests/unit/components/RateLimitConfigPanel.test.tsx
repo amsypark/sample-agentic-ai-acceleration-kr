@@ -357,4 +357,57 @@ describe('트리를 새로 받아도(revalidatePath) 운영자의 입력과 에�
 
     expect(rpmInput()).toHaveValue(61);
   });
+
+  it('새로 받은 트리에서 이 노드의 저장값이 바뀌었으면 409 문구도 지운다 — 그 409 는 이제 낡았다', async () => {
+    // 예전엔 입력칸은 새 저장값(77)으로 바뀌는데 409 문구는 남아, 운영자는 지금 값에 대한 충돌로 읽었다.
+    const user = userEvent.setup();
+    setRateLimitAction.mockResolvedValue({ success: false, error: CONFLICT });
+    const { rerender } = render(
+      <RateLimitConfigPanel node={globalUncapped} globalSlotHolder={globalCapped} />,
+    );
+    await user.type(rpmInput(), '40');
+    await user.click(screen.getByRole('button', { name: 'save' }));
+    await user.click(screen.getByRole('button', { name: 'releaseAndSave' }));
+    await waitFor(() => expect(screen.getByText(CONFLICT)).toBeInTheDocument());
+
+    const changed = fresh(globalUncapped.id); // 다른 운영자가 이 모델에 rpm 77 을 저장했다
+    changed.config = { target_id: changed.id, scope: 'GLOBAL', rpm: 77, tpm: null, cpm: null, cph: null };
+    rerender(<RateLimitConfigPanel node={changed} globalSlotHolder={changed} />);
+
+    expect(rpmInput()).toHaveValue(77);
+    expect(screen.queryByText(CONFLICT)).toBeNull();
+  });
+
+  it('노드가 트리에서 사라지면 선택 안내로 돌아가고, 다시 나타나면 저장값으로 시작한다', async () => {
+    const user = userEvent.setup();
+    setRateLimitAction.mockResolvedValue({ success: false, error: CONFLICT });
+    const { rerender } = render(<RateLimitConfigPanel node={ownUserNode} />);
+    await user.clear(rpmInput());
+    await user.type(rpmInput(), '99');
+    await user.click(screen.getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(screen.getByText(CONFLICT)).toBeInTheDocument());
+
+    rerender(<RateLimitConfigPanel node={null} />); // 예: 비활성 필터로 트리에서 빠졌다
+    expect(screen.getByText('selectNodePrompt')).toBeInTheDocument();
+    expect(screen.queryByText(CONFLICT)).toBeNull();
+
+    rerender(<RateLimitConfigPanel node={fresh(ownUserNode.id)} />); // 다시 나타났다
+    expect(rpmInput()).toHaveValue(60); // 사라지기 전의 입력(99)이 아니라 저장값
+    expect(screen.queryByText(CONFLICT)).toBeNull();
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenLastCalledWith('USER', ownUserNode.id));
+  });
+
+  it('같은 노드를 새로 받은 트리로 다시 그려도 사용량 폴링을 처음부터 다시 시작하지 않는다', async () => {
+    const { rerender } = render(<RateLimitConfigPanel node={ownUserNode} />);
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalledTimes(1));
+
+    rerender(<RateLimitConfigPanel node={fresh(ownUserNode.id)} />);
+    rerender(<RateLimitConfigPanel node={fresh(ownUserNode.id)} />);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetchRateLimitUsage).toHaveBeenCalledTimes(1); // 폴링 주기(10초)가 아니라 새로고침마다 다시 불렀다
+
+    rerender(<RateLimitConfigPanel node={teamlessNode} />); // 대조군 — 다른 노드면 새로 시작한다
+    await waitFor(() => expect(fetchRateLimitUsage).toHaveBeenCalledTimes(2));
+    expect(fetchRateLimitUsage).toHaveBeenLastCalledWith('USER', teamlessNode.id);
+  });
 });
