@@ -10,10 +10,10 @@
 Terraform으로 코드화되어 있고 인스톨러 TUI로 한 번에 배포합니다.
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=CrrE89tJL7g">
+  <a href="https://youtu.be/yte8TJr7obo">
     <img src="docs/images/demo-video-thumbnail.png" alt="전체 데모 영상 보기 (YouTube) — Harness 에이전트가 AgentCore Code Interpreter 로 만든 PPTX 를 채팅 옆 artifact 패널에 띄운 화면" width="900">
   </a><br>
-  <sub>▶ <a href="https://www.youtube.com/watch?v=CrrE89tJL7g">전체 데모 영상 보기 (YouTube)</a> · Harness 에이전트가 AgentCore Code Interpreter 로 만든 PPTX 를 채팅 옆 artifact 패널에 띄운 화면</sub>
+  <sub>▶ <a href="https://youtu.be/yte8TJr7obo">전체 데모 영상 보기 (YouTube)</a> · Harness 에이전트가 AgentCore Code Interpreter 로 만든 PPTX 를 채팅 옆 artifact 패널에 띄운 화면</sub>
 </p>
 
 ## 목차
