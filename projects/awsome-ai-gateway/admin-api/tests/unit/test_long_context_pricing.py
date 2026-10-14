@@ -218,6 +218,7 @@ async def test_create_model_persists_long_tier(mock_session, admin_user):
         repo.create_model = AsyncMock(side_effect=_ts)
         repo.create_pricing = AsyncMock()
         mock_audit.log = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=MagicMock())  # 형제 alias 조회: 빈 결과
         await svc.create_model(mock_session, data=data, actor=admin_user)
 
     written = repo.create_pricing.call_args.args[0]

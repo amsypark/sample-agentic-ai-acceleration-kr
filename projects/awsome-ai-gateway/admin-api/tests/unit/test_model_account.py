@@ -19,7 +19,7 @@ import pytest
 from pydantic import ValidationError as PydanticValidationError
 
 from app.core.auth import CurrentUser
-from app.core.exceptions import ValidationError
+from app.core.exceptions import ConflictError, ValidationError
 from app.models.auth import UserRole
 from app.models.model import ApiFormat, ModelAlias, ModelStatus, Provider
 from app.schemas.aws_accounts import (
@@ -28,7 +28,7 @@ from app.schemas.aws_accounts import (
     account_id_of,
 )
 from app.schemas.common import ApiFormatEnum, ProviderEnum
-from app.schemas.models import ModelCreateRequest, ModelUpdateRequest
+from app.schemas.models import ModelCreateRequest, ModelUpdateRequest, StatusPatchRequest
 from app.services.aws_account_service import model_cache_keys
 from app.services.model_service import ModelService
 
@@ -61,7 +61,8 @@ def test_a_registered_account_name_is_accepted(name):
 
 
 @pytest.mark.parametrize(
-    "name", ["default", "gateway", "inherit", "none", "ab", "-x1", "x1-", "Upper", "under_score"]
+    "name",
+    ["default", "gateway", "inherit", "none", "ab", "-x1", "x1-", "Upper", "under_score", "acct-1\n"],
 )
 def test_reserved_and_malformed_account_names_are_a_422(name):
     """예약어는 콘솔의 "기본값" 과 구별되지 않는다 — DB CHECK 와 같은 규칙을 여기서 422 로."""
@@ -100,6 +101,12 @@ def _acct(**kw):
         "arn:aws:iam::12345:role/x",
         "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude",
         "   ",
+        # 와일드카드·가짜 파티션·비 ASCII — 같은 문법이 terraform 에서는 IAM 정책 Resource 다.
+        "arn:aws:iam::111122223333:role/*",
+        "arn:aws:iam::111122223333:role/gw-*",
+        "arn:awsfoo:iam::111122223333:role/x",
+        "arn:aws:iam::111122223333:role/역할",
+        "arn:aws:iam::111122223333:role/a b",
     ],
 )
 def test_only_iam_role_arns_are_registered(role):
@@ -109,9 +116,14 @@ def test_only_iam_role_arns_are_registered(role):
 
 def test_partitions_and_paths_are_accepted():
     assert _acct(role_arn="arn:aws-us-gov:iam::111122223333:role/path/to/r").role_arn.endswith("/r")
+    assert _acct(role_arn="arn:aws-iso-b:iam::111122223333:role/a+b=c,d.e@f_g-h").role_arn
 
 
-@pytest.mark.parametrize("ext", ["x", "has space", "", "a" * 1225])
+def test_the_full_sts_external_id_charset_is_accepted():
+    assert _acct(external_id="Ab0_+=,.@:/-").external_id == "Ab0_+=,.@:/-"
+
+
+@pytest.mark.parametrize("ext", ["x", "has space", "", "a" * 1225, "외부아이디", "ext*", "üext"])
 def test_external_ids_outside_the_sts_constraint_are_refused(ext):
     with pytest.raises(PydanticValidationError):
         _acct(external_id=ext)
@@ -145,14 +157,14 @@ def test_model_cache_keys_cover_the_alias_every_model_id_and_the_list():
 # ── ModelService ──────────────────────────────────────────────────────────────────
 
 
-def _model(provider=Provider.BEDROCK, account_name=None):
+def _model(provider=Provider.BEDROCK, account_name=None, alias="claude-x", status=ModelStatus.ACTIVE):
     m = MagicMock(spec=ModelAlias)
-    m.alias = "claude-x"
+    m.alias = alias
     m.provider = provider
     m.provider_model_id = "global.anthropic.claude-x"
     m.endpoint_url = None
     m.api_format = ApiFormat.BEDROCK_NATIVE
-    m.status = ModelStatus.ACTIVE
+    m.status = status
     m.description = None
     m.display_name = None
     m.allowed_clients = None
@@ -164,10 +176,15 @@ def _model(provider=Provider.BEDROCK, account_name=None):
     return m
 
 
-def _session(registered=("inregion-seoul",)):
+def _session(registered=("inregion-seoul", "dedicated"), siblings=()):
+    """``siblings`` = 같은 모델 id 의 다른 ACTIVE alias 조회가 돌려줄 행(advisory lock 문장은
+    결과를 읽지 않으므로 같은 결과 객체를 받아도 된다)."""
     s = AsyncMock()
-    s.get = AsyncMock(side_effect=lambda cls, key: object() if key in registered else None)
+    s.get = AsyncMock(side_effect=lambda cls, key, **kw: object() if key in registered else None)
     s.flush = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = list(siblings)
+    s.execute = AsyncMock(return_value=result)
 
     async def _refresh(obj, attribute_names=None):
         # 트리거가 DB 에서 한 일을 흉내 낸다: 선택이 있으면 사본을 채우고, 없으면 비운다.
@@ -223,12 +240,13 @@ async def test_create_stores_the_selection_and_answers_with_the_trigger_copy():
 
         repo.create_model = AsyncMock(side_effect=_create_model)
         repo.create_pricing = AsyncMock()
-        resp = await svc.create_model(
+        out = await svc.create_model(
             _session(), actor=ADMIN, data=_create(alias="claude-x", account_name="inregion-seoul")
         )
-    assert (resp.account_name, resp.account_role_arn) == ("inregion-seoul", ROLE)
-    keys = cache.invalidate.await_args.args[0]
-    assert "model:anthropic.x" in keys and "model:claude-x" in keys and "model:list" in keys
+    assert (out.response.account_name, out.response.account_role_arn) == ("inregion-seoul", ROLE)
+    assert out.cache_keys == ["model:claude-x", "model:anthropic.x", "model:list"]
+    # 커밋 전(서비스 안)에는 지우지 않는다 — 라우터가 커밋 뒤에 지운다(ModelMutation).
+    cache.invalidate.assert_not_awaited()
 
 
 async def test_update_without_the_key_keeps_the_selection():
@@ -241,11 +259,12 @@ async def test_update_without_the_key_keeps_the_selection():
         repo.get_by_alias = AsyncMock(return_value=model)
         repo.update_model = AsyncMock(return_value=model)
         repo.get_current_pricing = AsyncMock(return_value=None)
-        resp = await svc.update_model(
+        out = await svc.update_model(
             _session(), alias="claude-x", data=ModelUpdateRequest(description="d"), actor=ADMIN
         )
     assert "account_name" not in repo.update_model.await_args.kwargs
-    assert (resp.account_name, resp.account_role_arn) == ("inregion-seoul", ROLE)
+    assert "apply_to_siblings" not in repo.update_model.await_args.kwargs, "컬럼이 아니다"
+    assert (out.response.account_name, out.response.account_role_arn) == ("inregion-seoul", ROLE)
 
 
 async def test_update_with_an_explicit_null_clears_the_selection():
@@ -259,13 +278,14 @@ async def test_update_with_an_explicit_null_clears_the_selection():
         repo.get_by_alias = AsyncMock(return_value=model)
         repo.update_model = AsyncMock(return_value=model)
         repo.get_current_pricing = AsyncMock(return_value=None)
-        resp = await svc.update_model(
+        out = await svc.update_model(
             _session(), alias="claude-x", data=ModelUpdateRequest(account_name=None), actor=ADMIN
         )
     assert model.account_name is None
-    assert (resp.account_name, resp.account_role_arn) == (None, None)
+    assert (out.response.account_name, out.response.account_role_arn) == (None, None)
     assert audit.log.await_args.kwargs["changes"]["after"]["account_name"] is None
-    assert "model:global.anthropic.claude-x" in cache.invalidate.await_args.args[0]
+    assert "model:global.anthropic.claude-x" in out.cache_keys
+    cache.invalidate.assert_not_awaited()
 
 
 async def test_update_rejects_an_account_on_an_existing_openmodel_alias():
@@ -300,9 +320,148 @@ async def test_update_invalidates_the_old_and_new_model_id_keys():
         repo.get_by_alias = AsyncMock(return_value=model)
         repo.update_model = AsyncMock(side_effect=_apply)
         repo.get_current_pricing = AsyncMock(return_value=None)
-        await svc.update_model(
+        out = await svc.update_model(
             _session(), alias="claude-x", actor=ADMIN,
             data=ModelUpdateRequest(provider_model_id="global.anthropic.claude-y"),
         )
-    keys = cache.invalidate.await_args.args[0]
-    assert "model:global.anthropic.claude-x" in keys and "model:global.anthropic.claude-y" in keys
+    assert "model:global.anthropic.claude-x" in out.cache_keys
+    assert "model:global.anthropic.claude-y" in out.cache_keys
+
+
+# ── 같은 모델 id 의 형제 alias 와 계정 일치 ───────────────────────────────────────────
+#
+# 게이트웨이는 alias 정확 매칭이 먼저다. 시드는 모델 id 와 이름이 같은 alias 를 두므로, 한 alias 에만
+# 계정을 걸면 모델 id 로 부르는 요청이 그 계정을 건너뛴다(200, 다른 계정 청구). 쓰기에서 막는다.
+
+
+def _sibling(alias="global.anthropic.claude-x", account_name=None):
+    return _model(alias=alias, account_name=account_name)
+
+
+def _repo_for_update(Repo, model):
+    repo = Repo.return_value
+    repo.get_by_alias = AsyncMock(return_value=model)
+    repo.update_model = AsyncMock(return_value=model)
+    repo.get_current_pricing = AsyncMock(return_value=None)
+    return repo
+
+
+async def test_selecting_an_account_that_a_sibling_does_not_share_is_a_409_naming_it():
+    svc, _ = _svc()
+    model = _model()
+    sib = _sibling()
+    with patch("app.services.model_service.ModelRepository") as Repo:
+        repo = _repo_for_update(Repo, model)
+        with pytest.raises(ConflictError) as exc:
+            await svc.update_model(
+                _session(siblings=[sib]), alias="claude-x", actor=ADMIN,
+                data=ModelUpdateRequest(account_name="inregion-seoul"),
+            )
+    msg = exc.value.message
+    assert "global.anthropic.claude-x (no account)" in msg and "apply_to_siblings" in msg
+    repo.update_model.assert_not_called()
+    assert sib.account_name is None
+
+
+async def test_apply_to_siblings_moves_them_in_the_same_save_and_drops_their_cache():
+    svc, _ = _svc()
+    model = _model()
+    sib = _sibling()
+    with patch("app.services.model_service.ModelRepository") as Repo, \
+         patch("app.services.model_service.audit_logger") as audit:
+        audit.log = AsyncMock()
+        _repo_for_update(Repo, model)
+        out = await svc.update_model(
+            _session(siblings=[sib]), alias="claude-x", actor=ADMIN,
+            data=ModelUpdateRequest(account_name="inregion-seoul", apply_to_siblings=True),
+        )
+    assert (sib.account_name, sib.account_role_arn) == ("inregion-seoul", ROLE)
+    assert out.cache_keys == [
+        "model:claude-x", "model:global.anthropic.claude-x", "model:list",
+    ], "형제의 alias 키(여기서는 모델 id 와 같은 이름)가 빠지면 형제는 300초 옛 계정으로 나간다"
+    after = audit.log.await_args.kwargs["changes"]["after"]
+    assert after["account_applied_to_siblings"] == ["global.anthropic.claude-x"]
+
+
+async def test_create_with_an_account_checks_siblings_too():
+    svc, _ = _svc()
+    with patch("app.services.model_service.ModelRepository") as Repo:
+        Repo.return_value.alias_exists_ci = AsyncMock(return_value=False)
+        Repo.return_value.create_model = AsyncMock()
+        with pytest.raises(ConflictError, match="other-alias"):
+            await svc.create_model(
+                _session(siblings=[_sibling(alias="other-alias", account_name="dedicated")]),
+                actor=ADMIN, data=_create(account_name="inregion-seoul"),
+            )
+        Repo.return_value.create_model.assert_not_called()
+
+
+async def test_an_unrelated_edit_is_not_blocked_by_already_mismatched_siblings():
+    """설명만 고치는 저장이 옛 데이터의 불일치 때문에 409 가 되면 운영자는 아무것도 못 고친다."""
+    svc, _ = _svc()
+    model = _model(account_name="inregion-seoul")
+    session = _session(siblings=[_sibling()])
+    with patch("app.services.model_service.ModelRepository") as Repo, \
+         patch("app.services.model_service.audit_logger") as audit:
+        audit.log = AsyncMock()
+        _repo_for_update(Repo, model)
+        await svc.update_model(
+            session, alias="claude-x", actor=ADMIN, data=ModelUpdateRequest(description="d")
+        )
+    session.execute.assert_not_awaited()
+
+
+async def test_an_inactive_alias_is_checked_when_it_is_activated_not_when_it_is_edited():
+    svc, _ = _svc()
+    model = _model(status=ModelStatus.INACTIVE)
+    with patch("app.services.model_service.ModelRepository") as Repo, \
+         patch("app.services.model_service.audit_logger") as audit:
+        audit.log = AsyncMock()
+        repo = _repo_for_update(Repo, model)
+        repo.patch_status = AsyncMock(return_value=model)
+        await svc.update_model(
+            _session(siblings=[_sibling()]), alias="claude-x", actor=ADMIN,
+            data=ModelUpdateRequest(account_name="inregion-seoul"),
+        )
+        model.account_name = "inregion-seoul"
+        with pytest.raises(ConflictError, match="then activate it"):
+            await svc.patch_status(
+                _session(siblings=[_sibling()]), alias="claude-x", actor=ADMIN,
+                data=StatusPatchRequest(active=True),
+            )
+        repo.patch_status.assert_not_called()
+        # 비활성화는 불일치를 만들 수 없다 — 형제를 보지 않는다.
+        model.status = ModelStatus.ACTIVE
+        deactivate_session = _session(siblings=[_sibling()])
+        await svc.patch_status(
+            deactivate_session, alias="claude-x", actor=ADMIN, data=StatusPatchRequest(active=False)
+        )
+        deactivate_session.execute.assert_not_awaited()
+
+
+async def test_openmodel_aliases_have_no_account_and_skip_the_sibling_check():
+    svc, _ = _svc()
+    session = _session(siblings=[_sibling(account_name="inregion-seoul")])
+    with patch("app.services.model_service.ModelRepository") as Repo, \
+         patch("app.services.model_service.audit_logger") as audit:
+        audit.log = AsyncMock()
+        repo = Repo.return_value
+        repo.alias_exists_ci = AsyncMock(return_value=False)
+
+        async def _create_model(m):
+            m.created_at = m.updated_at = datetime.now(UTC)
+            m.status = ModelStatus.ACTIVE
+            return m
+
+        repo.create_model = AsyncMock(side_effect=_create_model)
+        repo.create_pricing = AsyncMock()
+        await svc.create_model(
+            session, actor=ADMIN,
+            data=_create(provider=ProviderEnum.OPENMODEL, api_format=ApiFormatEnum.OPENAI_COMPATIBLE),
+        )
+    session.execute.assert_not_awaited()
+
+
+def test_apply_to_siblings_defaults_to_false_and_is_not_a_column():
+    assert _create().apply_to_siblings is False
+    assert ModelUpdateRequest().apply_to_siblings is False

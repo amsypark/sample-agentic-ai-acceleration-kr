@@ -95,14 +95,19 @@ def _validate_long_context_consistency(obj):
 #
 # 콜론을 문자 클래스로 쓰지 않는 유일한 자리다: 이건 Python ``re`` 라 SQLAlchemy 의 바인드
 # 파라미터 스캔(``:role`` 을 파라미터로 읽는다)이 없다. 마이그레이션/init SQL 은 ``[:]`` 여야 하고
-# (0043 docstring), 두 표현은 같은 문자열 집합을 받아들인다.
-_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$")
+# (0043 docstring), 두 표현은 같은 문자열 집합을 받아들인다. 셋 다 ``fullmatch`` + ``re.ASCII`` 로
+# 쓴다 — ``$`` 는 끝의 줄바꿈 앞에서도 맞고, ``\w`` 는 유니코드 글자를 받는다(IAM·STS 는 ASCII).
+#
+# 파티션은 ``aws`` / ``aws-<소문자>`` 만, 역할 경로·이름은 IAM 문자 집합만 받는다. ``role/*`` 같은
+# 와일드카드는 STS 호출로는 실패할 뿐이지만, 같은 문법을 쓰는 terraform 변수에서는 IAM 정책
+# Resource 가 되어 그 계정의 모든 역할을 연다 — 여기·DB CHECK·terraform·admin-ui 가 같은 문법이다.
+_ROLE_ARN_RE = re.compile(r"^arn:aws(-[a-z]+)*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$", re.ASCII)
 
-#: ``sts:AssumeRole`` 의 ExternalId 제약(AWS): 2-1224자, 이 문자 집합.
-_EXTERNAL_ID_RE = re.compile(r"^[\w+=,.@:/-]{2,1224}$")
+#: ``sts:AssumeRole`` 의 ExternalId 제약(AWS): 2-1224자, ``[\w+=,.@:/-]`` 의 ASCII 판.
+_EXTERNAL_ID_RE = re.compile(r"^[A-Za-z0-9_+=,.@:/-]{2,1224}$", re.ASCII)
 
 #: CHECK ck_aws_accounts_name(0044)과 같은 문법, 같은 예약어.
-_ACCOUNT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
+_ACCOUNT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", re.ASCII)
 _RESERVED_ACCOUNT_NAMES = frozenset({"default", "gateway", "inherit", "none"})
 
 
@@ -114,9 +119,10 @@ def _validate_role_arn(v: str | None) -> str | None:
         # 빈 문자열의 정식 표현은 null 이다. 그대로 두면 DB CHECK 가 거부하고, 조용히 None 으로
         # 바꾸면 "지웠다" 와 "안 건드렸다" 가 구별되지 않는다.
         raise ValueError("role_arn cannot be blank")
-    if not _ROLE_ARN_RE.match(v):
+    if not _ROLE_ARN_RE.fullmatch(v):
         raise ValueError(
-            "role_arn must be an IAM ROLE arn (arn:aws:iam::<12-digit-account>:role/<name>). "
+            "role_arn must be an IAM ROLE arn (arn:aws:iam::<12-digit-account>:role/<name>, "
+            "path and name in [A-Za-z0-9+=,.@_/-], no wildcards). "
             "A user ARN, a bare account id or a Bedrock ARN will not work: the account of a "
             "Bedrock call is decided by the credentials that sign it, so this must be a role "
             "the gateway can assume."
@@ -130,7 +136,7 @@ def _validate_external_id(v: str | None) -> str | None:
     v = v.strip()
     if not v:
         raise ValueError("external_id cannot be blank; send null to clear it")
-    if not _EXTERNAL_ID_RE.match(v):
+    if not _EXTERNAL_ID_RE.fullmatch(v):
         raise ValueError(
             "external_id must be 2-1224 chars of [A-Za-z0-9+=,.@:/_-] "
             "(the sts:AssumeRole ExternalId constraint)"
@@ -141,7 +147,7 @@ def _validate_external_id(v: str | None) -> str | None:
 def _validate_account_name(v: str | None) -> str | None:
     if v is None:
         return v
-    if not _ACCOUNT_NAME_RE.match(v) or v in _RESERVED_ACCOUNT_NAMES:
+    if not _ACCOUNT_NAME_RE.fullmatch(v) or v in _RESERVED_ACCOUNT_NAMES:
         raise ValueError(
             "account name must be 3-64 chars of a-z 0-9 and '-', not starting or ending with "
             "'-', and not one of default/gateway/inherit/none; send null for the default account"
@@ -211,6 +217,10 @@ class ModelCreateRequest(BaseModel):
     #: 역할 ARN·ExternalId 는 레지스트리가 갖고 DB 트리거가 alias 행에 복사한다 — 이 요청으로는
     #: 쓸 수 없다(extra="forbid" 라 ``account_role_arn`` 키는 422).
     account_name: str | None = Field(default=None, max_length=64)
+    #: 같은 provider_model_id 의 다른 ACTIVE alias 가 다른 계정을 부르면 409 다(모델 id 로 지목한
+    #: 요청이 그 alias 로 해석되어 이 계정을 건너뛴다 — services/model_service.py
+    #: ``_align_account_siblings``). true 면 그 alias 들에도 같은 계정을 같은 트랜잭션에서 건다.
+    apply_to_siblings: bool = False
 
     @field_validator("allowed_clients")
     @classmethod
@@ -262,6 +272,8 @@ class ModelUpdateRequest(BaseModel):
     #: 해제**(기본 계정으로 복귀 — 트리거가 사본도 비운다) / 이름 = 그 계정 선택. null 을 생략과
     #: 같이 다루면 계정 선택을 해제할 API 가 없어진다(repo.update_model 은 None 을 건너뛴다).
     account_name: str | None = Field(default=None, max_length=64)
+    #: ModelCreateRequest.apply_to_siblings 와 같다. 컬럼이 아니다 — update_kwargs 에서 뺀다.
+    apply_to_siblings: bool = False
 
     @field_validator("allowed_clients")
     @classmethod

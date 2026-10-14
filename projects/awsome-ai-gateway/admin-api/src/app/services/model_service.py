@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import structlog
 from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import audit_logger
@@ -16,6 +18,7 @@ from app.core.auth import CurrentUser
 from app.core.cache_invalidation import CacheInvalidationManager
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
 from app.models.model import ApiFormat, AwsAccount, ModelAlias, ModelPricing, ModelStatus, Provider
+from app.repositories._locks import advisory_xact_lock
 from app.repositories.model_repository import ModelRepository
 from app.schemas.models import (
     AwsPriceChange,
@@ -38,6 +41,20 @@ from app.services.aws_price_list import (
 )
 
 logger = structlog.get_logger()
+
+
+@dataclass
+class ModelMutation:
+    """모델 저장의 결과 — 응답과, **커밋 뒤에** 지울 모델 캐시 키.
+
+    서비스가 직접 지우지 않는 이유: 이 서비스는 커밋 전에 끝난다(CommittingRoute 가 그 뒤에
+    커밋한다). 커밋 전에 지우면 그 창에 들어온 게이트웨이 캐시 미스가 저장 전 행을 다시 읽어
+    **옛 계정**을 300초 더 캐시한다. 라우터가 커밋한 뒤 :meth:`ModelService.invalidate` 로 지운다
+    (routers/aws_accounts.py 와 같은 순서).
+    """
+
+    response: ModelResponse
+    cache_keys: list[str] = field(default_factory=list)
 
 
 async def _refresh_account_copy(session: AsyncSession, model: ModelAlias) -> None:
@@ -68,16 +85,87 @@ async def _assert_account_selection(
             f"{alias}: an AWS account cannot be set on an OPENMODEL alias — it is not served "
             "by AWS, so there is no account to call it in."
         )
-    if await session.get(AwsAccount, account_name) is None:
+    # FOR SHARE: alias 행보다 레지스트리 행을 **먼저** 잠근다. 사본 트리거도 같은 행을 FOR SHARE
+    # 로 읽는데(0044), 그건 alias 행을 잠근 뒤라 레지스트리 수정(레지스트리 행 → 그 계정의 alias
+    # 행 순서)과 락 순서가 반대가 된다. 여기서 먼저 잡으면 두 쓰기가 같은 순서로 잠근다.
+    if await session.get(AwsAccount, account_name, with_for_update={"read": True}) is None:
         raise ValidationError(
             f"{alias}: AWS account '{account_name}' is not registered "
             "(register it under /admin/aws-accounts first)"
         )
 
 
+#: 모델 id 를 공유하는 alias 사이의 계정 일치(아래 함수)를 직렬화하는 advisory lock 의 이름공간.
+_SIBLING_LOCK = "model-account-siblings"
+
+
+async def _align_account_siblings(
+    session: AsyncSession,
+    *,
+    alias: str,
+    provider_model_id: str,
+    account_name: str | None,
+    apply: bool,
+    remedy: str | None = None,
+) -> list[ModelAlias]:
+    """같은 provider_model_id 의 다른 ACTIVE alias 가 다른 계정을 부르면 409(``apply`` 면 맞춘다).
+
+    게이트웨이는 요청의 모델 이름을 **alias 정확 매칭 먼저**, 없을 때만 provider_model_id 로
+    해석한다. 시드는 모델 id 9개 중 8개에 그 id 와 **이름이 같은** alias 를 둔다(예: alias
+    ``global.anthropic.claude-opus-5`` = 모델 id). 그래서 ``claude-opus-5`` 에만 계정을 걸면 모델
+    id 로 부르는 클라이언트는 이름이 같은 alias 로 해석되어 그 계정을 건너뛴다 — 200 이고 다른
+    계정에 청구된다. 게이트웨이의 형제 계정 불일치 거절(router_service._pmid_fallback_row)은
+    그 이름의 alias 가 없을 때만 돈다.
+
+    그래서 불변식을 쓰기 쪽에 둔다: 한 모델 id 의 ACTIVE AWS alias 들은 같은 계정을 고른다.
+    OPENMODEL 은 제외한다(AWS 계정이 없다). INACTIVE 는 활성화할 때 본다(patch_status).
+    advisory lock 이 같은 모델 id 의 동시 저장 둘이 서로의 옛 상태를 보고 둘 다 통과하는 것을 막는다.
+    """
+    await advisory_xact_lock(session, _SIBLING_LOCK, provider_model_id)
+    rows = (
+        await session.execute(
+            select(ModelAlias)
+            .where(
+                ModelAlias.provider_model_id == provider_model_id,
+                ModelAlias.alias != alias,
+                ModelAlias.status == ModelStatus.ACTIVE,
+                ModelAlias.provider != Provider.OPENMODEL,
+            )
+            .order_by(ModelAlias.alias)
+        )
+    ).scalars().all()
+    siblings = [r for r in rows if r.account_name != account_name]
+    if not siblings:
+        return []
+    if not apply:
+        listing = ", ".join(f"{r.alias} ({r.account_name or 'no account'})" for r in siblings)
+        raise ConflictError(
+            f"{alias}: other active aliases of model id '{provider_model_id}' call a different "
+            f"AWS account: {listing}. A request that names the model id or one of those aliases "
+            "would be billed there instead. "
+            + (
+                remedy
+                or "Re-send with apply_to_siblings=true to set "
+                f"'{account_name or 'no account'}' on all {len(siblings)} of them in the same save."
+            )
+        )
+    now = datetime.now(timezone.utc)
+    for r in siblings:
+        r.account_name = account_name
+        r.updated_at = now
+    await session.flush()
+    for r in siblings:
+        await session.refresh(r, attribute_names=["account_role_arn", "account_external_id"])
+    return siblings
+
+
 class ModelService:
     def __init__(self, cache_mgr: CacheInvalidationManager) -> None:
         self._cache_mgr = cache_mgr
+
+    async def invalidate(self, keys: list[str], *, session: AsyncSession) -> None:
+        """:class:`ModelMutation` 의 키를 지운다 — 라우터가 **커밋한 뒤에** 부른다."""
+        await self._cache_mgr.invalidate(keys, session=session)
 
     async def list_models(self, session: AsyncSession) -> list[ModelResponse]:
         repo = ModelRepository(session)
@@ -96,7 +184,7 @@ class ModelService:
         actor: CurrentUser,
         ip_address: str = "0.0.0.0",
         request_id: str = "",
-    ) -> ModelResponse:
+    ) -> ModelMutation:
         repo = ModelRepository(session)
 
         # BR-MOD-01: Case-insensitive alias uniqueness
@@ -108,6 +196,16 @@ class ModelService:
             provider=Provider(data.provider.value),
             account_name=data.account_name,
         )
+        siblings: list[ModelAlias] = []
+        if data.provider.value != Provider.OPENMODEL.value:
+            # 새 alias 는 ACTIVE 로 만들어진다 — 같은 모델 id 의 형제와 계정이 같아야 한다.
+            siblings = await _align_account_siblings(
+                session,
+                alias=data.alias,
+                provider_model_id=data.provider_model_id,
+                account_name=data.account_name,
+                apply=data.apply_to_siblings,
+            )
 
         model = ModelAlias(
             alias=data.alias,
@@ -158,12 +256,22 @@ class ModelService:
         # self-heal). Keeps admin writes and gateway reads on one cache contract.
         # model:{provider_model_id} 도 지운다 — 게이트웨이가 모델 id 로 지목한 해석을 그 키에
         # 캐시하므로, 같은 모델 id 의 다른 alias 가 남긴 항목이 새 alias 의 계정 판정(형제 계정
-        # 불일치 거절)보다 오래 살지 않게.
-        await self._cache_mgr.invalidate(
-            [f"model:{model.alias}", f"model:{model.provider_model_id}", "model:list"],
-            session=session,
-        )
+        # 불일치 거절)보다 오래 살지 않게. 계정을 맞춘 형제의 키도 지운다. 지우는 것은 라우터가
+        # 커밋한 뒤다(ModelMutation).
+        cache_keys = list(dict.fromkeys([
+            f"model:{model.alias}",
+            *(f"model:{r.alias}" for r in siblings),
+            f"model:{model.provider_model_id}",
+            "model:list",
+        ]))
 
+        after = {
+            "alias": model.alias,
+            "provider": model.provider.value,
+            "account_name": model.account_name,
+        }
+        if siblings:
+            after["account_applied_to_siblings"] = [r.alias for r in siblings]
         await audit_logger.log(
             session,
             actor_user_id=actor.user_id,
@@ -171,16 +279,12 @@ class ModelService:
             action="CREATE_MODEL",
             resource_type="ModelAlias",
             resource_id=model.alias,
-            changes={"after": {
-                "alias": model.alias,
-                "provider": model.provider.value,
-                "account_name": model.account_name,
-            }},
+            changes={"after": after},
             ip_address=ip_address,
             request_id=request_id,
         )
 
-        return self._to_response(model, pricing)
+        return ModelMutation(self._to_response(model, pricing), cache_keys)
 
     async def update_model(
         self,
@@ -191,9 +295,13 @@ class ModelService:
         actor: CurrentUser,
         ip_address: str = "0.0.0.0",
         request_id: str = "",
-    ) -> ModelResponse:
+    ) -> ModelMutation:
         repo = ModelRepository(session)
-        update_kwargs = {k: v for k, v in data.model_dump().items() if v is not None}
+        update_kwargs = {
+            k: v
+            for k, v in data.model_dump(exclude={"apply_to_siblings"}).items()
+            if v is not None
+        }
         existing = await repo.get_by_alias(alias)
         if existing is None:
             raise NotFoundError("ModelAlias", alias)
@@ -201,12 +309,33 @@ class ModelService:
         # 대상 AWS 계정(0044) — **실효값**으로 판정한다: 키 없음 = 저장값 유지, 명시적 null = 해제.
         # provider 는 이 API 로 바꿀 수 없으므로(ModelUpdateRequest) 저장값이 곧 실효값이다.
         clears_account = "account_name" in data.model_fields_set and data.account_name is None
+        effective_account = None if clears_account else data.account_name or existing.account_name
+        effective_pmid = data.provider_model_id or previous_provider_model_id
         await _assert_account_selection(
             session,
             alias=alias,
             provider=existing.provider,
-            account_name=None if clears_account else data.account_name or existing.account_name,
+            account_name=effective_account,
         )
+        # 형제 계정 일치(_align_account_siblings): 이 저장이 계정이나 모델 id 를 바꾸는 ACTIVE
+        # alias 일 때, 또는 운영자가 맞추기를 명시했을 때만 본다. 관계없는 편집(설명 등)은 이미
+        # 어긋난 옛 데이터 때문에 막히지 않는다. INACTIVE 는 활성화할 때 본다(patch_status).
+        siblings: list[ModelAlias] = []
+        changes_routing = (
+            effective_account != existing.account_name
+            or effective_pmid != previous_provider_model_id
+        )
+        if existing.provider != Provider.OPENMODEL and (
+            data.apply_to_siblings
+            or (changes_routing and existing.status == ModelStatus.ACTIVE)
+        ):
+            siblings = await _align_account_siblings(
+                session,
+                alias=alias,
+                provider_model_id=effective_pmid,
+                account_name=effective_account,
+                apply=data.apply_to_siblings,
+            )
         model = await repo.update_model(alias, **update_kwargs)
         if model is None:
             raise NotFoundError("ModelAlias", alias)
@@ -243,16 +372,18 @@ class ModelService:
 
         # BR-MOD-04: Cache invalidation. 모델 id 키(바뀌었으면 옛것과 새것 둘 다)도 지운다 —
         # 게이트웨이가 모델 id 로 지목한 해석을 그 키에 캐시하고, 거기에 옛 계정이 남는다.
-        await self._cache_mgr.invalidate(
-            list(dict.fromkeys([
-                f"model:{alias}",
-                f"model:{previous_provider_model_id}",
-                f"model:{model.provider_model_id}",
-                "model:list",
-            ])),
-            session=session,
-        )
+        # 계정을 맞춘 형제의 키도. 지우는 것은 라우터가 커밋한 뒤다(ModelMutation).
+        cache_keys = list(dict.fromkeys([
+            f"model:{alias}",
+            *(f"model:{r.alias}" for r in siblings),
+            f"model:{previous_provider_model_id}",
+            f"model:{model.provider_model_id}",
+            "model:list",
+        ]))
 
+        after = dict(update_kwargs)
+        if siblings:
+            after["account_applied_to_siblings"] = [r.alias for r in siblings]
         await audit_logger.log(
             session,
             actor_user_id=actor.user_id,
@@ -260,12 +391,12 @@ class ModelService:
             action="UPDATE_MODEL",
             resource_type="ModelAlias",
             resource_id=alias,
-            changes={"after": update_kwargs},
+            changes={"after": after},
             ip_address=ip_address,
             request_id=request_id,
         )
 
-        return self._to_response(model, pricing)
+        return ModelMutation(self._to_response(model, pricing), cache_keys)
 
     async def set_pricing(
         self,
@@ -515,6 +646,26 @@ class ModelService:
     ) -> ModelResponse:
         repo = ModelRepository(session)
         new_status = ModelStatus.ACTIVE if data.active else ModelStatus.INACTIVE
+        if new_status == ModelStatus.ACTIVE:
+            current = await repo.get_by_alias(alias)
+            if (
+                current is not None
+                and current.status != ModelStatus.ACTIVE
+                and current.provider != Provider.OPENMODEL
+            ):
+                # 활성화도 형제 계정 일치를 깬다(_align_account_siblings). 여기서는 맞추지 않고
+                # 거절만 한다 — 어느 쪽 계정으로 맞출지는 PUT 의 account_name 이 정한다.
+                await _align_account_siblings(
+                    session,
+                    alias=alias,
+                    provider_model_id=current.provider_model_id,
+                    account_name=current.account_name,
+                    apply=False,
+                    remedy=(
+                        "Give this alias the same account first (edit it), or edit it with "
+                        "'apply to all' to move them to its account, then activate it."
+                    ),
+                )
         model = await repo.patch_status(alias, new_status)
         if model is None:
             raise NotFoundError("ModelAlias", alias)

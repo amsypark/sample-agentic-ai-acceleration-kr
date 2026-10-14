@@ -275,3 +275,186 @@ async def test_malformed_registry_input_is_a_422_naming_the_field(api):
         "name": "acctapi-user", "display_name": "x", "role_arn": "arn:aws:iam::111122223333:user/u",
     })
     assert r.status_code == 422 and "role_arn" in r.text
+
+
+# ── 모델 저장의 캐시 무효화는 커밋 뒤 ───────────────────────────────────────────────
+
+
+async def test_model_saves_invalidate_the_cache_only_after_commit(api):
+    """커밋 전에 지우면 그 창의 게이트웨이 캐시 미스가 저장 전 행(옛 계정)을 300초 다시 캐시한다."""
+    client, _sql, cache = api
+    await _register(client)
+    r = await client.post("/admin/models", json=_model_body(account_name="acctapi-seoul"))
+    assert r.status_code == 201, r.text
+    keys, in_tx = cache.calls[-1]
+    assert keys == ["model:acctapi-claude", "model:anthropic.acctapi-claude", "model:list"]
+    assert in_tx is False, "생성: 캐시를 커밋 전에 지웠다"
+
+    r = await client.put("/admin/models/acctapi-claude", json={"account_name": None})
+    assert r.status_code == 200, r.text
+    keys, in_tx = cache.calls[-1]
+    assert "model:acctapi-claude" in keys and "model:anthropic.acctapi-claude" in keys
+    assert in_tx is False, "수정: 캐시를 커밋 전에 지웠다"
+
+
+# ── 같은 모델 id 의 형제 alias 와 계정 일치 ───────────────────────────────────────────
+
+_SHARED = "acctapi-shared.model-id"  # 픽스처 정리(acctapi-%) 대상이어야 한다
+
+
+async def _pair(client, account_name=None):
+    for alias in ("acctapi-friendly", _SHARED):  # 시드처럼: 하나는 모델 id 와 이름이 같다
+        r = await client.post("/admin/models", json=_model_body(alias=alias, pmid=_SHARED,
+                                                                 account_name=account_name))
+        assert r.status_code == 201, r.text
+
+
+async def test_an_account_on_one_alias_of_a_shared_model_id_is_409_until_applied_to_all(api):
+    client, sql, cache = api
+    await _register(client)
+    await _pair(client)
+
+    r = await client.put("/admin/models/acctapi-friendly", json={"account_name": "acctapi-seoul"})
+    assert r.status_code == 409, r.text
+    assert f"{_SHARED} (no account)" in r.text and "apply_to_siblings" in r.text
+    rows = await sql("SELECT alias, account_name FROM model.model_aliases "
+                     "WHERE provider_model_id = :p ORDER BY alias", p=_SHARED)
+    assert [tuple(x) for x in rows] == [("acctapi-friendly", None), (_SHARED, None)], "409 인데 썼다"
+
+    cache.calls.clear()
+    r = await client.put("/admin/models/acctapi-friendly",
+                         json={"account_name": "acctapi-seoul", "apply_to_siblings": True})
+    assert r.status_code == 200, r.text
+    rows = await sql("SELECT alias, account_name, account_role_arn FROM model.model_aliases "
+                     "WHERE provider_model_id = :p ORDER BY alias", p=_SHARED)
+    assert [tuple(x) for x in rows] == [
+        ("acctapi-friendly", "acctapi-seoul", ROLE), (_SHARED, "acctapi-seoul", ROLE)
+    ], "형제의 사본(트리거)까지 같은 계정이어야 모델 id 로 부른 요청도 그 계정으로 간다"
+    keys, in_tx = cache.calls[-1]
+    assert keys == ["model:acctapi-friendly", f"model:{_SHARED}", "model:list"] and in_tx is False
+
+    # 맞춘 뒤에는 관계없는 편집이 막히지 않는다.
+    r = await client.put(f"/admin/models/{_SHARED}", json={"description": "x"})
+    assert r.status_code == 200, r.text
+
+
+async def test_creating_an_alias_that_disagrees_with_its_siblings_is_409(api):
+    client, sql, _cache = api
+    await _register(client)
+    await _pair(client, account_name="acctapi-seoul")
+    r = await client.post("/admin/models", json=_model_body(alias="acctapi-third", pmid=_SHARED))
+    assert r.status_code == 409 and "acctapi-friendly (acctapi-seoul)" in r.text, r.text
+    assert await sql("SELECT alias FROM model.model_aliases WHERE alias = 'acctapi-third'") == []
+    r = await client.post("/admin/models", json=_model_body(alias="acctapi-third", pmid=_SHARED,
+                                                             account_name="acctapi-seoul"))
+    assert r.status_code == 201, r.text
+
+
+async def test_activating_an_alias_that_disagrees_with_its_siblings_is_409(api):
+    client, sql, _cache = api
+    await _register(client)
+    await _pair(client, account_name="acctapi-seoul")
+    await sql("INSERT INTO model.model_aliases (alias, provider, provider_model_id, api_format, "
+              "status, created_by) VALUES ('acctapi-dormant', 'BEDROCK', :p, 'BEDROCK_NATIVE', "
+              "'INACTIVE', :u)", p=_SHARED, u=_SYS_USER)
+    r = await client.patch("/admin/models/acctapi-dormant/status", json={"active": True})
+    assert r.status_code == 409 and "then activate it" in r.text, r.text
+    rows = await sql("SELECT status FROM model.model_aliases WHERE alias = 'acctapi-dormant'")
+    assert rows[0][0] == "INACTIVE"
+
+
+async def test_a_concurrent_create_cannot_slip_past_an_apply_to_all(api, dsn):
+    """행 락은 아직 없는 행을 막지 못한다: 형제를 맞추는 저장이 커밋 전의 새 alias 를 못 보면 그
+    alias 만 옛 계정으로 남는다. 모델 id 단위 advisory lock 이 두 저장을 직렬화한다."""
+    import asyncio
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.core.auth import CurrentUser
+    from app.models.auth import UserRole
+    from app.schemas.models import ModelCreateRequest, ModelUpdateRequest
+    from app.services.model_service import ModelService
+
+    client, sql, _cache = api
+    await _register(client)
+    await _register(client, name="acctapi-dedicated", role=ROLE2, ext=None)
+    await _pair(client, account_name="acctapi-seoul")
+
+    admin = CurrentUser(user_id=_SYS_USER, email="admin@example.invalid", role=UserRole.ADMIN,
+                        team_id=None)
+    svc = ModelService(cache_mgr=_RecordingCache())
+    engine = create_async_engine(dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as creator, factory() as mover:
+            await svc.create_model(creator, actor=admin, data=ModelCreateRequest(**_model_body(
+                alias="acctapi-third", pmid=_SHARED, account_name="acctapi-seoul")))
+            pid = (await mover.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            task = asyncio.ensure_future(svc.update_model(
+                mover, alias="acctapi-friendly", actor=admin,
+                data=ModelUpdateRequest(account_name="acctapi-dedicated", apply_to_siblings=True)))
+            for _ in range(200):
+                if task.done():
+                    break
+                waiting = await sql("SELECT wait_event_type FROM pg_stat_activity WHERE pid = :p", p=pid)
+                if waiting and waiting[0][0] == "Lock":
+                    break
+                await asyncio.sleep(0.025)
+            await creator.commit()
+            await asyncio.wait_for(task, timeout=10)
+            await mover.commit()
+    finally:
+        await engine.dispose()
+    rows = await sql("SELECT alias, account_name FROM model.model_aliases "
+                     "WHERE provider_model_id = :p ORDER BY alias", p=_SHARED)
+    assert {a: n for a, n in rows} == {
+        "acctapi-friendly": "acctapi-dedicated",
+        "acctapi-third": "acctapi-dedicated",
+        _SHARED: "acctapi-dedicated",
+    }, "동시 생성된 alias 가 형제 맞추기를 빠져나가 옛 계정으로 남았다"
+
+
+async def test_a_model_save_locks_the_registry_row_before_the_alias_row(api, dsn):
+    """레지스트리 수정은 레지스트리 행 → 그 계정의 alias 행 순서로 잠근다. 모델 저장이 alias 행을 먼저
+    잠그고 트리거에서 레지스트리 행을 기다리면 두 쓰기가 반대 순서라 교착(40P01)이 날 수 있다. 저장은
+    레지스트리 행을 먼저 FOR SHARE 로 잡는다 — 그동안 alias 행은 잠겨 있지 않아야 한다."""
+    import asyncio
+
+    import asyncpg
+
+    client, _sql, _cache = api
+    await _register(client)
+    r = await client.post("/admin/models", json=_model_body(account_name="acctapi-seoul"))
+    assert r.status_code == 201, r.text
+
+    plain = dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
+    editor = await asyncpg.connect(plain)
+    probe = await asyncpg.connect(plain)
+    try:
+        tx = editor.transaction()
+        await tx.start()
+        # 전파가 없는 수정(display_name)이라 editor 는 레지스트리 행만 잠근다.
+        await editor.execute("UPDATE model.aws_accounts SET display_name = 'renamed' "
+                             "WHERE name = 'acctapi-seoul'")
+        task = asyncio.ensure_future(
+            client.put("/admin/models/acctapi-claude", json={"description": "re-save"}))
+        for _ in range(200):
+            if task.done():
+                break
+            n = await probe.fetchval("SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                                     "current_database() AND wait_event_type = 'Lock'")
+            if n:
+                break
+            await asyncio.sleep(0.025)
+        assert not task.done(), "저장이 레지스트리 행 락을 기다리지 않았다"
+        await probe.execute("SET lock_timeout = '200ms'")
+        async with probe.transaction():
+            await probe.execute("SELECT 1 FROM model.model_aliases WHERE alias = 'acctapi-claude' "
+                                "FOR UPDATE NOWAIT")
+        await tx.commit()
+        r = await asyncio.wait_for(task, timeout=10)
+        assert r.status_code == 200, r.text
+    finally:
+        await editor.close()
+        await probe.close()

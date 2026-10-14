@@ -128,7 +128,8 @@ async def test_real_router_write_reports_a_failed_commit_as_500(test_app: FastAP
 
     async def failing_session(request: Request):
         session = AsyncMock()
-        session.execute = AsyncMock()
+        # 결과 객체는 동기 API 다(.scalars().all()) — 형제 계정 조회(model_service)가 빈 결과를 본다.
+        session.execute = AsyncMock(return_value=MagicMock())
         session.get = AsyncMock(return_value=None)
         session.add = MagicMock()
         session.flush = AsyncMock()

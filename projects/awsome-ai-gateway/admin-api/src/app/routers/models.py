@@ -43,13 +43,18 @@ async def create_model(
     session: AsyncSession = Depends(get_db_session),
 ):
     svc: ModelService = request.app.state.model_service
-    return await svc.create_model(
+    outcome = await svc.create_model(
         session,
         data=body,
         actor=admin,
         ip_address=request.client.host if request.client else "0.0.0.0",
         request_id=request.headers.get("x-request-id", ""),
     )
+    # 커밋 **뒤에** 캐시를 지운다. 먼저 지우면 그 창의 게이트웨이 캐시 미스가 저장 전 행(옛 계정)을
+    # 300초 다시 캐시한다(services/model_service.ModelMutation, routers/aws_accounts.py 와 같은 순서).
+    await session.commit()
+    await svc.invalidate(outcome.cache_keys, session=session)
+    return outcome.response
 
 
 @router.put("/{alias}", response_model=ModelResponse)
@@ -61,7 +66,7 @@ async def update_model(
     session: AsyncSession = Depends(get_db_session),
 ):
     svc: ModelService = request.app.state.model_service
-    return await svc.update_model(
+    outcome = await svc.update_model(
         session,
         alias=alias,
         data=body,
@@ -69,6 +74,9 @@ async def update_model(
         ip_address=request.client.host if request.client else "0.0.0.0",
         request_id=request.headers.get("x-request-id", ""),
     )
+    await session.commit()  # 커밋 뒤에 지운다(create_model 주석)
+    await svc.invalidate(outcome.cache_keys, session=session)
+    return outcome.response
 
 
 @router.put("/{alias}/pricing", response_model=ModelResponse)

@@ -90,16 +90,23 @@ class TestCreateModel:
             repo.create_model = AsyncMock(side_effect=_set_timestamps)
             repo.create_pricing = AsyncMock()
             mock_audit.log = AsyncMock()
+            # 같은 모델 id 의 형제 alias 조회(계정 일치) — 결과 객체는 동기 API 다. 빈 결과.
+            mock_session.execute = AsyncMock(return_value=MagicMock())
 
-            result = await model_service.create_model(mock_session, data=data, actor=admin_user)
+            outcome = await model_service.create_model(mock_session, data=data, actor=admin_user)
 
-        assert result.alias == "claude-sonnet"
-        assert result.provider == Provider.BEDROCK
-        # P0-④: create_model is now invalidate-only (DEL model:{alias} + model:list);
-        # it must NOT pre-seed a (previously flat, TTL-less) model cache entry.
-        # The gateway populates model:{alias} with the correct nested shape + TTL
-        # on first cache-miss. So we assert DEL happened and SET did not.
-        assert mock_redis.delete.call_count >= 1
+        assert outcome.response.alias == "claude-sonnet"
+        assert outcome.response.provider == Provider.BEDROCK
+        # P0-④: create_model is invalidate-only (DEL model:{alias} + model:list); it must NOT
+        # pre-seed a (previously flat, TTL-less) model cache entry. The gateway populates
+        # model:{alias} with the correct nested shape + TTL on first cache-miss.
+        # 지우는 것은 라우터가 **커밋한 뒤**다(ModelMutation) — 서비스는 키만 돌려준다.
+        assert outcome.cache_keys == [
+            "model:claude-sonnet",
+            "model:anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "model:list",
+        ]
+        mock_redis.delete.assert_not_called()
         mock_redis.set.assert_not_called()
 
     async def test_create_model_duplicate_alias_raises(
@@ -150,10 +157,17 @@ class TestUpdateModel:
             repo.get_current_pricing = AsyncMock(return_value=pricing)
             mock_audit.log = AsyncMock()
 
-            await model_service.update_model(mock_session, alias="claude-sonnet", data=data, actor=admin_user)
+            outcome = await model_service.update_model(
+                mock_session, alias="claude-sonnet", data=data, actor=admin_user
+            )
 
-        # Cache invalidation called
-        assert mock_redis.delete.call_count >= 1
+        # 지울 키를 돌려주고, 커밋 전인 서비스 안에서는 지우지 않는다(라우터가 커밋 뒤에 지운다).
+        assert outcome.cache_keys == [
+            "model:claude-sonnet",
+            "model:anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "model:list",
+        ]
+        mock_redis.delete.assert_not_called()
 
 
 class TestSetPricing:
