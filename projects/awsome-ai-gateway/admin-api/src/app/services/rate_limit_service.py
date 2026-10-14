@@ -194,8 +194,10 @@ class RateLimitService:
           2. TEAM — 팀당 1개, 멤버(USER)를 자식으로.
           3. USER(팀 미배정) — ``auth.users.team_id`` 는 NULL 을 허용하므로 어느 팀의 members
              에도 없는 사용자가 있을 수 있다. USER 스코프 한도는 그들에게도 집행되고
-             (gateway-proxy 는 team_id 가 None 이면 TEAM 스코프만 건너뛴다) PUT 도 받으므로
-             트리에 있어야 한다. 상속할 TEAM 이 없으니 inherited_from 은 항상 None 이다.
+             (gateway-proxy 는 이들에게 TEAM 한도를 적용하지 않는다 — 키 인증이면 team_id 가
+             None 이 아니라 "" 라서 TEAM 조회를 시도했다가 실패하고 rl_config_db_query_failed
+             로 남긴 뒤 무제한으로 취급한다) PUT 도 받으므로 트리에 있어야 한다. 상속할 TEAM
+             이 없으니 inherited_from 은 항상 None 이다.
 
         ⚠️ GLOBAL 은 현재 **한 번에 한 모델**만 활성 한도를 가질 수 있다. upsert 가 alias 와
            무관하게 그 scope 의 활성 행을 전부 비활성화하고, 0024 의 유니크 인덱스도
