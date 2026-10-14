@@ -56,21 +56,28 @@ async def _seed(session, actor_id: str) -> None:
         {"role": ROLE, "actor": actor_id},
     )
     rows = [
-        # (alias, provider_model_id, account_name)
-        ("a", "anthropic.acct-proof-x", "zzproof-acct"),  # 계정 있음
-        ("b", "anthropic.acct-proof-x", None),  # 같은 모델 id, 계정 없음 → 불일치
-        ("c", "anthropic.acct-proof-y", "zzproof-acct"),  # 같은 모델 id, 같은 계정 → 일치
-        ("d", "anthropic.acct-proof-y", "zzproof-acct"),
+        # (alias, provider_model_id, account_name, status)
+        ("a", "anthropic.acct-proof-x", "zzproof-acct", "ACTIVE"),  # 계정 있음
+        ("b", "anthropic.acct-proof-x", None, "ACTIVE"),  # 같은 모델 id, 계정 없음 → 불일치
+        ("c", "anthropic.acct-proof-y", "zzproof-acct", "ACTIVE"),  # 같은 계정 → 일치
+        ("d", "anthropic.acct-proof-y", "zzproof-acct", "ACTIVE"),
+        # 비활성 형제는 계정이 달라도 모델 id 를 모호하게 만들지 않는다(서빙되지 않는다).
+        ("e", "anthropic.acct-proof-z", "zzproof-acct", "ACTIVE"),
+        ("f", "anthropic.acct-proof-z", None, "INACTIVE"),
+        # 모든 alias 가 비활성이면 kill switch 다 — '없음' 이 아니라 inactive 로 거절한다.
+        ("g", "anthropic.acct-proof-w", None, "INACTIVE"),
     ]
-    for alias, pmid, account in rows:
+    for alias, pmid, account, status in rows:
         await session.execute(
             text(
                 "INSERT INTO model.model_aliases "
                 "(alias, provider, provider_model_id, api_format, status, created_by, "
                 "account_name) "
-                "VALUES (:alias, 'BEDROCK', :pmid, 'ANTHROPIC_MESSAGES', 'ACTIVE', :actor, :acct)"
+                "VALUES (:alias, 'BEDROCK', :pmid, 'ANTHROPIC_MESSAGES', "
+                "CAST(:status AS model.model_status), :actor, :acct)"
             ),
-            {"alias": _PREFIX + alias, "pmid": pmid, "actor": actor_id, "acct": account},
+            {"alias": _PREFIX + alias, "pmid": pmid, "actor": actor_id, "acct": account,
+             "status": status},
         )
     await session.flush()
 
@@ -134,10 +141,25 @@ async def test_a_registry_edit_reaches_the_gateway_read_path(session):
 
 
 async def test_a_model_id_whose_aliases_call_different_accounts_is_refused(session):
+    from app.services.router_service import AmbiguousModelAccountError, RouterService
+
+    with pytest.raises(AmbiguousModelAccountError, match="different AWS accounts") as exc:
+        await RouterService().resolve_bedrock_model(None, session, "anthropic.acct-proof-x")
+    assert _PREFIX not in str(exc.value), "alias 이름은 로그로만 — 클라이언트 404 본문에는 없다"
+
+
+async def test_an_inactive_sibling_does_not_make_a_model_id_ambiguous(session):
     from app.services.router_service import RouterService
 
-    with pytest.raises(LookupError, match="different AWS accounts"):
-        await RouterService().resolve_bedrock_model(None, session, "anthropic.acct-proof-x")
+    cfg = await RouterService().resolve_bedrock_model(None, session, "anthropic.acct-proof-z")
+    assert cfg.alias == _PREFIX + "e" and cfg.account_role_arn == ROLE
+
+
+async def test_a_model_id_with_only_inactive_aliases_is_still_the_kill_switch(session):
+    from app.services.router_service import ModelInactiveError, RouterService
+
+    with pytest.raises(ModelInactiveError):
+        await RouterService().resolve_bedrock_model(None, session, "anthropic.acct-proof-w")
 
 
 async def test_a_model_id_whose_aliases_agree_resolves_to_the_first_by_name(session):

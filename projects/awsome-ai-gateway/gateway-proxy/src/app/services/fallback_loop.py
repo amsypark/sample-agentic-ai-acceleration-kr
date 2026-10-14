@@ -37,6 +37,7 @@ from app.observability.provider_metrics import (
     record_provider_request,
 )
 from app.schemas.domain import ModelConfigSchema, TokenUsage
+from app.services.account_credentials import account_id_of
 from app.services.circuit_breaker import CircuitBreakerService
 from app.services.rate_limit_enforcement import enforce_rate_limits
 from app.services.rate_limit_service import RateLimitService
@@ -58,6 +59,19 @@ class AdmissionRejection:
     status: int
     body: bytes
     headers: dict
+
+
+def breaker_key(candidate_config: Any) -> str:
+    """후보의 서킷 브레이커 키.
+
+    alias 계정이 없으면 ``provider_model_id`` 그대로 — 오늘의 키(``cb:{pmid}:*``)라 배포 중에도
+    기존 브레이커 상태가 이어지고, 같은 모델 id 의 계정 없는 alias 들은 지금처럼 한 브레이커를
+    나눈다. alias 계정이 있으면 ``{pmid}@{계정 번호}``: 장애·쿼터는 계정 단위라, 한 계정의 502
+    가 같은 모델 id 를 다른 계정으로 부르는 alias 의 트래픽까지 막으면 안 된다.
+    """
+    pmid = candidate_config.provider_model_id
+    account = account_id_of(getattr(candidate_config, "account_role_arn", None))
+    return f"{pmid}@{account}" if account else pmid
 
 
 def scope_denial_body(candidate_config: Any, *, client_scoped: bool) -> bytes:
@@ -301,14 +315,15 @@ async def run_fallback_loop(
             continue
 
         pmid = candidate_config.provider_model_id
+        cb_key = breaker_key(candidate_config)
 
         # --- 2. Circuit-breaker gate ---
-        if await cb.is_open(redis, pmid):
-            probe_won = await cb.try_acquire_halfopen_probe(redis, pmid)
+        if await cb.is_open(redis, cb_key):
+            probe_won = await cb.try_acquire_halfopen_probe(redis, cb_key)
             if not probe_won:
-                logger.info("fallback_cb_open_skip", alias=alias, pmid=pmid)
+                logger.info("fallback_cb_open_skip", alias=alias, pmid=pmid, cb_key=cb_key)
                 continue  # skip — circuit open, no probe slot
-            logger.info("fallback_cb_halfopen_probe", alias=alias, pmid=pmid)
+            logger.info("fallback_cb_halfopen_probe", alias=alias, pmid=pmid, cb_key=cb_key)
 
         # --- 3+4. Admission: scope (2 axes) + rate limits ---
         # ⚠️ 이 세 검사는 :func:`enforce_candidate_admission` 한 곳에 있다. 여기 인라인으로
@@ -407,7 +422,7 @@ async def run_fallback_loop(
                 record_provider_error(metrics, _pm_labels, status=status)
             # CB: record failure only for {502,503} and connection errors, NOT 504
             if status in _CB_FAILURE_STATUSES or caught_connection_error:
-                await cb.record_failure(redis, pmid)
+                await cb.record_failure(redis, cb_key)
 
             error_bytes = response_body if not is_stream else json.dumps(
                 {"error": {"type": "provider_error", "message": f"Backend returned {status}"}}
@@ -425,7 +440,7 @@ async def run_fallback_loop(
         else:
             # Non-fallback status (2xx, 4xx, etc.)
             if 200 <= status < 300:
-                await cb.record_success(redis, pmid)
+                await cb.record_success(redis, cb_key)
 
             availability_fallback_from = original_alias if not is_original else None
 

@@ -892,3 +892,104 @@ def test_the_external_id_never_appears_in_a_target_repr():
     t = AccountTarget(ROLE_ALIAS, "ext-secret-value")
     assert "ext-secret-value" not in repr(t) and ROLE_ALIAS in repr(t)
 
+
+# ── 클라이언트로 가는 오류 본문에 대상 계정이 새지 않는다 ─────────────────────────────
+
+_ASSUMED = "arn:aws:sts::111122223333:assumed-role/in-region-bedrock/gw-bedrock-xacct"
+_DENIED = (
+    f"User: {_ASSUMED} is not authorized to perform: bedrock:InvokeModel on resource: "
+    "arn:aws:bedrock:ap-northeast-2:111122223333:inference-profile/apac.anthropic.claude-x"
+)
+
+
+def _raising_client(code, message):
+    c = _boto_client()
+    err = ClientError({"Error": {"Code": code, "Message": message}}, "InvokeModel")
+    c.invoke_model = MagicMock(side_effect=err)
+    c.invoke_model_with_response_stream = MagicMock(side_effect=err)
+    return c
+
+
+def _assert_no_account_identifiers(text: str):
+    assert "111122223333" not in text and "arn:aws" not in text, text
+
+
+async def test_a_provider_error_body_carries_no_arn_or_account_id():
+    """AccessDenied 메시지에는 **대상 계정의** assumed-role ARN 이 들어 있다. 그 본문은 가상 키를
+    가진 누구에게나 간다 — 코드와 나머지 문장은 두고 ARN·계정 번호만 지운다(상세는 로그)."""
+    ad = BedrockAdapter(_raising_client("AccessDeniedException", _DENIED))
+    st, body, _h, _u = await ad.invoke(b"{}", "m")
+    text = body.decode()
+    assert st == 403
+    _assert_no_account_identifiers(text)
+    assert "AccessDeniedException" in text and "is not authorized to perform" in text
+
+    st, gen, _h, _r = await ad.invoke_stream(b"{}", "m")
+    text = b"".join([c async for c in gen]).decode()
+    assert st == 403
+    _assert_no_account_identifiers(text)
+
+
+async def test_an_unexpected_stream_error_is_redacted_too():
+    c = _boto_client()
+    c.invoke_model_with_response_stream = MagicMock(
+        side_effect=RuntimeError(f"connection reset while calling {_ASSUMED}")
+    )
+    st, gen, _h, _r = await BedrockAdapter(c).invoke_stream(b"{}", "m")
+    assert st == 502
+    _assert_no_account_identifiers(b"".join([x async for x in gen]).decode())
+
+
+async def test_validation_messages_clients_act_on_survive_the_redaction():
+    """Claude Code 는 'prompt is too long' 을 보고 대화를 압축한다.
+
+    일반 문구로 바꾸면 그 동작이 깨진다 — ARN·계정 번호만 지운다.
+    """
+    msg = "prompt is too long: 215000 tokens > 200000 maximum"
+    st, body, _h, _u = await BedrockAdapter(_raising_client("ValidationException", msg)).invoke(
+        b"{}", "m"
+    )
+    assert st == 400 and msg in body.decode()
+
+
+async def test_a_service_quota_error_is_429_not_a_502_that_trips_the_breaker():
+    """ServiceQuotaExceededException 은 그 **계정**의 쿼터다. 502 로 두면 폴백·서킷 브레이커 대상이
+    되어 다른 계정의 alias 까지 같은 모델 id 의 브레이커로 막는다."""
+    ad = BedrockAdapter(_raising_client("ServiceQuotaExceededException", "Too many tokens per day"))
+    st, _b, _h, _u = await ad.invoke(b"{}", "m")
+    assert st == 429
+    st, _g, _h, _r = await ad.invoke_stream(b"{}", "m")
+    assert st == 429
+
+
+@pytest.mark.parametrize("adapter_cls", [MantleAdapter, MantleOpenAIAdapter])
+async def test_mantle_error_passthrough_carries_no_arn_or_account_id(adapter_cls):
+    broker = MagicMock()
+    broker.bearer_token = AsyncMock(return_value="tok")
+    http = MagicMock()
+    http.post = AsyncMock(
+        return_value=MagicMock(status_code=403, content=json.dumps({"message": _DENIED}).encode())
+    )
+    st, body, _h, _u = await adapter_cls(http_client=http, broker=broker).invoke(
+        b"{}", "m", profile=_profile(), endpoint="https://bedrock-mantle.us-west-2.api.aws/x"
+    )
+    assert st == 403
+    _assert_no_account_identifiers(body.decode())
+    assert "is not authorized to perform" in body.decode()
+
+
+async def test_runtime_error_passthrough_carries_no_arn_or_account_id():
+    signer = MagicMock()
+    signer.sign = AsyncMock(return_value={"Authorization": "sig"})
+    http = MagicMock()
+    http.post = AsyncMock(
+        return_value=MagicMock(
+            status_code=403, headers={}, content=json.dumps({"message": _DENIED}).encode()
+        )
+    )
+    st, body, _h, _u = await BedrockOpenAIAdapter(http_client=http, signer=signer).invoke(
+        b"{}", "us.openai.gpt-x", endpoint=RUNTIME_ENDPOINT, profile=_profile(), wire="responses"
+    )
+    assert st == 403
+    _assert_no_account_identifiers(body.decode())
+    assert json.loads(body)["message"].startswith("User: <arn> is not authorized")

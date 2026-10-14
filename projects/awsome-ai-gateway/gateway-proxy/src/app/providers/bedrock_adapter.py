@@ -17,6 +17,7 @@ from app.services.account_credentials import (
     ACCOUNT_UNAVAILABLE_BODY,
     ACCOUNT_UNAVAILABLE_STATUS,
     AccountCredentialsUnavailable,
+    redact_account_identifiers,
 )
 
 _BEDROCK_POOL_SIZE = int(os.environ.get("BEDROCK_THREAD_POOL_SIZE", "128"))
@@ -30,6 +31,9 @@ _BOTO_ERROR_MAP: dict[str, int] = {
     "AccessDeniedException": 403,
     "ResourceNotFoundException": 404,
     "ThrottlingException": 429,
+    # 계정의 쿼터(예: 일일 토큰)다. 기본값 502 로 두면 폴백·서킷 브레이커 대상이 되어, 그 계정의
+    # 쿼터가 같은 모델 id 를 다른 계정으로 부르는 alias 의 브레이커까지 연다.
+    "ServiceQuotaExceededException": 429,
     "ModelTimeoutException": 504,
     "ServiceException": 502,
     "InternalServerException": 502,
@@ -232,9 +236,14 @@ class BedrockAdapter(ProviderAdapter):
         except ClientError as e:
             code = e.response["Error"]["Code"]
             status = _BOTO_ERROR_MAP.get(code, 502)
-            logger.warning("bedrock_client_error", error_code=code, model_id=model_id)
+            # 원문은 로그에만. 클라이언트 본문에서는 ARN·계정 번호를 지운다 — AccessDenied 문장에
+            # 서명한 계정의 assumed-role ARN 이 들어 있다
+            # (account_credentials.redact_account_identifiers).
+            logger.warning(
+                "bedrock_client_error", error_code=code, model_id=model_id, error=str(e)
+            )
             error_body = json.dumps(
-                {"error": {"type": "provider_error", "message": str(e)}}
+                {"error": {"type": "provider_error", "message": redact_account_identifiers(str(e))}}
             ).encode()
             return status, error_body, {}, TokenUsage()
         except Exception:
@@ -346,10 +355,10 @@ class BedrockAdapter(ProviderAdapter):
         except ClientError as e:
             code = e.response["Error"]["Code"]
             status = _BOTO_ERROR_MAP.get(code, 502)
-            error_msg = str(e)
             logger.warning(
-                "bedrock_stream_client_error", error_code=code, model_id=model_id, error=error_msg
+                "bedrock_stream_client_error", error_code=code, model_id=model_id, error=str(e)
             )
+            error_msg = redact_account_identifiers(str(e))  # invoke 의 같은 주석
 
             async def error_gen():
                 yield json.dumps(
@@ -358,7 +367,7 @@ class BedrockAdapter(ProviderAdapter):
 
             return status, error_gen(), {}, None
         except Exception as exc:
-            error_msg = str(exc)
+            error_msg = redact_account_identifiers(str(exc))
             logger.exception("bedrock_stream_failed", model_id=model_id)
 
             async def error_gen():

@@ -57,6 +57,15 @@ class ModelInactiveError(LookupError):
     """
 
 
+class AmbiguousModelAccountError(LookupError):
+    """provider_model_id 로 지목했는데 그 id 의 ACTIVE alias 들이 서로 다른 AWS 계정을 부른다.
+
+    :class:`ModelInactiveError` 와 같은 이유로 따로 둔다: 대체(fallback)하는 호출자에게 이것은
+    "모르는 모델" 이 아니다. /v1/responses 가 이것을 default_model 로 바꾸면 요청이 다른 모델·다른
+    계정으로 200 을 받는다 — 거절해야 하고(404), 고치는 법은 "alias 로 지목하라" 다.
+    """
+
+
 class ClientModelScopeError(PermissionError):
     """모델 × 앱 축의 거부(:func:`check_client_model_scope`).
 
@@ -185,7 +194,14 @@ def _parse_cached_model(cached: str, model_ref: str) -> Optional[ModelConfigSche
     treat it as a cache miss and rebuild from the DB with the correct shape+TTL.
     """
     try:
-        return ModelConfigSchema(**json.loads(cached))
+        data = json.loads(cached)
+        # 롤링 배포: 0043 이전 이미지가 쓴 payload 에는 계정 칸이 아예 없다. 스키마 기본값 None
+        # 으로 받으면 "alias 계정 없음" 이 되어 TTL 동안 그 alias 를 파드/프로필 계정으로 서명한다
+        # — 다른 계정에 청구되는 200 이다. 키가 없으면 미스로 본다(명시적 null 은 정상 값이다).
+        if "account_role_arn" not in data:
+            logger.info("model_cache_predates_alias_accounts_treating_as_miss", model_ref=model_ref)
+            return None
+        return ModelConfigSchema(**data)
     except Exception:
         logger.warning("model_cache_parse_failed_treating_as_miss", model_ref=model_ref)
         return None
@@ -206,12 +222,18 @@ async def _pmid_fallback_row(db: AsyncSession, provider_values: list[str], model
     로 지목한 요청이 캐시가 채워질 때마다 이 sibling 의 계정 또는 저 sibling 의 계정으로 청구될 수
     있었다(매번 200). 그래서:
 
-      * (account_role_arn, account_external_id) 가 다른 sibling 이 있으면 그 이름들을 담아
-        LookupError 로 거절한다(시끄럽게 — 고치는 법은 "alias 로 지목하라" 로 분명하다);
-      * 아니면 ``ORDER BY alias`` 의 첫 행 — 계정이 같으니 결정적으로 고르면 단가 행도 안정된다.
+      * **ACTIVE** sibling 만 본다 — 비활성 alias 는 서빙되지 않으므로 계정이 달라도 모호하지 않다;
+      * 그 중 (account_role_arn, account_external_id) 가 다른 것이 있으면
+        :class:`AmbiguousModelAccountError` 로 거절한다(시끄럽게 — 고치는 법은 "alias 로 지목하라").
+        alias 이름은 **로그에만** 남긴다: 404 본문은 그 키를 가진 누구에게나 가고, 이름은 다른
+        팀의 모델 구성이다;
+      * 아니면 ``ORDER BY alias`` 의 첫 ACTIVE 행 — 계정이 같으니 결정적으로 고르면 단가 행도
+        안정된다;
+      * ACTIVE 가 하나도 없으면 첫 행(비활성)을 돌려 호출자가 :class:`ModelInactiveError` 로
+        거절하게 한다 — 모든 alias 를 끈 운영자의 kill switch 가 "없는 모델" 로 대체되면 안 된다.
 
     계정이 없는 alias 들은 모두 (None, None) 으로 일치하므로 거절되지 않는다 — 오늘 동작에서
-    바뀌는 것은 "임의의 sibling" 이 "이름순 첫 sibling" 이 된 것뿐이다.
+    바뀌는 것은 "임의의 sibling" 이 "이름순 첫 ACTIVE sibling" 이 된 것뿐이다.
     """
     rows = (
         await db.execute(
@@ -228,22 +250,24 @@ async def _pmid_fallback_row(db: AsyncSession, provider_values: list[str], model
     ).scalars().all()
     if not rows:
         return None
+    active = [r for r in rows if r.status == "ACTIVE"]
+    if not active:
+        return rows[0]  # 호출자가 ModelInactiveError 로 거절한다(kill switch)
     accounts = {
         (getattr(r, "account_role_arn", None), getattr(r, "account_external_id", None))
-        for r in rows
+        for r in active
     }
     if len(accounts) > 1:
-        names = [str(r.alias) for r in rows[:8]]
         logger.error(
             "provider_model_id_siblings_disagree_on_account",
             provider_model_id=model_ref[:128],
-            aliases=names,
+            aliases=[str(r.alias) for r in active[:8]],
         )
-        raise LookupError(
-            f"Model '{model_ref}' is registered under several aliases that call different "
-            f"AWS accounts ({', '.join(names)}); ask for a specific alias instead."
+        raise AmbiguousModelAccountError(
+            f"Model '{model_ref[:128]}' is registered under several aliases that call different "
+            "AWS accounts; ask for a specific alias instead."
         )
-    return rows[0]
+    return active[0]
 
 
 async def _cache_resolved(redis, schema: ModelConfigSchema, model_ref: str) -> None:

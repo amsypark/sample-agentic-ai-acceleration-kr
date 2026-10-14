@@ -21,7 +21,11 @@ from app.services.body_log_records import (
     resolve_body_logger,
 )
 from app.services.fallback_loop import release_reservations
-from app.services.router_service import ModelInactiveError, RouterService
+from app.services.router_service import (
+    AmbiguousModelAccountError,
+    ModelInactiveError,
+    RouterService,
+)
 from app.services.service_tier_gate import reject_unpriced_service_tier
 from app.services.streaming import openai_sse_stream
 from app.services.tokenizer import estimate_prompt_usage
@@ -596,10 +600,13 @@ async def _handle_responses(request: Request):
         if _is_usable_model_ref(requested_alias) and requested_alias != profile.default_model:
             try:
                 return await _router_service.resolve_codex_model(redis, db, requested_alias)
-            except ModelInactiveError:
+            except (ModelInactiveError, AmbiguousModelAccountError):
                 # Do NOT fall back. status=INACTIVE is an operator kill switch: an alias
                 # that exists but was deliberately disabled must be refused, not quietly
                 # served as some other model (which would also bill the wrong alias).
+                # A model id whose active aliases call different AWS accounts is the same
+                # kind of answer: the model exists, we refuse to guess the account — serving
+                # default_model instead would be a 200 from another model and account.
                 # Propagates as a 404 via the LookupError handler below.
                 raise
             except (LookupError, DBAPIError):

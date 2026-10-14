@@ -169,6 +169,20 @@ def _fake_boto(signer: str, region: str, *, fail_code=None, built=None):
 
     c.invoke_model = MagicMock(side_effect=_invoke)
     c.count_tokens = MagicMock(side_effect=lambda **kw: {"inputTokens": len(signer)})
+
+    def _stream(**kw):
+        events = [
+            {"type": "message_start", "message": {"usage": {"input_tokens": 3}}},
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": signer}},
+            {"type": "message_delta", "usage": {"output_tokens": 2}},
+            {"type": "message_stop"},
+        ]
+        return {
+            "body": [{"chunk": {"bytes": json.dumps(e).encode()}} for e in events],
+            "ResponseMetadata": {"RequestId": f"rid-{signer}"},
+        }
+
+    c.invoke_model_with_response_stream = MagicMock(side_effect=_stream)
     return c
 
 
@@ -279,7 +293,9 @@ def _app_state(world, profile, *, fallback_order=None, alias_map=None, cb=None, 
     return st
 
 
-async def _messages(monkeypatch, world, profile, configs, alias, *, client="claude-code", **app_kw):
+async def _messages(
+    monkeypatch, world, profile, configs, alias, *, client="claude-code", stream=False, **app_kw
+):
     import app.routers.messages as messages_mod
 
     monkeypatch.setattr(messages_mod, "_router_service", _Router(configs))
@@ -291,11 +307,10 @@ async def _messages(monkeypatch, world, profile, configs, alias, *, client="clau
         "_session_factory": None,
         "request_id": "req-1",
     }
-    req = _FakeRequest(
-        {"model": alias, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]},
-        state,
-        app_state,
-    )
+    body = {"model": alias, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+    if stream:
+        body["stream"] = True
+    req = _FakeRequest(body, state, app_state)
     resp = await messages_mod.messages(req)
     return resp, app_state
 
@@ -689,3 +704,187 @@ async def test_runtime_alias_account_is_handed_to_the_signer(monkeypatch, world,
     resp, _st = await _openai(monkeypatch, world, profile, cfg, path)
     assert resp.status_code == 200
     assert signer.sign.await_args.kwargs["account"] == AccountTarget(ALIAS_ROLE, "alias-ext")
+
+
+
+# ── 계정을 쓰지 못한 스트림은 과금 행을 남기지 않는다 ──────────────────────────────────
+#
+# 스트림 경로는 상태와 무관하게 끝에서 on_usage / finalize 를 부른다. AssumeRole 실패(호출 자체가
+# 없음)로 끝난 스트림이 0 토큰 행을 alias 계정으로 남기면, 그 계정의 invocation log 에 없는 요청이
+# 원장에 "그 계정이 서빙했다" 로 남는다. finalize 의 0-usage 분기는 행을 쓰지 않는다 — 진짜
+# CostRecorder.finalize 로, Redis XADD 만 기록 대역으로 바꿔 끝까지 돌려 본다.
+
+
+class _LedgerRedis:
+    """finalize 가 쓰는 Redis 연산만: 예산 EVAL 은 성공한 척, cost:stream XADD 는 기록."""
+
+    def __init__(self):
+        self.rows: list[dict] = []
+
+    async def eval(self, *a, **kw):
+        return b'{"new_used":0,"remaining":1,"threshold_triggered":null}'
+
+    async def xadd(self, stream, fields, **kw):
+        self.rows.append(json.loads(fields["payload"]))
+
+
+class _Ledger:
+    """진짜 finalize. 라우트가 넘기는 redis(이 하네스에서는 None)만 기록 대역으로 바꾼다."""
+
+    def __init__(self):
+        from app.services.cost_recorder import CostRecorder
+
+        self.redis = _LedgerRedis()
+        self._real = CostRecorder()
+
+    async def finalize(self, *args, **kwargs):
+        if "redis" in kwargs:
+            kwargs["redis"] = self.redis
+        else:
+            args = (self.redis, *args[1:])
+        return await self._real.finalize(*args, **kwargs)
+
+
+@pytest.fixture
+def ledger(monkeypatch):
+    from app.services.lua_loader import LuaScriptLoader
+
+    monkeypatch.setitem(LuaScriptLoader._scripts, "budget_deduct", "-- test")
+    return _Ledger()
+
+
+async def _drain(resp) -> bytes:
+    return b"".join([c if isinstance(c, bytes) else c.encode() async for c in resp.body_iterator])
+
+
+async def test_a_streamed_alias_call_records_its_account_on_the_ledger(monkeypatch, world, ledger):
+    """양성 대조군: 하네스가 행을 볼 수 있다 — 성공한 스트림은 alias 계정으로 한 행."""
+    resp, _st = await _messages(
+        monkeypatch, world, None, {"claude-x": _cfg("claude-x", role=ALIAS_ROLE)}, "claude-x",
+        client="other", stream=True, extra={"cost_recorder": ledger},
+    )
+    assert resp.status_code == 200
+    await _drain(resp)
+    rows = [(r["aws_account_id"], r["input_tokens"], r["output_tokens"]) for r in ledger.redis.rows]
+    assert rows == [("111122223333", 3, 2)]
+
+
+async def test_a_messages_stream_that_could_not_assume_the_account_leaves_no_row(
+    monkeypatch, world, ledger
+):
+    world.sts._fail.add(ALIAS_ROLE)
+    resp, _st = await _messages(
+        monkeypatch, world, None, {"claude-x": _cfg("claude-x", role=ALIAS_ROLE)}, "claude-x",
+        client="other", stream=True, extra={"cost_recorder": ledger},
+    )
+    assert resp.status_code == ACCOUNT_UNAVAILABLE_STATUS
+    await _drain(resp)
+    assert ledger.redis.rows == []
+
+
+async def test_a_passthrough_stream_that_could_not_assume_the_account_leaves_no_row(
+    monkeypatch, world, ledger
+):
+    import app.routers.bedrock as bedrock_mod
+
+    world.sts._fail.add(ALIAS_ROLE)
+    cfg = _cfg("claude-x", role=ALIAS_ROLE)
+    monkeypatch.setattr(bedrock_mod, "_router_service", _Router({cfg.alias: cfg}))
+    st = _app_state(world, None, extra={"cost_recorder": ledger})
+    state = {
+        "auth_context": _auth(),
+        "client": "other",
+        "_redis": None,
+        "_session_factory": None,
+        "request_id": "req-1",
+        # 예약이 있었던 요청 — stream_with_cost 가 0 usage 로라도 finalize 를 부르는 조건이다.
+        "rate_limit_state": {"tpm_descriptors": [], "tpm_reserved": 0},
+    }
+    req = _FakeRequest({"messages": []}, state, st)
+    resp = await bedrock_mod._handle_bedrock(
+        req, cfg.alias, "invoke-with-response-stream", stream=True
+    )
+    assert resp.status_code == ACCOUNT_UNAVAILABLE_STATUS
+    await _drain(resp)
+    assert ledger.redis.rows == []
+
+
+async def test_a_responses_stream_that_could_not_assume_the_account_leaves_no_row(
+    monkeypatch, world, ledger
+):
+    import app.routers.openai_compat as oc
+    from app.services.account_credentials import AccountCredentialsUnavailable
+
+    signer = _runtime_world(world)
+    signer.sign = AsyncMock(side_effect=AccountCredentialsUnavailable(ALIAS_ROLE, "AccessDenied"))
+    cfg = _cfg("gpt-x", role=ALIAS_ROLE, provider=ProviderType.BEDROCK_RUNTIME_OPENAI,
+               pmid="us.openai.gpt-x", endpoint=RUNTIME_ENDPOINT)
+    monkeypatch.setattr(oc, "_router_service", _Router({cfg.alias: cfg}))
+    st = _app_state(
+        world, _codex_profile(backend="bedrock_openai"), extra={"cost_recorder": ledger}
+    )
+    state = {
+        "auth_context": _auth(),
+        "client": "codex",
+        "_redis": None,
+        "_session_factory": None,
+        "request_id": "req-1",
+    }
+    req = _FakeRequest({"model": cfg.alias, "input": "hi", "stream": True}, state, st)
+    resp = await oc._handle_responses(req)
+    assert resp.status_code == ACCOUNT_UNAVAILABLE_STATUS
+    await _drain(resp)
+    assert ledger.redis.rows == []
+
+
+# ── 서킷 브레이커는 계정 단위 ────────────────────────────────────────────────────────
+
+
+class _KeyedCB(_CB):
+    def __init__(self):
+        super().__init__()
+        self.successes: list[str] = []
+        self.checked: list[str] = []
+
+    async def is_open(self, redis, pmid):
+        self.checked.append(pmid)
+        return False
+
+    async def record_success(self, redis, pmid):
+        self.successes.append(pmid)
+
+
+async def test_an_alias_accounts_failures_do_not_open_the_breaker_of_in_account_aliases(
+    monkeypatch, world
+):
+    """계정 하나의 장애·쿼터(502)가 같은 모델 id 를 부르는 **다른 계정** alias 의 브레이커를 열면
+    멀쩡한 계정의 트래픽까지 503 이 된다. alias 계정이 있으면 키에 계정 번호가 붙고, 없으면 키가
+    오늘과 같다(provider_model_id 그대로 — 배포 중 기존 브레이커 상태가 그대로 이어진다)."""
+
+    def _boto_client(svc, **kw):
+        return _fake_boto(kw["aws_access_key_id"], kw["region_name"], fail_code="ServiceException")
+
+    monkeypatch.setattr("app.services.bedrock_account_client.boto3.client", _boto_client)
+    pmid = "global.anthropic.claude-shared"
+    configs = {
+        "claude-a": _cfg("claude-a", pmid=pmid, role=ALIAS_ROLE),
+        "claude-b": _cfg("claude-b", pmid=pmid),
+    }
+    cb = _KeyedCB()
+    resp, _st = await _messages(
+        monkeypatch, world, None, configs, "claude-a", client="other", cb=cb,
+        fallback_order=["claude-a", "claude-b"],
+        alias_map={"claude-a": ProviderType.BEDROCK, "claude-b": ProviderType.BEDROCK},
+    )
+    assert resp.status_code == 200 and _body(resp)["signed_by"] == "POD"
+    assert cb.failures == [f"{pmid}@111122223333"]
+    assert cb.checked == [f"{pmid}@111122223333", pmid]
+    assert cb.successes == [pmid]
+
+
+def test_breaker_keys_without_an_alias_account_are_todays_keys():
+    from app.services.fallback_loop import breaker_key
+
+    assert breaker_key(_cfg("claude-x")) == "global.anthropic.claude-x"
+    with_account = breaker_key(_cfg("claude-x", role=ALIAS_ROLE))
+    assert with_account == "global.anthropic.claude-x@111122223333"

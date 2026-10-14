@@ -47,6 +47,7 @@ alias 계정이 없는 요청에만 걸린다.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 #: RoleSessionName — 경로(transport)마다 **이미 쓰던 이름**을 alias 계정에도 쓴다. 대상 계정의
@@ -154,6 +155,28 @@ def account_id_of(role_arn: str | None) -> str | None:
     if len(parts) > 4 and len(parts[4]) == 12 and parts[4].isdigit():
         return parts[4]
     return None
+
+
+_ARN_RE = re.compile(r"arn:aws[^\s\"'\\]*")
+_ACCOUNT_ID_RE = re.compile(r"(?<!\d)\d{12}(?!\d)")
+
+
+def redact_account_identifiers(text: str) -> str:
+    """클라이언트로 가는 상류 오류 문장에서 ARN 과 12자리 계정 번호만 지운다.
+
+    AccessDenied 메시지에는 서명한 **대상 계정의** assumed-role ARN 이 그대로 들어 있고, 그 본문은
+    가상 키를 가진 누구에게나 간다. 메시지를 통째로 일반 문구로 바꾸지 않는 이유: 클라이언트가
+    그 문장으로 동작한다(Claude Code 는 ``prompt is too long`` 을 보고 대화를 압축한다). 원문은
+    각 어댑터가 서버 로그에 남긴다.
+    """
+    return _ACCOUNT_ID_RE.sub("<account-id>", _ARN_RE.sub("<arn>", text))
+
+
+def redact_account_identifiers_bytes(body: bytes) -> bytes:
+    """:func:`redact_account_identifiers` 의 바이트판 — 상류 오류 본문 그대로 넘기는 경로용."""
+    if b"arn:aws" not in body and not _ACCOUNT_ID_RE.search(body.decode("utf-8", "replace")):
+        return body  # 바꿀 것이 없으면 원본 바이트 그대로(디코딩 왕복 없음)
+    return redact_account_identifiers(body.decode("utf-8", "replace")).encode()
 
 
 def effective_account_id(

@@ -15,6 +15,7 @@ from app.services.account_credentials import (
     ACCOUNT_UNAVAILABLE_BODY,
     ACCOUNT_UNAVAILABLE_STATUS,
     AccountCredentialsUnavailable,
+    redact_account_identifiers_bytes,
 )
 
 logger = structlog.get_logger(__name__)
@@ -87,7 +88,8 @@ class MantleAdapter(ProviderAdapter):
                 model_id=model_id,
                 error_body=body[:500].decode("utf-8", "replace"),
             )
-            return resp.status_code, body, {}, TokenUsage()
+            # 원문은 위 로그에만 — 클라이언트로 가는 본문에서는 서명 계정의 ARN·번호를 지운다.
+            return resp.status_code, redact_account_identifiers_bytes(body), {}, TokenUsage()
 
         try:
             usage = _extract_bedrock_usage(json.loads(body))

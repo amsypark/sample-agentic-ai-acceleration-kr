@@ -70,6 +70,7 @@ from app.services.account_credentials import (
     ACCOUNT_UNAVAILABLE_MESSAGE,
     ACCOUNT_UNAVAILABLE_STATUS,
     AccountCredentialsUnavailable,
+    redact_account_identifiers_bytes,
 )
 
 logger = structlog.get_logger(__name__)
@@ -267,7 +268,9 @@ class BedrockOpenAIAdapter(ProviderAdapter):
                 aws_request_id=aws_request_id,
                 error_body=body[:500].decode("utf-8", "replace"),
             )
-            return resp.status_code, body, out_headers, TokenUsage()
+            # 원문은 위 로그에만 — 클라이언트로 가는 본문에서는 서명 계정의 ARN·번호를 지운다.
+            safe_body = redact_account_identifiers_bytes(body)
+            return resp.status_code, safe_body, out_headers, TokenUsage()
 
         logger.info(
             "bedrock_openai_invoked",

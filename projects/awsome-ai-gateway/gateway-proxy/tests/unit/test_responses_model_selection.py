@@ -591,3 +591,55 @@ async def test_scope_denial_applies_to_requested_model(monkeypatch):
     # The check saw the REQUESTED model, not the profile default.
     assert denied["alias"] == "codex-gpt-5.6-sol"
     adapter.invoke.assert_not_awaited()
+
+
+def _sibling_row(alias, role=None, ext=None, status="ACTIVE"):
+    row = MagicMock()
+    row.alias = alias
+    row.status = status
+    row.account_role_arn = role
+    row.account_external_id = ext
+    return row
+
+
+@pytest.mark.asyncio
+async def test_a_model_id_whose_aliases_call_different_accounts_is_denied_not_substituted(
+    monkeypatch,
+):
+    """BILLING: 모델 id 로 지목했는데 그 id 의 alias 들이 서로 다른 AWS 계정을 부르면 해석을
+    거절한다(_pmid_fallback_row). 그 거절이 이 경로에서 '모르는 모델' 처럼 default_model 로
+    조용히 바뀌면, 요청은 다른 모델·다른 계정으로 200 을 받는다 — inactive 와 같이 404 여야 한다.
+
+    진짜 RouterService 해석 경로(alias 정확 매칭 없음 → 모델 id 형제 조회)를 통과시킨다.
+    """
+    from app.services.router_service import RouterService
+
+    shared = "openai.gpt-shared"
+    db = MagicMock()
+    exact = MagicMock()
+    exact.scalar_one_or_none = MagicMock(return_value=None)
+    siblings = MagicMock()
+    siblings.scalars = MagicMock(return_value=MagicMock(all=MagicMock(return_value=[
+        _sibling_row("gpt-a", role="arn:aws:iam::111122223333:role/a"),
+        _sibling_row("gpt-b"),
+    ])))
+    db.execute = AsyncMock(side_effect=[exact, siblings])
+
+    request, adapter, _calls, fallback_resolve = _build(shared)
+    real = RouterService()
+
+    async def _resolve(redis, _db, model_ref):
+        if model_ref == shared:
+            return await real.resolve_codex_model(None, db, model_ref)
+        return await fallback_resolve(redis, _db, model_ref)
+
+    monkeypatch.setattr("app.routers.openai_compat._router_service.resolve_codex_model", _resolve)
+
+    resp = await _handle_responses(request)
+
+    assert resp.status_code == 404, "형제 계정 불일치가 default_model 로 대체됐다"
+    assert b"different AWS accounts" in resp.body
+    assert b"gpt-a" not in resp.body and b"gpt-b" not in resp.body, (
+        "alias 이름(다른 팀의 모델 구성)은 클라이언트가 아니라 로그로만 간다"
+    )
+    adapter.invoke.assert_not_awaited()
