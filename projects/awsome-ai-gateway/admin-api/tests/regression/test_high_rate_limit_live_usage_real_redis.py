@@ -32,12 +32,18 @@ from pathlib import Path
 import pytest
 
 REDIS_PROOF_URL = os.environ.get("REDIS_PROOF_URL")
+PROOF_DSN = os.environ.get("PROOF_DSN")  # 설정돼 있으면 증명 잡이다 — 그때 Redis 가 없으면 실패
 PROXY_SCOPE_MODULE = (
     Path(__file__).resolve().parents[3] / "gateway-proxy" / "src" / "app" / "services" / "rate_limit_scope.py"
 )
 
+# ⚠️ 둘 다 없을 때(일반 pytest·로컬)만 skip 한다. CI 의 pg-proof 잡은 PROOF_DSN 과 REDIS_PROOF_URL 을
+#    함께 준다 — PROOF_DSN 만 있는데 Redis 가 빠지면 아래 픽스처가 **실패**시킨다. 조용히 skip 되면
+#    이 증명이 CI 에서 사라진 것을 아무도 모른다(GitHub Actions 는 모든 잡에 CI=true 를 주므로 그
+#    변수로는 증명 잡을 가릴 수 없다).
 pytestmark = pytest.mark.skipif(
-    not REDIS_PROOF_URL, reason="REDIS_PROOF_URL 미설정 — glob 매칭은 실 Redis 에서만 증명된다"
+    not REDIS_PROOF_URL and not PROOF_DSN,
+    reason="REDIS_PROOF_URL 미설정 — glob 매칭은 실 Redis 에서만 증명된다",
 )
 
 
@@ -55,6 +61,8 @@ def _proxy():
 
 @pytest.fixture
 async def redis_client():
+    if not REDIS_PROOF_URL:
+        pytest.fail("PROOF_DSN 은 있는데 REDIS_PROOF_URL 이 없다 — 이 증명은 실 Redis 가 필요하다")
     redis_asyncio = pytest.importorskip("redis.asyncio", reason="redis 패키지 필요")
     client = redis_asyncio.from_url(REDIS_PROOF_URL, decode_responses=True)
     assert await client.ping() is True, f"REDIS_PROOF_URL 에 붙지 못했다: {REDIS_PROOF_URL}"
