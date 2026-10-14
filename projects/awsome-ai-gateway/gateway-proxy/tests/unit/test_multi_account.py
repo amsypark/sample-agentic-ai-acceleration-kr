@@ -993,3 +993,22 @@ async def test_runtime_error_passthrough_carries_no_arn_or_account_id():
     assert st == 403
     _assert_no_account_identifiers(body.decode())
     assert json.loads(body)["message"].startswith("User: <arn> is not authorized")
+
+
+@pytest.mark.parametrize(
+    "stream_fn", ["bedrock_anthropic_sse_stream", "openai_sse_stream", "responses_sse_stream"]
+)
+async def test_a_mid_stream_error_event_carries_no_arn_or_account_id(stream_fn):
+    """스트림 도중의 상류 예외도 클라이언트에 SSE error 이벤트로 간다 — 같은 규칙으로 지운다."""
+    from app.services import streaming
+
+    async def _chunks():
+        if False:  # pragma: no cover - async generator
+            yield b""
+        raise RuntimeError(_DENIED)
+
+    request = MagicMock()
+    request.is_disconnected = AsyncMock(return_value=False)
+    out = b"".join([c async for c in getattr(streaming, stream_fn)(request, _chunks())]).decode()
+    assert "is not authorized to perform" in out
+    _assert_no_account_identifiers(out)
