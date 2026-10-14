@@ -981,3 +981,46 @@ async def test_cost_settle_eval_never_crosses_slots(mock_redis):
         numkeys = call.args[1]
         keys = call.args[2 : 2 + numkeys]
         assert len({_hash_tag(k) for k in keys}) == 1, f"CROSSSLOT: {keys}"
+
+
+@pytest.mark.asyncio
+async def test_a_later_scope_denial_releases_the_earlier_reservations(mock_redis):
+    """호출 모양 가드(값의 증명은 test_medium_reservation_release_on_denial.py, 실 Redis): TEAM 이
+    거부하면 USER 에 넣은 예약을 예약액의 음수로 한 번 되돌린다 — 비용은 cost_settle_scope, TPM 은
+    rate_limit_tpm_settle(예약한 버킷)."""
+    from app.services.lua_loader import LuaScriptLoader
+
+    for name in ("cost_rate_limit_scope", "cost_settle_scope", "rate_limit_tpm_check",
+                 "rate_limit_tpm_settle"):
+        LuaScriptLoader._scripts[name] = f"-- {name}"
+    ok = json.dumps({"allowed": True, "reserved_cost": 0.5}).encode()
+    deny = json.dumps({"allowed": False, "scope": "TEAM", "limit_type": "cpm"}).encode()
+    mock_redis.eval = AsyncMock(side_effect=[ok, deny])
+    r = await RateLimitService().reserve_cost(
+        mock_redis, user_id="u1", estimated_cost=Decimal("0.5"),
+        user_cpm_limit=Decimal("1"), user_cph_limit=None,
+        team_id="t1", team_cpm_limit=Decimal("1"), team_cph_limit=None,
+    )
+    assert not r.allowed and r.reserved_cost == Decimal("0")
+    released = [c.args for c in mock_redis.pipeline.return_value.eval.call_args_list]
+    assert len(released) == 1
+    script, numkeys, cpm_key, cph_key, adj = released[0]
+    assert (script, numkeys, adj) == ("-- cost_settle_scope", 2, "-0.5")
+    assert cpm_key.startswith("rl:cost:user:{u1}:cpm:")
+    assert cph_key.startswith("rl:cost:user:{u1}:cph:")
+
+    mock_redis.pipeline.return_value.eval.reset_mock()
+    ok_tpm = json.dumps({"allowed": True, "limit": -1, "remaining": -1}).encode()
+    deny_tpm = json.dumps({"allowed": False, "scope": "TEAM", "limit_type": "tpm"}).encode()
+    mock_redis.eval = AsyncMock(side_effect=[ok_tpm, deny_tpm])
+    descriptors = build_scope_descriptors(
+        user_id="u1", team_id="t1", model_alias="m1",
+        user_rpm=None, user_tpm=10000, team_rpm=None, team_tpm=100,
+        global_rpm=None, global_tpm=None,
+    )
+    t = await RateLimitService().check_multi_scope_tpm(mock_redis, descriptors, reserved_tokens=500)
+    assert not t.allowed and t.reserved_keys == ()
+    released = [c.args for c in mock_redis.pipeline.return_value.eval.call_args_list]
+    assert len(released) == 1
+    assert released[0][0] == "-- rate_limit_tpm_settle" and released[0][1] == 3
+    assert released[0][2] == "{USER:u1:m1}:tpm:cur" and released[0][5] == "-500"

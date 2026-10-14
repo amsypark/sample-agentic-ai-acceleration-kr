@@ -170,6 +170,9 @@ async def enforce_rate_limits(
 ) -> JSONResponse | None:
     """라우터용 Pre-reserve RPM + TPM 체크 진입점.
 
+    거부할 때는 이 요청이 그때까지 넣은 TPM·비용 예약을 되돌린 뒤 429 를 돌려준다(뒤 스코프의
+    거부는 각 검사가, 비용 단계의 거부는 여기서 TPM 을). RPM 의 +1 은 그대로다.
+
     Returns:
         거부 시 ``JSONResponse(status_code=429)``, 통과 시 ``None``.
         통과한 경우 ``state`` 에 ``rate_limit_state`` 키로 settle 정보 주입:
@@ -266,6 +269,10 @@ async def enforce_rate_limits(
         team_cph_limit=limits.team.cph,
     )
     if not cost_result.allowed:
+        # 이 요청은 거부된다 — 위에서 넣은 TPM 예약을 되돌린다. 거부된 요청은 정산 상태를 받지 않아
+        # 다른 곳에서는 되돌릴 수 없고, 남기면 그 분(가중 추정으로 약 2분) 동안 과잉제한한다.
+        # 비용 쪽 앞 스코프의 예약은 reserve_cost 가 이미 되돌렸다.
+        await svc.settle_tpm(redis, [], reserved, 0, reserved_keys=tpm_result.reserved_keys)
         return _build_cost_429(cost_result, metrics)
 
     # 통과 — settle용 정보 주입

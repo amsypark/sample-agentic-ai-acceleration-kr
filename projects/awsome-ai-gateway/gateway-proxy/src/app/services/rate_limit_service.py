@@ -228,6 +228,11 @@ class RateLimitService:
         통과 결과의 ``reserved_keys`` 는 **실제로 예약한** 스코프마다 (cur, prev, window 키,
         예약한 버킷 번호)다. eval 이 실패해 fail-open 한 스코프는 들어가지 않는다. 정산은 이것만,
         그 버킷에서만 조정한다(:meth:`settle_tpm`).
+
+        뒤 스코프가 거부하면(또는 fail-closed 로 막으면) 이 요청이 앞 스코프에 넣은 예약을 그
+        자리에서 되돌리고 거부를 돌려준다. 거부된 요청은 정산 상태를 받지 않으므로 다른 곳에서
+        되돌릴 수 없다 — 예전에는 그 예약이 버킷이 넘어갈 때까지(가중 추정으로 최대 약 2분) 남아
+        과잉제한했다.
         """
         effective = [d for d in descriptors if d.tpm_limit and d.tpm_limit > 0]
         if not effective or reserved_tokens <= 0:
@@ -259,9 +264,12 @@ class RateLimitService:
                 logger.exception("rate_limit_tpm_scope_failed", scope=d.scope.value)
                 blocked = _on_eval_failure(d.scope.value, "tpm")
                 if blocked is not None:
+                    await self._settle_tpm_keys(redis, tuple(reserved), -int(reserved_tokens))
                     return blocked
                 continue
             if not result["allowed"]:
+                # 거부 — 앞 스코프에 이 요청이 넣은 예약을 되돌린다(docstring).
+                await self._settle_tpm_keys(redis, tuple(reserved), -int(reserved_tokens))
                 return RateLimitResult(
                     allowed=False,
                     remaining=result.get("remaining", -1),
@@ -322,10 +330,11 @@ class RateLimitService:
     ) -> None:
         if not reserved_keys:
             return
-        script = LuaScriptLoader.get("rate_limit_tpm_settle")
         # 파이프라이닝(deepdive Q50): 스코프별 EVAL 을 순차 await 대신 한 파이프라인으로.
         # 비트랜잭션 파이프라인은 cluster 에서 명령마다 그 키의 노드로 라우팅된다.
+        # 실패는 경고뿐이다 — 거부 경로의 되돌리기도 이것을 쓴다(429 를 다른 응답으로 바꾸지 않게).
         try:
+            script = LuaScriptLoader.get("rate_limit_tpm_settle")
             pipe = redis.pipeline(transaction=False)
             for cur, prev, win, bucket in reserved_keys:
                 pipe.eval(
@@ -425,9 +434,10 @@ class RateLimitService:
         fail-open 으로 CPM/CPH **무음 미집행**됐다(team 없을 때 dummy team 키조차
         cross-slot). cost_rate_limit_scope.lua 로 한 scope 의 cpm/cph 2키(동일 hash
         tag = 단일 슬롯)만 넘겨 scope 별 호출. USER 통과 후에만 TEAM 검사(fast-fail).
-        USER 통과·TEAM 거부 시 USER 카운터엔 phantom 예약이 남는다 — 거부된 요청은 정산
-        상태를 받지 않으므로 settle_cost 가 돌지 않고, 그 예약은 창이 끝날 때까지(cpm 1분,
-        cph 1시간) 남는다(과잉제한 방향). budget_service.check 와 동형 패턴.
+        USER 통과·TEAM 거부(또는 fail-closed) 시에는 이 요청이 USER 에 넣은 예약을 그 자리에서
+        되돌리고 거부를 돌려준다. 거부된 요청은 정산 상태를 받지 않으므로 다른 곳에서 되돌릴 수
+        없다 — 예전에는 그 예약이 창이 끝날 때까지(cpm 1분, cph 1시간) 남아 과잉제한했다.
+        budget_service.check 와 동형 패턴.
 
         반환값의 ``reserved_keys`` 는 **실제로 예약한** 스코프의 (cpm 키, cph 키)다. 한도가 없어
         건너뛴 스코프, eval 이 실패해 fail-open 한 스코프, 예약액이 0 이라 Lua 가 쓰지 않은 경우는
@@ -478,6 +488,7 @@ class RateLimitService:
                 logger.exception("cost_reserve_scope_failed", scope=label, user_id=user_id)
                 _record_fail_open(label, "cost")
                 if _fail_closed():
+                    await self._settle_cost_keys(redis, tuple(reserved), -estimated_cost, user_id)
                     return CostLimitResult(
                         allowed=False,
                         scope=label,
@@ -487,6 +498,8 @@ class RateLimitService:
                     )
                 continue
             if not result["allowed"]:
+                # 거부 — 앞 스코프에 이 요청이 넣은 예약을 되돌린다(docstring).
+                await self._settle_cost_keys(redis, tuple(reserved), -estimated_cost, user_id)
                 return CostLimitResult(
                     allowed=False,
                     scope=result.get("scope"),
@@ -561,11 +574,19 @@ class RateLimitService:
             )
             return
 
-        script = LuaScriptLoader.get("cost_settle_scope")
+        await self._settle_cost_keys(redis, reserved_keys, adjustment, user_id)
+
+    async def _settle_cost_keys(
+        self, redis, reserved_keys: tuple[tuple[str, str], ...], adjustment: Decimal, user_id: str
+    ) -> None:
+        """예약한 스코프마다 cost_settle_scope EVAL 한 번(정산·되돌리기 공용)."""
+        if not reserved_keys:
+            return
         # 파이프라이닝(deepdive Q50): 스코프별 EVAL 을 순차 await 대신 한 파이프라인으로.
         # 비트랜잭션 파이프라인은 cluster 에서 명령마다 그 키의 노드로 라우팅되고, 각 EVAL 의
-        # 두 키는 한 슬롯이다.
+        # 두 키는 한 슬롯이다. 실패는 경고뿐이다(거부 경로의 되돌리기도 이것을 쓴다).
         try:
+            script = LuaScriptLoader.get("cost_settle_scope")
             pipe = redis.pipeline(transaction=False)
             for cpm_key, cph_key in reserved_keys:
                 pipe.eval(script, 2, cpm_key, cph_key, str(adjustment))
