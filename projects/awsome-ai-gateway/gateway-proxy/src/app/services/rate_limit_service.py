@@ -352,6 +352,10 @@ class RateLimitService:
     ) -> None:
         """TPM 사후 정산 — 실제 토큰과 예약분의 차액을 **예약한 버킷에만** 반영한다 (설계 §D2).
 
+        단, 추가분(실제 > 예약)인데 예약한 버킷이 이미 지났으면 **지금 버킷**에 더한다 — 그 토큰은
+        응답이 끝난 지금 쓴 것이다(예약한 분은 prev 로 가중치만큼 줄어들거나 이미 사라졌다). 환불은
+        예약한 버킷에서만 한다.
+
         ``reserved_keys`` = :meth:`check_multi_scope_tpm` 이 돌려준 ``reserved_keys``(스코프마다
         cur·prev·window 키와 예약한 버킷 번호). 스코프마다 EVAL 한 번(rate_limit_tpm_settle.lua,
         같은 hash tag 의 세 키 — 다른 스코프와 한 EVAL 에 섞으면 Redis Cluster CROSSSLOT 이다).
@@ -406,6 +410,8 @@ class RateLimitService:
                     str(bucket),
                     str(_TPM_KEY_TTL),
                     str(_SETTLE_MARKER_TTL),
+                    # 지금 버킷 — 예약한 버킷이 지난 추가분이 간다(스크립트 docstring).
+                    str(int(time.time()) // 60),
                 )
             results = await pipe.execute(raise_on_error=False)
         except Exception:
@@ -624,8 +630,10 @@ class RateLimitService:
         """CPM/CPH 사후 정산 — 실제 비용과 예약분의 차액을 **예약한 키에만** 반영한다.
 
         ``reserved_keys`` = :meth:`reserve_cost` 가 돌려준 ``reserved_keys``(스코프마다 (cpm 키,
-        cph 키)). 정산은 그 키만, 그 키 이름의 창에서만 조정한다 — 예약하지 않은 스코프는 건드리지
-        않고, 정산 시각으로 창을 다시 고르지 않는다.
+        cph 키)). 정산은 그 스코프만, 그 키 이름의 창에서 조정한다 — 예약하지 않은 스코프는 건드리지
+        않고, 환불은 정산 시각으로 창을 다시 고르지 않는다. 단, 추가 청구(실제 > 예약)인데 예약한
+        창이 이미 지났으면 같은 스코프의 **지금** 창 키에 더한다(없으면 만들고 TTL 을 건다) — 지난
+        창의 키에 더하면 어떤 검사도 읽지 않아 그 비용이 한도에서 사라진다.
 
         ⚠️ 예전 구현은 USER 키를 무조건, TEAM 키를 ``team_id`` 만 있으면 조정했고 창을 정산
            시각의 ``now`` 로 골랐으며 EXPIRE 를 걸지 않았다. 그래서 (1) 한도가 없어 예약하지 않은
@@ -686,13 +694,18 @@ class RateLimitService:
         try:
             script = LuaScriptLoader.get("cost_settle_scope")
             pipe = redis.pipeline(transaction=False)
+            now = int(time.time())
             for cpm_key, cph_key in reserved_keys:
                 pipe.eval(
                     script,
-                    3,
+                    5,
                     cpm_key,
                     cph_key,
                     _cost_settle_marker(cpm_key, reservation_id),
+                    # 같은 스코프의 지금 창 키 — 예약한 창이 지난 추가 청구가 간다(스크립트
+                    # docstring). 예약한 창이 아직이면 위 두 키와 같다.
+                    f"{cpm_key.rsplit(':', 1)[0]}:{(now // 60) * 60}",
+                    f"{cph_key.rsplit(':', 1)[0]}:{(now // 3600) * 3600}",
                     str(adjustment),
                     str(_SETTLE_MARKER_TTL),
                 )

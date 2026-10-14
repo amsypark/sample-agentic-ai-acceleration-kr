@@ -365,6 +365,56 @@ async def test_settle_after_minute_and_hour_boundary_stays_in_the_reserved_windo
         await _cleanup(r, auth)
 
 
+@pytest.mark.parametrize("crossing", ["minute", "hour"])
+async def test_an_extra_charge_after_the_reserved_window_lands_in_the_current_window(
+    real_redis, monkeypatch, crossing
+):
+    """실제 > 예약인데 정산 때 예약한 창이 이미 지났다(분 경계, 또는 분·시 경계) → 추가분(실제 −
+    예약)은 같은 스코프의 **지금** 창 키에 간다(새로 만들고 TTL 을 건다). 예약한 창의 키는 예약액
+    그대로다. 지나지 않은 창(분 경계에서의 cph)은 예약한 키가 실제 비용이 된다. 예약하지 않은
+    스코프(USER)에는 키가 생기지 않는다.
+
+    예전에는 추가분이 지난 창의 키에 더해졌다 — 그 키는 어떤 검사도 읽지 않으므로 그 비용은 지금
+    창의 한도에서 빠졌다. 환불은 그대로 예약한 창에서 한다(위 경계 테스트).
+    """
+    from app.services import rate_limit_service as rls
+
+    r = real_redis
+    auth = _auth()
+    big = TokenUsage(input_tokens=50, output_tokens=4000, total_tokens=4050)
+    hour = (int(time.time()) // 3600 + 1) * 3600
+    boundary = hour if crossing == "hour" else hour + 600  # hour + 600: 시 안의 분 경계
+    clock = [boundary - 0.5]
+    monkeypatch.setattr(rls, "time", SimpleNamespace(time=lambda: clock[0]))
+    team = f"rl:cost:team:{{{auth.team_id}}}"
+    cpm_old, cph_old = f"{team}:cpm:{boundary - 60}", f"{team}:cph:{(boundary - 1) // 3600 * 3600}"
+    cpm_now, cph_now = f"{team}:cpm:{boundary}", f"{team}:cph:{boundary // 3600 * 3600}"
+    try:
+        state, keys = await _reserve(monkeypatch, r, auth, user=False, team=True, max_tokens=10)
+        assert keys == {cpm_old, cph_old}
+        reserved = _reserved(state)
+        actual = float(calculate_cost(big, _model()))
+        assert actual > reserved
+
+        clock[0] = boundary + 0.5
+        await _finalize(r, auth, state, big)
+
+        keyspace = await _cost_keyspace(r)
+        _assert_no_ttl_less_or_negative(keyspace)
+        after = _of(keyspace, auth)
+        extra = actual - reserved
+        if crossing == "hour":
+            expect = {cpm_old: reserved, cph_old: reserved, cpm_now: extra, cph_now: extra}
+        else:
+            assert cph_now == cph_old
+            expect = {cpm_old: reserved, cph_old: actual, cpm_now: extra}
+        assert {k: v[0] for k, v in after.items()} == pytest.approx(expect, abs=1e-12)
+        assert 0 < after[cpm_now][1] <= 120
+        assert 0 < after[cph_now][1] <= 7200
+    finally:
+        await _cleanup(r, auth)
+
+
 async def _expire_now(r, keys) -> None:
     """예약 키를 진짜 TTL 만료로 없앤다(DEL 이 아니라 만료 — 스트림이 cpm TTL 120s 를 넘긴 경우)."""
     for key in keys:

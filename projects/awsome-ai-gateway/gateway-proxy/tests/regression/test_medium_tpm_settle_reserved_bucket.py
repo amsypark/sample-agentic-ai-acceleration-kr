@@ -361,6 +361,66 @@ async def test_settle_after_the_bucket_keys_expired_creates_nothing(real_redis, 
         await _cleanup(r, case)
 
 
+_BIG = TokenUsage(input_tokens=50, output_tokens=6000, total_tokens=6050)
+
+
+@pytest.mark.parametrize("after", ["rotated", "not-rotated", "two-rotations", "expired"])
+async def test_extra_tokens_after_the_reserved_bucket_land_in_the_current_bucket(
+    real_redis, monkeypatch, after
+):
+    """실제 > 예약인데 정산 때 예약한 버킷 B 가 이미 지났다 → 추가분(실제 − 예약)은 **지금** 버킷의
+    cur 에 간다. 예약분은 B 에 남아 회전 규칙대로 prev 로 가거나 사라진다. 세 스코프 모두.
+
+    * rotated: 다른 요청 X 가 B+1 에 예약해 회전시켰다 → cur = X 의 예약 + 추가분, prev = A 의 예약.
+    * not-rotated: B 뒤로 검사가 없었다 → 정산이 check 와 같은 회전을 한다 → prev = A 의 예약,
+      cur = 추가분, window = B+1.
+    * two-rotations: X 가 B+2 에 예약 → cur = X 의 예약 + 추가분, prev = 0.
+    * expired: 세 키가 만료됐고 지금은 B+3 → cur = 추가분(새로 만든다), prev = 0, window = B+3.
+
+    세 키 모두 TTL 이 있다. 예전에는 rotated 의 추가분이 prev 로 가 가중치만큼 줄었고, 나머지
+    셋에서는 아무 데도 남지 않았다. 환불은 그대로 예약한 버킷에서만 한다(위 회전 테스트).
+    """
+    import asyncio
+
+    r, case, clock = real_redis, _Case(), _Clock(monkeypatch)
+    try:
+        state_a, rejected = await _reserve(monkeypatch, r, case, max_tokens=10)
+        assert rejected is None
+        reserved_a = _reserved(state_a)
+        extra = compute_tpm_incr(_BIG) - reserved_a
+        assert extra > 0
+        b = clock.bucket
+        if after in ("rotated", "two-rotations"):
+            clock.now += 60 if after == "rotated" else 120
+            state_x, _ = await _reserve(monkeypatch, r, case, max_tokens=500)
+            reserved_x = _reserved(state_x)
+            if after == "rotated":
+                expect = {"cur": reserved_x + extra, "prev": reserved_a, "window": b + 1}
+            else:
+                expect = {"cur": reserved_x + extra, "prev": 0, "window": b + 2}
+        elif after == "not-rotated":
+            clock.now += 60
+            expect = {"cur": extra, "prev": reserved_a, "window": b + 1}
+        else:
+            for keys in case.groups.values():
+                for key in keys:
+                    await r.pexpire(key, 1)
+            await asyncio.sleep(0.05)
+            clock.now += 180
+            expect = {"cur": extra, "prev": 0, "window": b + 3}
+
+        await _finalize(r, case, state_a, _BIG)
+
+        keyspace = await _tpm_keyspace(r)
+        _assert_no_ttl_less_or_negative(keyspace)
+        for scope, v in _values(keyspace, case).items():
+            assert v == expect, (scope, v)
+        ttls = {k: keyspace[k][1] for keys in case.groups.values() for k in keys}
+        assert all(0 < t <= 180 for t in ttls.values()), ttls
+    finally:
+        await _cleanup(r, case)
+
+
 async def test_a_denial_right_after_a_rotation_leaves_no_key_without_a_ttl(
     real_redis, monkeypatch
 ):

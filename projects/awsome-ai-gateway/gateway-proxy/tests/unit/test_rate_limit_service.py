@@ -521,14 +521,15 @@ async def test_check_multi_scope_tpm_tpm_exceeded(mock_redis):
 
 
 @pytest.mark.asyncio
-async def test_settle_tpm_refund(mock_redis):
-    """예약 > 실제 사용 → 예약한 스코프마다 rate_limit_tpm_settle EVAL 한 번(차액, 예약 버킷).
-
-    파이프라인 1회. 키를 직접 만들 수 있는 INCRBY 는 쓰지 않는다.
+async def test_settle_tpm_refund(mock_redis, monkeypatch):
+    """예약 > 실제 사용 → 예약한 스코프마다 rate_limit_tpm_settle EVAL 한 번(차액, 예약 버킷,
+    지금 버킷). 파이프라인 1회. 키를 직접 만들 수 있는 INCRBY 는 쓰지 않는다.
     """
+    from app.services import rate_limit_service as rls
     from app.services.lua_loader import LuaScriptLoader
     from app.services.rate_limit_scope import build_tpm_key_group
 
+    monkeypatch.setattr(rls, "time", SimpleNamespace(time=lambda: 29_000_000 * 60 + 5.0))
     LuaScriptLoader._scripts["rate_limit_tpm_settle"] = "-- mock"
     descriptors = build_scope_descriptors(
         user_id="u1",
@@ -555,7 +556,7 @@ async def test_settle_tpm_refund(mock_redis):
     assert pipe.incrby.call_count == 0
     assert [c.args[2:] for c in pipe.eval.call_args_list] == [
         (cur, prev, win, cur.replace(":tpm:cur", ":tpm-settled:rid-1"), "-1500", "29000000",
-         "180", "120")
+         "180", "120", "29000000")
         for cur, prev, win, _b in keys
     ]
     pipe.execute.assert_awaited_once()
@@ -758,10 +759,13 @@ _TEAM_KEYS = ("rl:cost:team:{t1}:cpm:120", "rl:cost:team:{t1}:cph:0")
 
 
 @pytest.mark.asyncio
-async def test_settle_cost_evals_each_reserved_scope_once(mock_redis):
-    """정산 = 예약한 스코프마다 cost_settle_scope EVAL 한 번(두 키, 차액). 파이프라인 1회."""
+async def test_settle_cost_evals_each_reserved_scope_once(mock_redis, monkeypatch):
+    """정산 = 예약한 스코프마다 cost_settle_scope EVAL 한 번(예약한 두 키, 표지, 지금 창의 두 키,
+    차액). 파이프라인 1회. 지금이 예약한 창 안이면 지금 창의 키는 예약한 키와 같다."""
+    from app.services import rate_limit_service as rls
     from app.services.lua_loader import LuaScriptLoader
 
+    monkeypatch.setattr(rls, "time", SimpleNamespace(time=lambda: 150.0))  # cpm 120 · cph 0 창
     LuaScriptLoader._scripts["cost_settle_scope"] = "-- mock"
     svc = RateLimitService()
     await svc.settle_cost(
@@ -776,8 +780,10 @@ async def test_settle_cost_evals_each_reserved_scope_once(mock_redis):
     pipe = mock_redis.pipeline.return_value
     calls = [c.args for c in pipe.eval.call_args_list]
     assert calls == [
-        ("-- mock", 3, *_USER_KEYS, "rl:cost-settled:user:{u1}:rid-1", "-0.007", "120"),
-        ("-- mock", 3, *_TEAM_KEYS, "rl:cost-settled:team:{t1}:rid-1", "-0.007", "120"),
+        ("-- mock", 5, *_USER_KEYS, "rl:cost-settled:user:{u1}:rid-1", *_USER_KEYS, "-0.007",
+         "120"),
+        ("-- mock", 5, *_TEAM_KEYS, "rl:cost-settled:team:{t1}:rid-1", *_TEAM_KEYS, "-0.007",
+         "120"),
     ]
     pipe.incrbyfloat.assert_not_called()  # 키를 직접 만들 수 있는 INCRBYFLOAT 는 쓰지 않는다
     pipe.execute.assert_awaited_once()
@@ -1008,8 +1014,8 @@ async def test_a_later_scope_denial_releases_the_earlier_reservations(mock_redis
     assert not r.allowed and r.reserved_cost == Decimal("0")
     released = [c.args for c in mock_redis.pipeline.return_value.eval.call_args_list]
     assert len(released) == 1
-    script, numkeys, cpm_key, cph_key, marker, adj, _marker_ttl = released[0]
-    assert (script, numkeys, adj) == ("-- cost_settle_scope", 3, "-0.5")
+    script, numkeys, cpm_key, cph_key, marker, _cpm_now, _cph_now, adj, _ttl = released[0]
+    assert (script, numkeys, adj) == ("-- cost_settle_scope", 5, "-0.5")
     assert marker.startswith("rl:cost-settled:user:{u1}:")
     assert cpm_key.startswith("rl:cost:user:{u1}:cpm:")
     assert cph_key.startswith("rl:cost:user:{u1}:cph:")

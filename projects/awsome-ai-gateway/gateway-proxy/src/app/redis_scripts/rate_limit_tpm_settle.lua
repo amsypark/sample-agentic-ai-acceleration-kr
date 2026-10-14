@@ -17,6 +17,7 @@
 -- ARGV[2] = 예약한 버킷 번호 (floor(now / window_sec), 예약 시각)
 -- ARGV[3] = TTL (rate_limit_tpm_check.lua 의 window_sec * 2 + 60)
 -- ARGV[4] = 표지 TTL (초)
+-- ARGV[5] = 지금 버킷 번호 (floor(now / window_sec), 정산 시각)
 --
 -- 한 예약은 **한 번만** 정산된다 — 표지를 SET NX 로 먼저 세우고, 이미 있으면 아무것도 쓰지 않는다
 -- (cost_settle_scope.lua 와 같다: 응답을 못 받은 명령의 재시도, 정산 상태 사본으로 다시 부른 경우).
@@ -30,6 +31,13 @@
 -- 이 수정 이전 코드가 남긴 키). 결과가 음수면 0 으로 둔다(TTL 유지): 버킷의 토큰 합은 음수일 수 없고,
 -- 음수는 그 분 동안 남의 한도를 빌려 준다.
 --
+-- 단, 추가분(adjustment > 0 — 예약보다 더 쓴 토큰)이고 예약한 버킷이 지금 버킷이 아니면 위 규칙 대신
+-- **지금 버킷(cur)** 에 더한다. 그 토큰은 응답이 끝난 지금 쓴 것이고, prev 에 더하면 가중치만큼 줄어
+-- 들며 두 번 이상 회전했으면 아무 데도 남지 않는다. cur 가 아직 지난 버킷이면(그 뒤 검사가 없었다)
+-- rate_limit_tpm_check.lua 와 똑같이 회전부터 한다(window 마커가 지금보다 앞일 때만 — 다른 파드의
+-- 시계가 앞서 이미 회전한 경우는 그대로 둔다). 키가 없으면 만들고 세 키 모두 TTL 을 건다. 환불은
+-- 예약한 그 버킷에서만 한다(위 규칙).
+--
 -- Returns: {applied, clamped, duplicate}
 --   applied 1 = 조정함, 0 = 예약한 버킷이 없어 건너뜀. clamped 1 = 음수가 될 뻔해 0 으로 뒀다(호출자가
 --   로그·카운트한다). duplicate 1 = 이미 정산된 예약이라 아무것도 하지 않았다.
@@ -41,7 +49,28 @@ end
 local adj = tonumber(ARGV[1])
 local bucket = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
+local current = tonumber(ARGV[5])
 local marker = tonumber(redis.call('GET', KEYS[3]) or '-1')
+
+if adj > 0 and current and bucket ~= current then
+    if marker < current then
+        local cur_val = tonumber(redis.call('GET', KEYS[1]) or '0')
+        if marker == current - 1 then
+            redis.call('SET', KEYS[2], cur_val)
+        else
+            redis.call('SET', KEYS[2], 0)
+        end
+        redis.call('SET', KEYS[1], 0)
+        redis.call('SET', KEYS[3], current)
+        redis.call('EXPIRE', KEYS[2], ttl)
+        redis.call('EXPIRE', KEYS[3], ttl)
+    end
+    redis.call('INCRBY', KEYS[1], adj)
+    if redis.call('TTL', KEYS[1]) < 0 then
+        redis.call('EXPIRE', KEYS[1], ttl)
+    end
+    return {1, 0, 0}
+end
 
 local target
 if marker == bucket then
