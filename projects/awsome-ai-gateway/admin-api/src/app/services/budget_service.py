@@ -1092,7 +1092,10 @@ class BudgetService:
         #    예산 검증은 일부러 하지 않는다 — 저장해 둔 alias 가 나중에 무효가 됐거나 예산 행이
         #    지워졌어도 기능을 **끌 수는** 있어야 한다.
         if not data.enabled:
-            deactivated = await DowngradePolicyRepository(session).delete_rules(scope, scope_id)
+            rule_repo = DowngradePolicyRepository(session)
+            # 끈 뒤에는 활성 규칙이 DB 에 남지 않는다 — 무엇을 껐는지는 감사 기록(before)에만 남는다.
+            removed_rules = await rule_repo.get_rules(scope, scope_id)
+            deactivated = await rule_repo.delete_rules(scope, scope_id)
             cache_key = f"budget:downgrade:{scope.value.lower()}:{scope_id}"
             await self._cache_mgr.invalidate([cache_key], session=session)
             await audit_logger.log(
@@ -1103,7 +1106,19 @@ class BudgetService:
                 resource_type="DowngradePolicy",
                 resource_id=str(scope_id),
                 # 요청 echo 가 아니라 **실제로 남긴 상태**를 기록한다.
-                changes={"after": {"enabled": False, "rules": [], "deactivated": deactivated}},
+                changes={
+                    "before": {
+                        "rules": [
+                            {
+                                "from_model_alias": r.from_model_alias,
+                                "to_model_alias": r.to_model_alias,
+                                "threshold_pct": r.threshold_pct,
+                            }
+                            for r in removed_rules
+                        ]
+                    },
+                    "after": {"enabled": False, "rules": [], "deactivated": deactivated},
+                },
                 ip_address=ip_address,
                 request_id=request_id,
             )

@@ -529,9 +529,16 @@ async def test_delete_override_restores_inheritance_and_reset_still_works(sessio
     actor = CurrentUser(user_id=SEED_ADMIN_ID, email="admin@example.com", role=UserRole.ADMIN, team_id=None)
     svc = _rl_service()
 
-    out = await svc.delete_user_rate_limit(session, user_id=U_A, actor=actor)
+    from unittest.mock import AsyncMock, patch
+
+    with patch("app.services.rate_limit_service.audit_logger.log", new=AsyncMock()) as audit:
+        out = await svc.delete_user_rate_limit(session, user_id=U_A, actor=actor)
     await session.commit()
     assert out.deactivated == 1
+    # 감사 기록이 지운 값(시드의 rpm=60 개인 한도)을 실제 행에서 읽어 남긴다.
+    assert audit.await_args.kwargs["changes"]["before"] == {
+        "model_alias": None, "rpm": 60, "tpm": None, "cpm": None, "cph": None,
+    }
     assert await _active_rows(session, "USER", U_A) == []
     node = _find(await _tree(session), str(U_A))
     assert node.inherited_from == str(SEED_TEAM_ID), "제거 후 팀 상속으로 돌아오지 않았다"
@@ -869,16 +876,21 @@ async def test_downgrade_enabled_false_really_turns_it_off(session):
     assert on.enabled is True and await active_rules() == 1
 
     # 콘솔은 체크를 끈 상태에서도 규칙과 함께 PUT 한다(AutoDowngradeConfig.handleSave).
-    off = await svc.set_downgrade_config(
-        session,
-        scope=BudgetScope.TEAM,
-        scope_id=SEED_TEAM_ID,
-        data=AutoDowngradeConfigRequest(enabled=False, rules=rules),
-        actor=actor,
-    )
+    from unittest.mock import patch
+
+    with patch("app.services.budget_service.audit_logger.log", new=AsyncMock()) as audit:
+        off = await svc.set_downgrade_config(
+            session,
+            scope=BudgetScope.TEAM,
+            scope_id=SEED_TEAM_ID,
+            data=AutoDowngradeConfigRequest(enabled=False, rules=rules),
+            actor=actor,
+        )
     await session.commit()
     assert off.enabled is False
     assert await active_rules() == 0, "끄기 저장 후에도 활성 규칙이 남아 gateway-proxy 가 계속 바꿔치기한다"
+    # 끈 규칙은 DB 에 활성으로 남지 않는다 — 감사 기록(before)이 무엇을 껐는지 담는다.
+    assert audit.await_args.kwargs["changes"]["before"] == {"rules": rules}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

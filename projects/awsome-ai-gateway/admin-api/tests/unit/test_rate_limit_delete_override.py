@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.core.auth import CurrentUser
@@ -25,10 +26,11 @@ from app.services.rate_limit_service import RateLimitService
 USER_ID = uuid.UUID("33333333-3333-4333-8333-333333333333")
 
 
-async def delete_override(svc, session, actor, *, deactivated: int = 1):
+async def delete_override(svc, session, actor, *, deactivated: int = 1, before=None):
     with patch("app.services.rate_limit_service.RateLimitConfigRepository") as MockRepo, patch(
         "app.services.rate_limit_service.audit_logger"
     ) as mock_audit:
+        MockRepo.return_value.get_active = AsyncMock(return_value=before)
         MockRepo.return_value.deactivate_configs = AsyncMock(return_value=deactivated)
         mock_audit.log = AsyncMock()
         result = await svc.delete_user_rate_limit(
@@ -78,17 +80,33 @@ class TestDeleteUserOverride:
         )
         assert match_arg == f"rl:config:USER:{USER_ID}:*"
 
-    async def test_is_audited(
+    async def test_is_audited_with_the_values_it_removed(
         self, mock_session: AsyncMock, admin_user: CurrentUser, mock_redis: AsyncMock
     ):
+        """감사 기록이 ``deactivated: 1`` 만 남기면 무엇이 지워졌는지 복원할 수 없다 — 지운 값을 남긴다."""
         svc = RateLimitService(cache_mgr=CacheInvalidationManager(mock_redis))
-        _, _, audit_log = await delete_override(svc, mock_session, admin_user)
+        row = MagicMock(
+            model_alias=None, rpm_limit=60, tpm_limit=1000,
+            cpm_limit_usd=Decimal("0.5000"), cph_limit_usd=None,
+        )
+        _, _, audit_log = await delete_override(svc, mock_session, admin_user, before=row)
 
         audit_log.assert_awaited_once()
         kwargs = audit_log.await_args.kwargs
         assert kwargs["action"] == "DELETE_RATE_LIMIT"
         assert kwargs["resource_id"] == str(USER_ID)
         assert kwargs["changes"]["after"]["deactivated"] == 1
+        assert kwargs["changes"]["before"] == {
+            "model_alias": None, "rpm": 60, "tpm": 1000, "cpm": "0.5000", "cph": None,
+        }
+
+    async def test_audit_before_is_null_when_there_was_nothing_to_remove(
+        self, mock_session: AsyncMock, admin_user: CurrentUser, mock_redis: AsyncMock
+    ):
+        """대조군 — 멱등 호출(지울 행 없음)은 before 가 null 이다."""
+        svc = RateLimitService(cache_mgr=CacheInvalidationManager(mock_redis))
+        _, _, audit_log = await delete_override(svc, mock_session, admin_user, deactivated=0)
+        assert audit_log.await_args.kwargs["changes"]["before"] is None
 
     async def test_no_existing_override_is_not_an_error(
         self, mock_session: AsyncMock, admin_user: CurrentUser, mock_redis: AsyncMock

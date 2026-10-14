@@ -47,6 +47,7 @@ async def test_delete_route_returns_the_delete_envelope(
     with patch("app.services.rate_limit_service.RateLimitConfigRepository") as MockRepo, patch(
         "app.services.rate_limit_service.audit_logger"
     ) as mock_audit:
+        MockRepo.return_value.get_active = AsyncMock(return_value=None)
         MockRepo.return_value.deactivate_configs = AsyncMock(return_value=1)
         mock_audit.log = AsyncMock()
         resp = await client.delete(f"/admin/rate-limits/user/{USER_ID}", headers=admin_headers)

@@ -40,6 +40,10 @@ async def _set(enabled: bool):
     with patch("app.services.budget_service.DowngradePolicyRepository") as Rules, patch(
         "app.services.budget_service.audit_logger"
     ) as audit, patch.object(svc, "get_downgrade_config", AsyncMock(return_value=off)):
+        Rules.return_value.get_rules = AsyncMock(return_value=[
+            MagicMock(from_model_alias="claude-opus-4-7", to_model_alias="claude-sonnet-4-6", threshold_pct=80),
+            MagicMock(from_model_alias="claude-sonnet-4-6", to_model_alias="claude-haiku-4-5", threshold_pct=95),
+        ])
         Rules.return_value.delete_rules = AsyncMock(return_value=2)
         Rules.return_value.set_rules = AsyncMock()
         audit.log = AsyncMock()
@@ -65,6 +69,16 @@ async def test_disable_deactivates_the_rules_instead_of_rewriting_them_active():
     assert cache.invalidate.await_args.args[0] == [f"budget:downgrade:team:{TEAM_ID}"]
     after = audit_log.await_args.kwargs["changes"]["after"]
     assert after == {"enabled": False, "rules": [], "deactivated": 2}, "감사 기록이 DB 와 다른 상태를 주장한다"
+
+
+async def test_disable_audits_the_rules_it_removed():
+    """끈 뒤에는 규칙이 DB 에 활성으로 남지 않는다 — 감사 기록이 무엇을 껐는지 담아야 되돌릴 수 있다."""
+    _, _, audit_log, _ = await _set(enabled=False)
+    before = audit_log.await_args.kwargs["changes"]["before"]
+    assert before == {"rules": [
+        {"from_model_alias": "claude-opus-4-7", "to_model_alias": "claude-sonnet-4-6", "threshold_pct": 80},
+        {"from_model_alias": "claude-sonnet-4-6", "to_model_alias": "claude-haiku-4-5", "threshold_pct": 95},
+    ]}
 
 
 async def test_disable_works_even_when_saved_aliases_went_invalid():

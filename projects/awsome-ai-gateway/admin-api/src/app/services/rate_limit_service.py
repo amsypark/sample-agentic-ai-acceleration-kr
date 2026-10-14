@@ -448,6 +448,9 @@ class RateLimitService:
         멱등이다: 원래 없었으면 deactivated=0.
         """
         repo = RateLimitConfigRepository(session)
+        # 지우기 전 값을 감사 기록에 남긴다 — ``deactivated: 1`` 만으로는 무엇이 사라졌는지 복원할 수 없다.
+        # (scope, scope_id) 의 활성 행은 0024 유니크 인덱스로 최대 1개다.
+        before = await repo.get_active(RateLimitScope.USER, user_id)
         removed = await repo.deactivate_configs(RateLimitScope.USER, user_id)
 
         # _set_rate_limit 이 심는 스냅샷 키와 gateway-proxy 정책 캐시를 함께 지운다 — 남겨 두면
@@ -466,7 +469,18 @@ class RateLimitService:
             action="DELETE_RATE_LIMIT",
             resource_type="RateLimitConfig",
             resource_id=str(user_id),
-            changes={"after": {"scope": RateLimitScope.USER.value, "deactivated": removed}},
+            changes={
+                "before": None
+                if before is None
+                else {
+                    "model_alias": before.model_alias,
+                    "rpm": before.rpm_limit,
+                    "tpm": before.tpm_limit,
+                    "cpm": str(before.cpm_limit_usd) if before.cpm_limit_usd is not None else None,
+                    "cph": str(before.cph_limit_usd) if before.cph_limit_usd is not None else None,
+                },
+                "after": {"scope": RateLimitScope.USER.value, "deactivated": removed},
+            },
             ip_address=ip_address,
             request_id=request_id,
         )
