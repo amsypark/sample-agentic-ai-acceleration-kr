@@ -94,6 +94,32 @@ variable "claude_code_374_role_arn" {
   default     = ""
 }
 
+variable "bedrock_account_assume_role_arns" {
+  description = <<-EOT
+    alias 별 대상 AWS 계정(마이그레이션 0043/0044)용으로 gateway-proxy 가 sts:AssumeRole 할 수
+    있는 역할 ARN 목록 — 관리 콘솔의 AWS 계정 레지스트리(/admin/aws-accounts)에 등록하는 역할.
+    여기 없는 역할을 alias 에 고르면 그 alias 의 호출이 AssumeRole AccessDenied 로 실패한다
+    (게이트웨이는 고정 500 으로 답하고 다른 계정으로 대신 호출하지 않는다).
+    빈 목록(기본) = statement 를 렌더하지 않는다.
+
+    ⚠️ 와일드카드("*")를 넣지 말 것. 그러면 게이트웨이 역할이 자신을 신뢰하는 임의의 계정 역할로
+    전환할 수 있게 되고, 콘솔에 ARN 한 줄을 넣을 수 있는 사람이 곧 그 모든 계정에서 Bedrock 을
+    호출할 수 있다. 대상 계정 쪽 신뢰 정책이 2차 방어선이지만 이 모듈이 관리하지 않는다.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    # 역할 ARN 만. Bedrock ARN·사용자 ARN 도 apply 는 되지만 AssumeRole 이 불가능하고, 그
+    # 사실은 그 alias 를 처음 호출할 때까지 드러나지 않는다.
+    condition = alltrue([
+      for a in var.bedrock_account_assume_role_arns :
+      can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$", a))
+    ])
+    error_message = "각 항목은 IAM 역할 ARN 이어야 합니다: arn:aws:iam::<12자리 계정>:role/<이름> (와일드카드 불가)."
+  }
+}
+
 variable "bedrock_invocation_log_group_arn" {
   description = <<-EOT
     Bedrock model-invocation log group ARN — admin-api 의 감사 대조

@@ -133,6 +133,40 @@ data "aws_iam_policy_document" "bedrock" {
   }
 
   # --------------------------------------------------------------------------
+  # alias 별 대상 AWS 계정 (마이그레이션 0043/0044) — 모델 alias 단위의 계정 간 Bedrock 호출.
+  #
+  # Bedrock 호출의 계정은 **서명한 자격증명**으로 정해진다: bedrock-runtime.<region> 은 리전
+  # 공용 호스트이고, SigV4 scope(<key>/<date>/<region>/bedrock)에도 foundation-model ARN(계정
+  # 칸이 비어 있다)에도 계정이 없다. 그래서 다른 계정의 호출에 필요한 권한은 그 계정 역할에 대한
+  # sts:AssumeRole 하나다. 세 경로(Bedrock native, Mantle, bedrock-runtime OpenAI)가 모두 이
+  # 권한으로 alias 계정의 자격증명을 받는다(services/bedrock_account_client.py 가 단일 캐시).
+  #
+  # 위 두 statement(cowork / claude-code 의 앱 단위 계정)와 별개다 — 그 둘은 routing_profiles
+  # 의 역할이고, 이것은 관리 콘솔의 AWS 계정 레지스트리에 등록되는 역할이다. 같은 역할이면 한
+  # 곳에만 있어도 된다(IAM 은 Allow 의 합집합).
+  #
+  # 대상 계정 쪽에도 두 가지가 필요하다(이 모듈 밖):
+  #   1) 그 역할의 신뢰 정책이 이 gateway-proxy IRSA 역할을 Principal 로 허용
+  #      (ExternalId 를 요구하면 레지스트리 항목의 External ID 에 같은 값을 넣는다)
+  #   2) 그 역할에 bedrock:InvokeModel / InvokeModelWithResponseStream / CountTokens(게이트웨이의
+  #      count_tokens 도 alias 계정으로 간다) + 해당 모델의 모델 액세스. 쿼터·청구·승인이 모두
+  #      그 계정 기준이다(docs/guides/multi-account-bedrock-setup.md).
+  #   RoleSessionName: native = gw-bedrock-xacct, runtime = gw-bedrock-openai, Mantle = gw-mantle.
+  #
+  # 빈 목록(기본) = statement 가 정책 문서에 아예 나타나지 않는다. `resources = []` 로 렌더되면
+  # MalformedPolicyDocument 로 apply 가 깨지므로 조건을 빼면 안 된다.
+  # --------------------------------------------------------------------------
+  dynamic "statement" {
+    for_each = length(var.bedrock_account_assume_role_arns) > 0 ? [1] : []
+    content {
+      sid       = "AssumeTargetBedrockAccounts"
+      effect    = "Allow"
+      actions   = ["sts:AssumeRole"]
+      resources = var.bedrock_account_assume_role_arns
+    }
+  }
+
+  # --------------------------------------------------------------------------
   # 요청/응답 **본문** 로깅 sink 쓰기 (modules/body-logging).
   #
   # ⚠️ 쓰기 전용이다. Get/List/Delete 를 넣지 않는다 — 게이트웨이는 자기가 넣은 본문을
