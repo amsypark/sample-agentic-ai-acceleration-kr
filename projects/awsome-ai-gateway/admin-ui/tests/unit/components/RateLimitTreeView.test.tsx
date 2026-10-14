@@ -111,6 +111,59 @@ describe('RateLimitTreeView', () => {
     expect(screen.getByText(`${own.config?.rpm}rpm`)).toBeInTheDocument();
   });
 
+  it('개인 한도를 제거해 서버가 새 트리를 내리면 패널이 새 노드를 보여준다', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(<RateLimitTreeView nodes={nodes} />);
+    await user.click(screen.getByText(teamNode.label));
+    const own = teamNode.children.find((c) => !c.inherited_from)!;
+    await user.click(screen.getByText(own.label));
+
+    expect(screen.getByRole('button', { name: 'removeOverride' })).toBeInTheDocument();
+    expect(screen.getByLabelText('RPM (Requests Per Minute)')).toHaveValue(own.config!.rpm);
+
+    // DELETE 후 revalidate — 같은 사용자가 이제 팀 한도를 상속한다(새 배열·새 객체).
+    const fresh = nodes.map((n) =>
+      n.id !== teamNode.id
+        ? n
+        : {
+            ...n,
+            children: n.children.map((c) =>
+              c.id === own.id ? { ...c, config: teamNode.config, inherited_from: teamNode.id } : c,
+            ),
+          },
+    );
+    rerender(<RateLimitTreeView nodes={fresh} />);
+
+    expect(screen.queryByRole('button', { name: 'removeOverride' })).toBeNull();
+    expect(screen.getByText(teamNode.id)).toBeInTheDocument(); // 상속 안내
+    // 지운 값이 입력칸에 남아 있으면 '저장' 한 번에 같은 오버라이드가 되살아난다.
+    expect(screen.getByLabelText('RPM (Requests Per Minute)')).toHaveValue(null);
+  });
+
+  it('새 트리에서 선택한 노드가 사라지면 패널이 비워진다', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(<RateLimitTreeView nodes={nodes} />);
+    await user.click(screen.getByText(teamlessNode.label));
+    expect(screen.getByLabelText('RPM (Requests Per Minute)')).toBeInTheDocument();
+
+    rerender(<RateLimitTreeView nodes={nodes.filter((n) => n.id !== teamlessNode.id)} />);
+
+    expect(screen.queryByLabelText('RPM (Requests Per Minute)')).toBeNull();
+    expect(screen.getByText('selectNodePrompt')).toBeInTheDocument();
+  });
+
+  it('트리가 그대로면 다시 그려도 입력 중인 값을 지우지 않는다 (대조군)', async () => {
+    // 매 렌더 노드를 새로 만드는 식으로 고치면 패널 effect 가 매번 돌아 타이핑이 지워진다.
+    const user = userEvent.setup();
+    const { rerender } = render(<RateLimitTreeView nodes={nodes} />);
+    await user.click(screen.getByText(teamlessNode.label));
+    await user.type(screen.getByLabelText('RPM (Requests Per Minute)'), '77');
+
+    rerender(<RateLimitTreeView nodes={nodes} />);
+
+    expect(screen.getByLabelText('RPM (Requests Per Minute)')).toHaveValue(77);
+  });
+
   it('팀 미배정 사용자를 선택하면 USER 스코프 패널이 열린다', async () => {
     const user = userEvent.setup();
     render(<RateLimitTreeView nodes={nodes} />);
