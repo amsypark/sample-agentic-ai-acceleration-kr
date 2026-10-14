@@ -187,7 +187,7 @@ client=claude-code → routing_profiles row (backend=invoke, account_role_arn=37
   → invoke_model / invoke-with-response-stream, model id 는 profile.region(ap-ne-2)으로 rewrite
 ```
 
-**859 투명 폴백:** `BedrockAdapter._get_client` 는 `client_resolver`(374 assume+build)가 예외를 던지면 in-account 859 `fallback_client` 로 폴백한다 → **claude-code 는 절대 안 죽는다**(라이브 실증: 374 AccessDenied → 859 200). STS 클라이언트는 `mantle_assume_region`(기본 ap-northeast-2)에서 생성되며 creds 는 account-global 이라 재사용된다. cross-account 클라이언트 BotoConfig 는 in-account 와 동일(`max_pool_connections=50`, `read_timeout=stream_timeout(300s)`, `retries.total_max_attempts=bedrock_max_attempts`).
+**859 투명 폴백:** `BedrockAdapter._get_client` 는 `client_resolver`(374 assume+build)가 예외를 던지면 in-account 859 `fallback_client` 로 폴백한다 → **claude-code 는 절대 안 죽는다**(라이브 실증: 374 AccessDenied → 859 200). STS 클라이언트는 `mantle_assume_region`(기본 ap-northeast-2)에서 생성되며 creds 는 account-global 이라 재사용된다. STS 클라이언트 자신은 connect 3s · read 5s · standard 재시도 총 3회(`bedrock_account_client.STS_BOTO_CONFIG`)라, 응답 없는 STS 에서도 AssumeRole 한 번이 최대 약 27초다(botocore 기본값이면 약 315초). 이 경로(와 runtime·Mantle 의 프로필 경로)는 AssumeRole 실패를 (역할, ExternalId, 세션 이름)마다 5초 기억해(`PROFILE_FAILURE_BACKOFF`) 그 동안 STS 없이 곧바로 859 로 폴백하고, 줄 선 요청이 각자 STS 를 다시 기다리지 않는다. cross-account 클라이언트 BotoConfig 는 in-account 와 동일(`max_pool_connections=50`, `read_timeout=stream_timeout(300s)`, `retries.total_max_attempts=bedrock_max_attempts`).
 
 **즉시 롤백은 무배포:** `0022 downgrade` 가 claude-code 의 `account_role_arn`/`external_id` 를 NULL 로 되돌리면(코드가 `account_role_arn` NULL 이면 in-account adapter 사용), 다음 요청부터 859 in-account 로 복귀한다. 적용 후 Redis `routing_profile:claude-code` 캐시 키(TTL 5분)를 플러시하면 즉시 반영된다.
 
