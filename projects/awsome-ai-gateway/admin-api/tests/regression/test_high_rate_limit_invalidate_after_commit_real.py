@@ -296,3 +296,50 @@ async def test_a_new_limit_applies_even_if_a_request_lands_in_the_commit_window(
         )
     assert in_window["rpm"] is None, "전제: 커밋 전 창에는 아직 팀 행이 없다"
     assert (await _gateway_load(engine, redis_client, "TEAM", team, ALIAS_A))["rpm"] == 11
+
+
+async def test_failed_pattern_invalidation_is_retried_as_a_pattern(engine, redis_client):
+    """패턴 무효화가 Redis 장애로 실패하면 ``pattern:<glob>`` 행이 실제 테이블에 남는다. 재시도
+    (``POST /internal/cache/retry`` → ``retry_failed``)는 그 패턴을 다시 SCAN+DEL 해야 한다 — 예전엔
+    리터럴 'pattern:…' 키를 DEL 하고 resolved 로 표시해, 옛 정책 캐시가 TTL 까지 남았다."""
+    import redis.asyncio as redis_asyncio
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.core.cache_invalidation import CacheInvalidationManager
+
+    uid = str(uuid.uuid4())
+    stale = [f"rl:config:USER:{uid}:{alias}" for alias in (ALIAS_A, ALIAS_B)]
+    for key in stale:
+        await redis_client.set(key, json.dumps({"rpm": 3}), ex=TTL)
+    bystander = f"rl:config:USER:{uuid.uuid4()}:{ALIAS_A}"
+    await redis_client.set(bystander, json.dumps({"rpm": 9}), ex=TTL)
+
+    # 1) Redis 장애 — 연결이 거부되는 주소. 실패가 실 PG 테이블에 기록된다.
+    dead = redis_asyncio.from_url("redis://127.0.0.1:1/0")
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as s:
+            await CacheInvalidationManager(dead).invalidate_pattern(f"rl:config:USER:{uid}:*", session=s)
+            await s.commit()
+    finally:
+        await dead.aclose()
+    pattern_key = f"pattern:rl:config:USER:{uid}:*"
+    async with engine.connect() as conn:
+        row = (await conn.execute(text(
+            "SELECT resolved_at FROM audit.cache_invalidation_failures WHERE cache_key = :k"
+        ), {"k": pattern_key})).one()
+    assert row.resolved_at is None
+    assert all([await redis_client.get(k) for k in stale]), "전제: 장애 동안 옛 캐시는 남아 있다"
+
+    # 2) Redis 복구 후 재시도 — 패턴으로 다시 지운다.
+    async with AsyncSession(engine, expire_on_commit=False) as s:
+        resolved = await CacheInvalidationManager(redis_client).retry_failed(s)
+        await s.commit()
+    assert resolved == 1
+    assert [await redis_client.get(k) for k in stale] == [None, None], "재시도가 패턴 키를 지우지 않았다"
+    assert await redis_client.get(bystander) is not None  # 대조군 — 패턴 밖의 키는 그대로다
+    async with engine.connect() as conn:
+        resolved_at = (await conn.execute(text(
+            "SELECT resolved_at FROM audit.cache_invalidation_failures WHERE cache_key = :k"
+        ), {"k": pattern_key})).scalar_one()
+    assert resolved_at is not None
