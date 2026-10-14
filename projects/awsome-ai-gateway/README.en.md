@@ -65,6 +65,7 @@ annotated as such in the chart).
 
 | Family | Alias | Backend entrypoint | Registered by |
 |--------|-------|--------------------|---------------|
+| Claude Fable | `claude-fable-5`, `claude-fable-5-1` | `global.anthropic.claude-fable-5{,-1}` | migration `0042` |
 | Claude 5.5 | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | `global.anthropic.claude-{opus,sonnet,haiku}-5-5` | migration `0041` |
 | Claude 5 | `claude-opus-5`, `claude-sonnet-5` | `global.anthropic.claude-{opus,sonnet}-5` | migration `0027` |
 | Claude 4.x | `claude-opus-4-*`, `claude-sonnet-4-*`, `claude-haiku-4-5` | `global.anthropic.claude-*` | baseline–`0004` |
@@ -75,7 +76,11 @@ annotated as such in the chart).
 
 - Migration `0028` switches the codex default from `codex-gpt` (5.5) to **`codex-gpt-5.6-terra`**.
   Flush the `routing_profile:codex` Redis key (or wait out the 300s TTL) for it to take effect.
-- **Fable 5 is deliberately not registered** — no inference profile in ap-northeast-2.
+- **Fable 5 / 5.1 need an account setting before they can be called.** The Bedrock data retention mode
+  must be `aws_review` in the request Region of the account that executes the request
+  (`PUT https://bedrock.<region>.amazonaws.com/data-retention`); otherwise every call is a 400. With it on,
+  Fable traffic is retained for up to 30 days and may be reviewed by AWS (other models are unaffected).
+  Cross-account clients need it in that account too — see the migration `0042` docstring.
 - The OpenAI-compatible bedrock-runtime endpoint (`gpt-5.6-*`, `gpt-6*`) also needs IAM to allow the
   `project/default` resource; without it every call is a 401 even when the model ARNs are allowed
   (see the `bedrock_allowed_model_arns` comment).

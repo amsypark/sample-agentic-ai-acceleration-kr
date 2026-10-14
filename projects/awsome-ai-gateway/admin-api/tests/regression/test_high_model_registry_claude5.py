@@ -191,7 +191,7 @@ def test_fable5_is_not_registered():
     aliases = [m[0] for m in _module_constants(_M0027)["MODELS"]]
     profiles = [m[1] for m in _module_constants(_M0027)["MODELS"]]
     assert not any("fable" in x for x in aliases + profiles), (
-        "fable-5 는 ap-northeast-2 에서 호출되지 않는다 — 리전 정책 해소 후 별도 마이그레이션"
+        "0027 은 Fable 을 넣지 않는다 — Fable 은 데이터 보존 모드 요구사항과 함께 0042 가 등록한다"
     )
 
 
@@ -379,7 +379,11 @@ async def test_live_registry_state_after_migrations():
                     text("SELECT count(*) FROM model.model_aliases WHERE alias LIKE '%fable%'")
                 )
             ).scalar()
-            assert fable == 0, "fable-5 가 등록돼 있다 — ap-northeast-2 에서 전부 실패한다"
+            # 0042 가 Fable 을 등록한다(데이터 보존 모드 aws_review 요구 — 그 리비전 docstring).
+            # 그 전 리비전의 DB 에는 여전히 없어야 한다. 0042 이후의 상태는
+            # test_high_model_registry_0042 가 본다.
+            if head < "0042":
+                assert fable == 0, "0042 이전인데 fable 이 등록돼 있다"
 
             # 모든 alias 는 단가가 있어야 한다. 없으면 cost_usd 가 0 으로 기록돼
             # 예산·ROI 가 조용히 틀어진다.
