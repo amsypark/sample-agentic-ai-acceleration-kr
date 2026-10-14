@@ -14,8 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.audit import audit_logger
 from app.core.auth import CurrentUser
 from app.core.cache_invalidation import CacheInvalidationManager
-from app.core.exceptions import ConflictError, NotFoundError
-from app.models.model import ApiFormat, ModelAlias, ModelPricing, ModelStatus, Provider
+from app.core.exceptions import ConflictError, NotFoundError, ValidationError
+from app.models.model import ApiFormat, AwsAccount, ModelAlias, ModelPricing, ModelStatus, Provider
 from app.repositories.model_repository import ModelRepository
 from app.schemas.models import (
     AwsPriceChange,
@@ -38,6 +38,41 @@ from app.services.aws_price_list import (
 )
 
 logger = structlog.get_logger()
+
+
+async def _refresh_account_copy(session: AsyncSession, model: ModelAlias) -> None:
+    """flush 한 뒤 트리거가 유지하는 계정 사본(0044)을 ``model`` 로 다시 읽는다.
+
+    BEFORE 트리거는 DB 안에서 account_role_arn / account_external_id 를 쓴다. ORM 인스턴스는
+    flush 전 값을 그대로 들고 있으므로, 이것이 없으면 응답(그리고 그것을 그리는 콘솔)이 실제로
+    바뀐 저장에 대해 옛 계정 — 또는 계정 없음 — 을 보여 준다.
+    """
+    await session.flush()
+    await session.refresh(model, attribute_names=["account_role_arn", "account_external_id"])
+
+
+async def _assert_account_selection(
+    session: AsyncSession, *, alias: str, provider: Provider, account_name: str | None
+) -> None:
+    """alias 의 레지스트리 선택을 **요청 후 실효값**으로 검증한다.
+
+    * 등록된 이름이어야 한다. DB 도 거부하지만(FK + 사본 트리거) IntegrityError 로 — 운영자에게는
+      이유 없는 실패로 보인다.
+    * OPENMODEL alias 에는 안 된다. AWS 가 서빙하지 않으니 선택은 저장되고 콘솔 계정 칸에 보이지만
+      **절대 쓰이지 않는다** — 운영자는 그 모델이 그 계정으로 간다고 믿게 된다.
+    """
+    if account_name is None:
+        return
+    if provider == Provider.OPENMODEL:
+        raise ValidationError(
+            f"{alias}: an AWS account cannot be set on an OPENMODEL alias — it is not served "
+            "by AWS, so there is no account to call it in."
+        )
+    if await session.get(AwsAccount, account_name) is None:
+        raise ValidationError(
+            f"{alias}: AWS account '{account_name}' is not registered "
+            "(register it under /admin/aws-accounts first)"
+        )
 
 
 class ModelService:
@@ -67,6 +102,12 @@ class ModelService:
         # BR-MOD-01: Case-insensitive alias uniqueness
         if await repo.alias_exists_ci(data.alias):
             raise ConflictError(f"Model alias already exists: {data.alias}")
+        await _assert_account_selection(
+            session,
+            alias=data.alias,
+            provider=Provider(data.provider.value),
+            account_name=data.account_name,
+        )
 
         model = ModelAlias(
             alias=data.alias,
@@ -79,9 +120,14 @@ class ModelService:
             display_name=data.display_name,
             # None = 제한 없음(하위호환 기본값), [] = 허용 앱 없음, 목록 = 그 앱만.
             allowed_clients=data.allowed_clients,
+            # 대상 AWS 계정(0044): 레지스트리 선택만 쓴다. role/ExternalId 사본은 DB 트리거가
+            # 채운다(models/model.py 의 ModelAlias.account_name 주석).
+            account_name=data.account_name,
             created_by=actor.user_id,
         )
         await repo.create_model(model)
+        # 트리거가 DB 에서 사본을 채웠다 — 응답이 게이트웨이가 실제로 쓸 계정을 보여 주게 다시 읽는다.
+        await _refresh_account_copy(session, model)
 
         # Initial pricing
         pricing = ModelPricing(
@@ -110,8 +156,12 @@ class ModelService:
         # pattern: DEL both keys and let the gateway populate model:{alias} with
         # the correct nested shape + TTL on first cache-miss (router_service
         # self-heal). Keeps admin writes and gateway reads on one cache contract.
+        # model:{provider_model_id} 도 지운다 — 게이트웨이가 모델 id 로 지목한 해석을 그 키에
+        # 캐시하므로, 같은 모델 id 의 다른 alias 가 남긴 항목이 새 alias 의 계정 판정(형제 계정
+        # 불일치 거절)보다 오래 살지 않게.
         await self._cache_mgr.invalidate(
-            [f"model:{model.alias}", "model:list"], session=session
+            [f"model:{model.alias}", f"model:{model.provider_model_id}", "model:list"],
+            session=session,
         )
 
         await audit_logger.log(
@@ -121,7 +171,11 @@ class ModelService:
             action="CREATE_MODEL",
             resource_type="ModelAlias",
             resource_id=model.alias,
-            changes={"after": {"alias": model.alias, "provider": model.provider.value}},
+            changes={"after": {
+                "alias": model.alias,
+                "provider": model.provider.value,
+                "account_name": model.account_name,
+            }},
             ip_address=ip_address,
             request_id=request_id,
         )
@@ -140,6 +194,19 @@ class ModelService:
     ) -> ModelResponse:
         repo = ModelRepository(session)
         update_kwargs = {k: v for k, v in data.model_dump().items() if v is not None}
+        existing = await repo.get_by_alias(alias)
+        if existing is None:
+            raise NotFoundError("ModelAlias", alias)
+        previous_provider_model_id = existing.provider_model_id
+        # 대상 AWS 계정(0044) — **실효값**으로 판정한다: 키 없음 = 저장값 유지, 명시적 null = 해제.
+        # provider 는 이 API 로 바꿀 수 없으므로(ModelUpdateRequest) 저장값이 곧 실효값이다.
+        clears_account = "account_name" in data.model_fields_set and data.account_name is None
+        await _assert_account_selection(
+            session,
+            alias=alias,
+            provider=existing.provider,
+            account_name=None if clears_account else data.account_name or existing.account_name,
+        )
         model = await repo.update_model(alias, **update_kwargs)
         if model is None:
             raise NotFoundError("ModelAlias", alias)
@@ -164,10 +231,27 @@ class ModelService:
             await session.flush()
             update_kwargs["allowed_clients"] = None
 
+        # account_name 도 같은 "명시적 null = 해제" 다. 빠지면 계정 선택을 해제할 API 가 없다 —
+        # 위 필터가 null 을 버리므로 성공 토스트만 뜨고 그 alias 는 옛 계정으로 계속 나간다.
+        # 해제하면 트리거가 사본도 비운다(기본 계정 복귀).
+        if clears_account:
+            model.account_name = None
+            update_kwargs["account_name"] = None
+        await _refresh_account_copy(session, model)
+
         pricing = await repo.get_current_pricing(alias)
 
-        # BR-MOD-04: Cache invalidation
-        await self._cache_mgr.invalidate([f"model:{alias}", "model:list"], session=session)
+        # BR-MOD-04: Cache invalidation. 모델 id 키(바뀌었으면 옛것과 새것 둘 다)도 지운다 —
+        # 게이트웨이가 모델 id 로 지목한 해석을 그 키에 캐시하고, 거기에 옛 계정이 남는다.
+        await self._cache_mgr.invalidate(
+            list(dict.fromkeys([
+                f"model:{alias}",
+                f"model:{previous_provider_model_id}",
+                f"model:{model.provider_model_id}",
+                "model:list",
+            ])),
+            session=session,
+        )
 
         await audit_logger.log(
             session,
@@ -485,6 +569,9 @@ class ModelService:
             allowed_clients=model.allowed_clients,
             description=model.description,
             display_name=model.display_name,
+            account_name=model.account_name,
+            account_role_arn=model.account_role_arn,
+            account_external_id=model.account_external_id,
             current_pricing=pricing_resp,
             created_at=model.created_at,
             updated_at=model.updated_at,

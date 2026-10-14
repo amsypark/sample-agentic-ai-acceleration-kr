@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from decimal import Decimal
 
@@ -88,6 +89,66 @@ def _validate_long_context_consistency(obj):
 # 같은 이유(NUMERIC(12,8) 오버플로 → 500).
 
 
+# ── 대상 AWS 계정 (마이그레이션 0043/0044) ──────────────────────────────────────────
+# DB CHECK 와 **같은 문법**을 여기서 막는다. DB 만 막으면 오타가 422 가 아니라 IntegrityError →
+# 409/500 으로 보인다 — 운영자에게 어느 필드가 왜 틀렸는지 알려 주지 못한다.
+#
+# 콜론을 문자 클래스로 쓰지 않는 유일한 자리다: 이건 Python ``re`` 라 SQLAlchemy 의 바인드
+# 파라미터 스캔(``:role`` 을 파라미터로 읽는다)이 없다. 마이그레이션/init SQL 은 ``[:]`` 여야 하고
+# (0043 docstring), 두 표현은 같은 문자열 집합을 받아들인다.
+_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$")
+
+#: ``sts:AssumeRole`` 의 ExternalId 제약(AWS): 2-1224자, 이 문자 집합.
+_EXTERNAL_ID_RE = re.compile(r"^[\w+=,.@:/-]{2,1224}$")
+
+#: CHECK ck_aws_accounts_name(0044)과 같은 문법, 같은 예약어.
+_ACCOUNT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
+_RESERVED_ACCOUNT_NAMES = frozenset({"default", "gateway", "inherit", "none"})
+
+
+def _validate_role_arn(v: str | None) -> str | None:
+    if v is None:
+        return v
+    v = v.strip()
+    if not v:
+        # 빈 문자열의 정식 표현은 null 이다. 그대로 두면 DB CHECK 가 거부하고, 조용히 None 으로
+        # 바꾸면 "지웠다" 와 "안 건드렸다" 가 구별되지 않는다.
+        raise ValueError("role_arn cannot be blank")
+    if not _ROLE_ARN_RE.match(v):
+        raise ValueError(
+            "role_arn must be an IAM ROLE arn (arn:aws:iam::<12-digit-account>:role/<name>). "
+            "A user ARN, a bare account id or a Bedrock ARN will not work: the account of a "
+            "Bedrock call is decided by the credentials that sign it, so this must be a role "
+            "the gateway can assume."
+        )
+    return v
+
+
+def _validate_external_id(v: str | None) -> str | None:
+    if v is None:
+        return v
+    v = v.strip()
+    if not v:
+        raise ValueError("external_id cannot be blank; send null to clear it")
+    if not _EXTERNAL_ID_RE.match(v):
+        raise ValueError(
+            "external_id must be 2-1224 chars of [A-Za-z0-9+=,.@:/_-] "
+            "(the sts:AssumeRole ExternalId constraint)"
+        )
+    return v
+
+
+def _validate_account_name(v: str | None) -> str | None:
+    if v is None:
+        return v
+    if not _ACCOUNT_NAME_RE.match(v) or v in _RESERVED_ACCOUNT_NAMES:
+        raise ValueError(
+            "account name must be 3-64 chars of a-z 0-9 and '-', not starting or ending with "
+            "'-', and not one of default/gateway/inherit/none; send null for the default account"
+        )
+    return v
+
+
 # ── Requests ──
 
 
@@ -143,12 +204,22 @@ class ModelCreateRequest(BaseModel):
     #:   목록           그 앱들만 허용
     allowed_clients: list[str] | None = None
 
+    #: 대상 AWS 계정 — 레지스트리(``/admin/aws-accounts``)에 등록된 이름(0044).
+    #:   생략/``null``  기본값: 이 alias 에 계정 없음 → 게이트웨이가 앱의 라우팅 프로필 계정
+    #:                  (그 경로가 프로필을 쓸 때), 그것도 없으면 게이트웨이 자신의 계정으로 부른다.
+    #:   이름           그 계정의 역할로 서명한다(모든 경로에서 프로필보다 우선).
+    #: 역할 ARN·ExternalId 는 레지스트리가 갖고 DB 트리거가 alias 행에 복사한다 — 이 요청으로는
+    #: 쓸 수 없다(extra="forbid" 라 ``account_role_arn`` 키는 422).
+    account_name: str | None = Field(default=None, max_length=64)
+
     @field_validator("allowed_clients")
     @classmethod
     def _validate_clients(cls, v: list[str] | None) -> list[str] | None:
         # ⚠️ None 을 그대로 통과시켜야 한다 — [] 로 정규화하면 "제한 없음" 이
         #    "전면 거부" 로 바뀐다(정확히 반대 방향의 사고).
         return validate_clients(v)
+
+    _v_account_name = field_validator("account_name")(_validate_account_name)
 
     @model_validator(mode="after")
     def _validate_long_context(self):
@@ -187,11 +258,17 @@ class ModelUpdateRequest(BaseModel):
     #:    거부이므로 "제한 해제" 버튼이 그 모델을 통째로 막는다.
     #:    구별은 서비스 계층에서 ``model_fields_set`` 으로 한다.
     allowed_clients: list[str] | None = None
+    #: 대상 AWS 계정 이름(0044). allowed_clients 와 같은 3-상태다: 생략 = 유지 / **명시적 null =
+    #: 해제**(기본 계정으로 복귀 — 트리거가 사본도 비운다) / 이름 = 그 계정 선택. null 을 생략과
+    #: 같이 다루면 계정 선택을 해제할 API 가 없어진다(repo.update_model 은 None 을 건너뛴다).
+    account_name: str | None = Field(default=None, max_length=64)
 
     @field_validator("allowed_clients")
     @classmethod
     def _validate_update_clients(cls, v: list[str] | None) -> list[str] | None:
         return validate_clients(v)
+
+    _v_account_name = field_validator("account_name")(_validate_account_name)
 
 
 
@@ -285,6 +362,12 @@ class ModelResponse(BaseModel):
     #: 구별해 보여줘야 한다 — ``[]`` 를 "제한 없음" 으로 렌더하면 운영자가 자기가 만든
     #: 전면 거부를 보지 못한다.
     allowed_clients: list[str] | None = None
+    #: 레지스트리 선택(0044). 콘솔이 현재 선택을 prefill 하는 값이다 — 빠지면 편집 화면이
+    #: "기본값" 으로 열리고, 계정 칸을 건드리지 않은 저장도 선택을 지운다.
+    account_name: str | None = None
+    #: 트리거가 유지하는 사본 — 게이트웨이가 실제로 서명에 쓰는 값. 읽기 전용.
+    account_role_arn: str | None = None
+    account_external_id: str | None = None
     current_pricing: ModelPricingResponse | None = None
     created_at: datetime
     updated_at: datetime

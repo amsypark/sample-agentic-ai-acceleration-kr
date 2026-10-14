@@ -258,6 +258,7 @@ jobs:
             tests/regression/test_high_init_sql_matches_orm.py \
             tests/regression/test_high_aws_price_sync_real_db.py \
             tests/regression/test_high_aws_account_registry_real_db.py \
+            tests/regression/test_high_model_account_selection_real_db.py \
             > /tmp/proof.txt 2>&1
           status=$?
           tail -40 /tmp/proof.txt
@@ -265,8 +266,9 @@ jobs:
           # 통과했더라도 실질 실행이 0건이면 실패다 — 그게 이 잡을 만든 이유다.
           # ⚠️ 하한만 본다. 정확한 통과 수는 DB 에 쌓인 데이터에 따라 달라진다 — 일부
           #    테스트는 대상 테이블이 비어 있으면 스스로 skip 한다(플랜 어서션 등). 로컬
-          #    실측은 136 passed / 2 skipped 였다(AWS 자동연동 real-PG 2건 포함). 하한의
-          #    목적은 "PROOF_DSN 이 안 걸려 대부분 skip 된" 상태를 잡는 것이다.
+          #    실측은 200 passed / 2 skipped 다(AWS 자동연동 real-PG 2건, 0044 계정 레지스트리
+          #    트리거 27건, 계정 API 7건 포함). 하한의 목적은 "PROOF_DSN 이 안 걸려 대부분
+          #    skip 된" 상태를 잡는 것이다.
           passed=$(grep -oE "[0-9]+ passed" /tmp/proof.txt | tail -1 | grep -oE "[0-9]+" || echo 0)
           echo "passed=${passed}"
           if [ "${passed:-0}" -lt 95 ]; then

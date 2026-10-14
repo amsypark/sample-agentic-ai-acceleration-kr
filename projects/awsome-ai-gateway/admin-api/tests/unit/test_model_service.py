@@ -33,6 +33,10 @@ def _make_model(alias: str = "claude-sonnet") -> ModelAlias:
     m.status = ModelStatus.ACTIVE
     m.description = "test model"
     m.display_name = None  # _to_response reads display_name; MagicMock would yield a non-str → pydantic error
+    # 대상 AWS 계정(0043/0044) — 같은 이유로 실제 값이어야 한다. None = 기본 계정.
+    m.account_name = None
+    m.account_role_arn = None
+    m.account_external_id = None
     m.created_at = datetime.now(timezone.utc)
     m.updated_at = datetime.now(timezone.utc)
     return m
@@ -124,6 +128,8 @@ class TestUpdateModel:
         data = ModelUpdateRequest(description="new desc")
 
         with patch("app.services.model_service.ModelRepository") as MockRepo:
+            # update_model 은 바꾸기 전에 행을 읽는다(계정 선택을 실효값으로 검증 — 0044).
+            MockRepo.return_value.get_by_alias = AsyncMock(return_value=None)
             MockRepo.return_value.update_model = AsyncMock(return_value=None)
 
             with pytest.raises(NotFoundError):
@@ -139,6 +145,7 @@ class TestUpdateModel:
         with patch("app.services.model_service.ModelRepository") as MockRepo, \
              patch("app.services.model_service.audit_logger") as mock_audit:
             repo = MockRepo.return_value
+            repo.get_by_alias = AsyncMock(return_value=model)
             repo.update_model = AsyncMock(return_value=model)
             repo.get_current_pricing = AsyncMock(return_value=pricing)
             mock_audit.log = AsyncMock()

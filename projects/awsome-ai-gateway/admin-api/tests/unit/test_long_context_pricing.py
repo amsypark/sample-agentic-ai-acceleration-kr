@@ -38,6 +38,9 @@ def _model() -> ModelAlias:
     m.description = None
     m.display_name = None
     m.allowed_clients = None
+    m.account_name = None  # 0044 — _to_response 가 읽는다
+    m.account_role_arn = None
+    m.account_external_id = None
     m.created_at = _NOW
     m.updated_at = _NOW
     return m

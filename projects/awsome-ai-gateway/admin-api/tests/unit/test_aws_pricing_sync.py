@@ -32,6 +32,9 @@ def _model(alias: str, pmid: str) -> ModelAlias:
     m.status = ModelStatus.ACTIVE
     m.description = None
     m.display_name = None
+    m.account_name = None  # 0044 — _to_response 가 읽는다
+    m.account_role_arn = None
+    m.account_external_id = None
     m.created_at = datetime.now(timezone.utc)
     m.updated_at = datetime.now(timezone.utc)
     return m
