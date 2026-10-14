@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/analytics", tags=["Analytics"])
 
+#: scope 의 허용 형태 — 화면 라우트와 export 가 **같은** 집합을 쓴다.
+_SCOPE_PATTERN = r"^(all|team:[0-9a-fA-F-]{36})$"
+
 #: /admin/analytics 응답 캐시 TTL(초). dashboard 와 같은 값이지만 정책이 달라 별도로 둔다
 #: (여기는 ADMIN + scope='all' 에만 캐시한다 — 아래 get_analytics 주석 참조).
 _ANALYTICS_CACHE_TTL = 30
@@ -83,7 +86,9 @@ async def get_analytics(
     #    조용히 by_model 응답이 돌아왔다(쓰레기 값과 바이트 단위로 동일 = 무증상 오답).
     #    이 Literal 집합은 admin-ui/src/types/enums.ts 의 GroupByType 과 일치한다.
     group_by: Literal["model", "team", "user"] = Query("model"),
-    scope: str = Query("all", description="all | team:{uuid}"),
+    # ⚠️ scope 는 닫힌 집합이다 — 그 밖의 값은 422. 예전엔 자유 문자열이라 'xyz' 같은 값이
+    #    서비스의 어느 분기도 타지 않고 전사 범위로 떨어졌다(서비스도 스스로 400 으로 닫는다).
+    scope: str = Query("all", description="all | team:{uuid}", pattern=_SCOPE_PATTERN),
     # ⚠️ 날짜 범위는 Annotated 로 선언한다 — 기본값이 진짜 None 이라 라우트 함수를 직접
     #    부르는 회귀 테스트(test_critical_analytics_cache_role_isolation)가 FieldInfo 객체를
     #    받지 않는다. 둘 다 주면 그 KST 일자 범위만 집계하고, 한쪽만 주면 400 이다.
@@ -231,7 +236,7 @@ async def export_analytics(
     #    (tests/unit/test_analytics_query_param_parity.py 가 강제). 화면이 받는 필터를 export 가
     #    못 받으면 FastAPI 가 그 파라미터를 422 없이 버리므로, 운영자는 화면과 다른 데이터셋을
     #    조용히 내려받는다(예전엔 scope 와 범위가 그렇게 빠져 있었다).
-    scope: str = Query("all", description="all | team:{uuid}"),
+    scope: str = Query("all", description="all | team:{uuid}", pattern=_SCOPE_PATTERN),
     start_date: Annotated[str | None, Query(description="YYYY-MM-DD (KST). end_date 와 함께")] = None,
     end_date: Annotated[str | None, Query(description="YYYY-MM-DD (KST). start_date 와 함께")] = None,
     user: CurrentUser = Depends(require_admin_or_team_leader),

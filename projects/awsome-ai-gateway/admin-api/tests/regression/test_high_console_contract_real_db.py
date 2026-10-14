@@ -26,6 +26,9 @@
      조인하던 동안 두 팀의 소진율이 뒤바뀌었다 — 이 스키마에는 팀 이름 유일성 제약이 아예 없다).
   7. 자동 하향 PUT 의 ``enabled: false`` 가 budget.downgrade_policies 의 활성 행을 실제로 없앤다
      (예전: 규칙을 전부 is_active=true 로 다시 써서 '끄기' 저장 후에도 집행이 계속됐다).
+  8. analytics scope 는 닫힌 집합이다 — TEAM_LEADER 가 'xyz'·'ALL'·' all' 로 물으면 데이터를 읽기 전에
+     400 이고, 'all' 은 자기 팀으로만 좁혀진다(예전: 앞의 셋이 전사 범위로 떨어져 다른 팀 사용자
+     이메일까지 화면·CSV 로 나갔다).
 
 실행::
 
@@ -827,3 +830,42 @@ async def test_downgrade_enabled_false_really_turns_it_off(session):
     await session.commit()
     assert off.enabled is False
     assert await active_rules() == 0, "끄기 저장 후에도 활성 규칙이 남아 gateway-proxy 가 계속 바꿔치기한다"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. analytics scope — 닫힌 집합
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("scope", ["xyz", "ALL", " all", "team:not-a-uuid"])
+async def test_leader_malformed_scope_never_reaches_org_wide_data(session, scope):
+    from app.core.auth import CurrentUser
+    from app.core.exceptions import ValidationError
+    from app.models.auth import UserRole
+    from app.services.analytics_service import AnalyticsService
+
+    leader = CurrentUser(user_id=uuid.uuid4(), email="lead@example.com", role=UserRole.TEAM_LEADER, team_id=SEED_TEAM_ID)
+    svc = AnalyticsService()
+    with pytest.raises(ValidationError):
+        await svc.get_analytics(session, period=PERIOD, group_by="user", scope=scope, actor=leader)
+    with pytest.raises(ValidationError):
+        await svc.export_analytics(session, format="csv", period=PERIOD, group_by="user", scope=scope, actor=leader)
+
+
+async def test_leader_all_is_scoped_to_the_own_team(session):
+    """대조군 — 'all' 은 TEAM_LEADER 에게 자기 팀이다: 다른 팀(TEAM_B) 사용자는 화면에도 CSV 에도 없다."""
+    from app.core.auth import CurrentUser
+    from app.models.auth import UserRole
+    from app.services.analytics_service import AnalyticsService
+
+    leader = CurrentUser(user_id=uuid.uuid4(), email="lead@example.com", role=UserRole.TEAM_LEADER, team_id=SEED_TEAM_ID)
+    svc = AnalyticsService()
+    resp = await svc.get_analytics(session, period=PERIOD, group_by="user", scope="all", actor=leader)
+    emails = {u.email for u in resp.by_user}
+    assert "range-b@example.com" not in emails, "다른 팀 사용자가 리더 화면에 나왔다"
+    assert "range-a@example.com" in emails
+    assert resp.cost_summary.total_cost_usd == Decimal("71.00")  # 시드 팀만: 1+2+4+64 (TEAM_B 의 8 제외)
+    csv_body, _ = await svc.export_analytics(
+        session, format="csv", period=PERIOD, group_by="user", scope="all", actor=leader
+    )
+    assert "range-b@example.com" not in csv_body

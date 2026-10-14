@@ -98,17 +98,31 @@ class AnalyticsService:
         period_filter = cost_day_range_filter(*date_range) if date_range else cost_period_filter(period)
 
         # Determine scope filter
+        #
+        # ⚠️ scope 는 **닫힌 집합**('all' | 'team:<uuid>')으로만 해석한다 — 나머지는 전부 400.
+        #    예전엔 `startswith("team:")` 와 `== "all"` 두 분기만 있었고 그 밖의 값('xyz',
+        #    'ALL', ' all')은 어느 분기도 타지 않아 roi_scope=None(=GLOBAL)로 떨어졌다. 아래
+        #    격리 불변식은 비-GLOBAL 일 때만 검사하므로 그대로 통과 → TEAM_LEADER 가 **전사**
+        #    비용·사용자 이메일·팀을 받았고, export 는 그것을 CSV 로 내려줬다(실 PG 재현:
+        #    다른 팀 사용자 $500 포함 $501). 'team:<uuid 아님>' 은 uuid.UUID 의 ValueError 가
+        #    잡히지 않아 500 이었다. 라우트도 같은 집합을 pattern 으로 강제하지만(422), 서비스를
+        #    직접 부르는 경로가 있으므로(export_analytics) 여기서도 스스로 닫는다.
         roi_scope: ROIScope | None = None
         scope_id: uuid.UUID | None = None
 
         if scope.startswith("team:"):
-            team_id = uuid.UUID(scope.split(":")[1])
+            try:
+                team_id = uuid.UUID(scope[len("team:"):])
+            except ValueError:
+                raise ValidationError(f"scope must be 'all' or 'team:<uuid>' (got {scope!r})") from None
             # TEAM_LEADER can only see own team
             if actor.role == UserRole.TEAM_LEADER and actor.team_id != team_id:
                 raise ForbiddenError("Team leaders can only view analytics for their own team")
             roi_scope = ROIScope.TEAM
             scope_id = team_id
-        elif scope == "all":
+        elif scope != "all":
+            raise ValidationError(f"scope must be 'all' or 'team:<uuid>' (got {scope!r})")
+        else:
             # TEAM_LEADER restricted to own team
             if actor.role == UserRole.TEAM_LEADER:
                 # ⚠️ 팀이 없는 TEAM_LEADER 를 통과시키면 안 된다. 예전엔 scope_id 가
@@ -127,6 +141,11 @@ class AnalyticsService:
                 roi_scope = ROIScope.TEAM
                 scope_id = actor.team_id
         # ADMIN: no restriction
+
+        # 불변식(방어 심층): TEAM_LEADER 는 어떤 경로로 와도 TEAM 범위로 끝나야 한다. 위 분기에
+        # 새 값이 추가되면서 이 성질이 다시 깨지면, 데이터를 읽기 전에 여기서 닫는다.
+        if actor.role == UserRole.TEAM_LEADER and roi_scope != ROIScope.TEAM:
+            raise ForbiddenError("Team leaders can only view analytics for their own team")
 
         # 불변식: 비-GLOBAL scope 라면 scope_id 가 반드시 있다. 아래의 by_user/trends 는
         # `scope_id is not None` 로 격리를 걸기 때문에, 이 둘이 어긋나면 그 두 질의만
