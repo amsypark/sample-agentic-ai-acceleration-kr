@@ -51,6 +51,10 @@ class _Meta(NamedTuple):
     cancel_on_shutdown: bool
 
 
+#: 유예 창이 끝난 패스에서 막 취소한 drain 에 주는 1회 대기(초). 그 drain 의 finally 는 보호
+#: 태스크로 회계를 넘기고 기다리므로(services/streaming.py) 정상이면 Redis 왕복 몇 번이면 끝난다.
+_LATE_CANCEL_WAIT = 0.5
+
 #: 떼어 낸 태스크의 강한 참조(+ 셧다운 drain 이 쓰는 메타데이터).
 #:
 #: ⚠️ asyncio 는 실행 중 태스크를 **약한 참조**로만 들고 있다. 핸들을 지역 변수로만 둔 태스크는
@@ -163,7 +167,15 @@ async def drain(timeout: float = 10.0, *, cancel_grace: float = 2.0) -> int:
                 cancelled.update(batch)
                 logger.warning("bg_tasks_drain_cancelled", **_describe(batch))
             remaining = deadline - loop.time()
-            if not pending or remaining <= 0:
+            if not pending:
+                return pending
+            if remaining <= 0:
+                if batch:
+                    # ⚠️ 마지막 패스에서 처음 본 drain 은 방금 취소됐을 뿐 finally 를 돌 기회가
+                    #    없었다. 그대로 리턴하면 회계 없이 abandoned 가 된다 — 그 묶음만 한 번
+                    #    짧게 기다린다.
+                    await asyncio.wait(batch, timeout=min(_LATE_CANCEL_WAIT, cancel_grace))
+                    return _pending()
                 return pending
             await asyncio.wait(pending, timeout=remaining)
 

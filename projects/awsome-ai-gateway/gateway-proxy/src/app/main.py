@@ -426,8 +426,9 @@ async def lifespan(app: FastAPI):
     #   · cost_stream_spool.drain() 앞 — 이 태스크들이 spool 한 레코드도 마지막 재발행을 받게.
     # ⚠️ 끝까지 기다리지 못한 것을 그대로 두면 asyncio.run 의 teardown 이 그 finally 를 싱크가
     #    닫힌 **뒤에** 돌린다. 그래서 10s 뒤에도 상류를 읽고 있는 drain 은 한 번 취소해(그때까지
-    #    읽은 만큼 회계) 2s 더 기다리고, 그래도 남은 것은 이름·요청 id 를 로그한다(bg_tasks.drain).
-    #    합계 12s 는 pod terminationGracePeriodSeconds(60) 안에 들어간다.
+    #    읽은 만큼 회계) 2s 더 기다리고(창 끝에 처음 본 drain 은 0.5s 더), 그래도 남은 것은
+    #    이름·요청 id 를 로그한다(bg_tasks.drain). 최대 12.5s — pod 의
+    #    terminationGracePeriodSeconds(60) 안이다.
     try:
         completed = await bg_tasks.drain(timeout=10.0, cancel_grace=2.0)
         if completed:

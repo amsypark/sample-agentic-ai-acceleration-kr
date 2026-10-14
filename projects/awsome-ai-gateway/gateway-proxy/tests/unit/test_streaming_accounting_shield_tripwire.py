@@ -107,16 +107,14 @@ def test_every_streaming_generator_has_a_shielded_finalize():
 
 
 def test_streaming_exit_paths_do_not_bare_await_accounting():
-    """제너레이터 **본문**(성공/timeout/예외 꼬리)이 회계를 직접 await 하면 안 된다.
+    """제너레이터 **본문**(성공/timeout/예외 꼬리)과 drain 이 회계를 직접 await 하면 안 된다.
 
-    그 await 가 취소 지점이 되고, 그게 측정된 유실이다. 꼬리는 반드시 ``_spawn_finalize``
-    (= shield)를 통과해야 한다. 반면 구현 헬퍼는 이미 떼어 낸 태스크 안에서 돌거나(drain,
-    ``_finalize``) 그 태스크에 실려 가는 것이라 직접 await 가 맞다.
+    그 await 가 취소 지점이 되고, 그게 측정된 유실이다. 꼬리와 drain 의 finally 는 반드시
+    ``_spawn_finalize``(= shield)를 통과해야 한다. drain 도 예외가 아니다 — 셧다운에서 한 번
+    취소되므로(cancel_on_shutdown) 그 finally 의 회계가 잘릴 수 있다(리뷰 프로브로 실측). 직접
+    await 가 맞는 것은 보호 태스크에 실려 가는 구현 헬퍼뿐이다.
     """
     impl_helpers = {
-        "_drain_remaining",
-        "consume_remaining",
-        "_fire_on_usage",
         "_fire_on_complete",
         "_run_on_usage",
         "_finalize",

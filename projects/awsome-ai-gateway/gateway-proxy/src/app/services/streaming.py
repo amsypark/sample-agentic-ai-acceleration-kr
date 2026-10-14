@@ -101,7 +101,7 @@ async def bedrock_anthropic_sse_stream(
     # 과금 멱등 가드. 종료 경로가 4개(정상/idle timeout/upstream 예외/클라이언트 끊김
     # → 백그라운드 drain)라, 가드 없이 각 경로에서 finalize 를 호출하면 **이중 과금**이
     # 된다. 반대로 timeout/예외 경로에서 호출을 빼면 그때까지 생성된 토큰이 **유실**된다
-    # (과거 동작: 두 경로가 함수 말미의 _fire_on_usage 를 건너뛰는 return 이었다).
+    # (과거 동작: 두 경로가 함수 말미의 usage 발화를 건너뛰는 return 이었다).
     usage_fired = False
     # 본문 로깅용 원본 SSE 프레임 누적. on_complete 가 없으면 아무것도 쌓지 않는다.
     accumulated_frames: list[str] = []
@@ -244,11 +244,6 @@ async def bedrock_anthropic_sse_stream(
         except Exception:
             logger.exception("on_usage_callback_failed")
 
-    async def _fire_on_usage() -> None:
-        """클레임 + 실행. 이미 떼어 낸 태스크(drain)에서만 부른다."""
-        if _claim_usage():
-            await _run_on_usage()
-
     async def _finalize(complete_status: str, *, fire_usage: bool) -> None:
         """과금과 본문 로그를 **한 단위**로 — 한 태스크에 실어야 둘 다 살아남는다.
 
@@ -284,8 +279,11 @@ async def bedrock_anthropic_sse_stream(
         except Exception:
             logger.exception("stream_drain_error")
         finally:
-            await _fire_on_usage()
-            await _fire_on_complete("partial")
+            # ⚠️ 회계는 여기서도 보호 태스크로 넘긴다. 이 drain 은 셧다운에서 한 번 취소된다
+            #    (cancel_on_shutdown) — 그 취소가 이 finally 의 회계 도중에 떨어지면 차감과 XADD 가
+            #    다시 갈라지고, 느린 토크나이저면 클레임만 소비된 채 행이 없다(리뷰 프로브로 실측).
+            #    보호 태스크는 취소 대상이 아니라 셧다운 drain() 이 다시 스냅샷해 기다린다.
+            await _spawn_finalize("partial")
 
     # Starlette `is_disconnected()` 는 ASGI 스트리밍 응답 컨텍스트에서 신뢰할
     # 수 없어 (false positive 로 첫 iteration 부터 True 반환) 명시적 체크를
@@ -489,11 +487,6 @@ async def openai_sse_stream(
         except Exception:
             logger.exception("on_usage_callback_failed")
 
-    async def _fire_on_usage() -> None:
-        """클레임 + 실행. 이미 떼어 낸 태스크(drain)에서만 부른다."""
-        if _claim_usage():
-            await _run_on_usage()
-
     async def _finalize(complete_status: str, *, fire_usage: bool) -> None:
         """과금 + 본문 로그를 한 단위로 — Bedrock 경로의 같은 함수 참조."""
         if fire_usage:
@@ -522,8 +515,11 @@ async def openai_sse_stream(
         except Exception:
             logger.exception("stream_drain_error")
         finally:
-            await _fire_on_usage()
-            await _fire_on_complete("partial")
+            # ⚠️ 회계는 여기서도 보호 태스크로 넘긴다. 이 drain 은 셧다운에서 한 번 취소된다
+            #    (cancel_on_shutdown) — 그 취소가 이 finally 의 회계 도중에 떨어지면 차감과 XADD 가
+            #    다시 갈라지고, 느린 토크나이저면 클레임만 소비된 채 행이 없다(리뷰 프로브로 실측).
+            #    보호 태스크는 취소 대상이 아니라 셧다운 drain() 이 다시 스냅샷해 기다린다.
+            await _spawn_finalize("partial")
 
     # Starlette `is_disconnected()` 는 ASGI 스트리밍 응답 컨텍스트에서 신뢰할
     # 수 없어 (false positive 로 첫 iteration 부터 True 반환) 명시적 체크를
@@ -731,11 +727,6 @@ async def responses_sse_stream(
         except Exception:
             logger.exception("on_usage_callback_failed")
 
-    async def _fire_on_usage() -> None:
-        """클레임 + 실행. 이미 떼어 낸 태스크(drain)에서만 부른다."""
-        if _claim_usage():
-            await _run_on_usage()
-
     async def _finalize(complete_status: str, *, fire_usage: bool) -> None:
         """과금 + 본문 로그를 한 단위로 — Bedrock 경로의 같은 함수 참조."""
         if fire_usage:
@@ -766,8 +757,7 @@ async def responses_sse_stream(
         except Exception:
             logger.exception("responses_stream_drain_error")
         finally:
-            await _fire_on_usage()
-            await _fire_on_complete("partial")
+            await _spawn_finalize("partial")  # 보호 태스크로 — Bedrock 경로 drain 의 같은 주석
 
     try:
         while True:
@@ -837,6 +827,12 @@ async def stream_response(
     usage: TokenUsage | None = None
     client_disconnected = False
 
+    async def _record_usage() -> None:
+        try:
+            await on_usage(usage, None)
+        except Exception:
+            logger.exception("on_usage_callback_failed")
+
     async def consume_remaining():
         """클라이언트 연결 끊김 후 백그라운드 소비."""
         nonlocal usage
@@ -853,10 +849,10 @@ async def stream_response(
             logger.exception("stream_drain_error")
         finally:
             if usage and callable(on_usage):
-                try:
-                    await on_usage(usage, None)
-                except Exception:
-                    logger.exception("on_usage_callback_failed")
+                # 보호 태스크로 — 세 제너레이터의 drain 과 같은 이유(셧다운 취소가 회계를 자른다).
+                await bg_tasks.spawn_shielded(
+                    _record_usage(), name="stream_response_finalize", request_id=request_id
+                )
 
     try:
         async for chunk in chunk_iterator:
@@ -882,12 +878,6 @@ async def stream_response(
     except Exception:
         logger.exception("stream_proxy_error")
         client_disconnected = True
-
-    async def _record_usage() -> None:
-        try:
-            await on_usage(usage, None)
-        except Exception:
-            logger.exception("on_usage_callback_failed")
 
     if not client_disconnected and usage and callable(on_usage):
         # 위 세 제너레이터와 같은 이유로 보호한다(마지막 yield 뒤). 호출부 없는 함수지만,

@@ -302,3 +302,102 @@ def _aiter(items):
             yield item
 
     return _gen()
+
+
+def _stream_case(kind: str):
+    """(제너레이터, 첫 프레임, 이어지는 프레임) — 세 SSE 헬퍼의 텍스트 델타 모양."""
+    from app.services.streaming import bedrock_anthropic_sse_stream, openai_sse_stream
+
+    if kind == "bedrock":
+        def frame(t):
+            return json.dumps(
+                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": t}}
+            ).encode()
+
+        return bedrock_anthropic_sse_stream, frame
+    if kind == "openai":
+        def frame(t):
+            return f'data: {{"choices":[{{"delta":{{"content":"{t}"}}}}]}}\n\n'.encode()
+
+        return openai_sse_stream, frame
+    return responses_sse_stream, _delta
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["bedrock", "openai", "responses"])
+@pytest.mark.parametrize("slow", ["finalize", "tokenizer"])
+async def test_shutdown_cancel_never_cuts_a_drains_own_accounting(kind, slow):
+    """drain 은 셧다운에 한 번 취소된다(cancel_on_shutdown). 그 취소가 drain **자신의** finally 회계
+    도중에 떨어지면 다시 갈라진다 — 느린 finalize 면 차감만 남고 원장이 비고, 느린 토크나이저면
+    클레임만 소비되고 행이 없다(예약도 안 풀린다). 리뷰 프로브로 실측했다.
+    """
+    helper, frame = _stream_case(kind)
+    deducted: list[int] = []
+    recorded: list[int] = []
+
+    async def tokenizer(text: str) -> int:
+        if slow == "tokenizer":
+            await asyncio.sleep(0.3)  # Bedrock CountTokens 왕복
+        return len(text)
+
+    async def on_usage(usage, first_token_time) -> None:
+        deducted.append(usage.output_tokens)  # 예산 EVAL 은 이미 나갔다
+        if slow == "finalize":
+            await asyncio.sleep(0.3)  # 느린 Redis 아래 남은 EVAL·정산·XADD
+        recorded.append(usage.output_tokens)  # cost:stream XADD
+
+    async def upstream():  # 클라이언트가 떠난 뒤 ~0.15s 에 끝나는 모델
+        yield frame("a")
+        for _ in range(3):
+            await asyncio.sleep(0.05)
+            yield frame("b")
+
+    gen = helper(
+        _ScopedRequest(f"req-{kind}-{slow}"),
+        upstream(),
+        on_usage=on_usage,
+        tokenizer_hook=tokenizer,
+        idle_timeout=5.0,
+        drain_timeout=30.0,
+    )
+    await gen.__anext__()
+    await gen.aclose()  # 클라이언트가 yield 에서 사라졌다 → drain 이 상류를 마저 읽는다
+    await bg_tasks.drain(timeout=0.25, cancel_grace=1.0)  # main.py: 10 / 2
+
+    assert deducted == recorded == [4], f"회계가 갈렸다: 차감 {deducted} / 원장 {recorded}"
+    assert bg_tasks.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_drain_first_seen_on_the_last_grace_pass_still_gets_to_account():
+    """유예 창의 마지막 패스에서 처음 본 drain 도 finally 로 회계할 기회가 한 번은 있어야 한다.
+
+    고치기 전에는 그 패스에서 취소만 하고 남은 시간이 0 이라 바로 리턴했다 — drain 은 취소된 채
+    finally 를 돌 기회 없이 abandoned 로 남았다.
+    """
+    accounted: list[str] = []
+
+    async def outlives_the_grace():  # 끝나지 않는 회계(취소 대상 아님) — 유예 창을 끝까지 붙잡는다
+        await asyncio.sleep(1.0)
+
+    async def late_drain():
+        try:
+            await asyncio.sleep(30)
+        finally:
+            await asyncio.sleep(0.01)  # 차감·XADD 왕복
+            accounted.append("late")
+
+    async def first_drain():
+        try:
+            await asyncio.sleep(30)
+        finally:
+            # 유예 창의 첫 스냅샷 **뒤에** 생긴다 → 마지막 패스에서 처음 보인다
+            bg_tasks.spawn(late_drain(), name="late_stream_drain", cancel_on_shutdown=True)
+
+    stuck = bg_tasks.spawn(outlives_the_grace(), name="stuck_finalize")
+    bg_tasks.spawn(first_drain(), name="first_stream_drain", cancel_on_shutdown=True)
+    try:
+        await bg_tasks.drain(timeout=0.05, cancel_grace=0.2)
+        assert accounted == ["late"], "마지막 패스에서 취소된 drain 이 회계하지 못했다"
+    finally:
+        stuck.cancel()
