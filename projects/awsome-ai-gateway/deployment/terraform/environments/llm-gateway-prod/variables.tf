@@ -233,19 +233,14 @@ variable "bedrock_allowed_model_arns" {
   # DB 에 alias 를 넣는 것만으로는 호출되지 않는다.
   type = list(string)
   default = [
-    # Foundation models (실제 추론이 실행되는 리소스)
-    "arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-4-*",
-    "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-*",
-    "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-*",
-    # Claude 5 (migration 0027). 세대 전체를 `claude-*-5*` 로 열지 않고 모델별로 적는 이유는
-    # fable-5 를 IAM 에서도 계속 막아 두기 위해서다(0027 이 의도적으로 미등록 — apne2
-    # 프로파일 부재). 실측으로 fable-5 는 이 목록에서 AccessDenied 유지됨을 확인했다.
-    "arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-5*",
-    "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5*",
-    # Claude Haiku 5.5 (migration 0041). Opus/Sonnet 5.5 는 위 두 줄(`opus-5*`, `sonnet-5*`)이
-    # 이미 덮는다 — haiku 는 4 세대 줄(`haiku-4-*`)만 있어 5.5 가 AccessDenied 였다.
-    # fable 은 계속 막는다(0041 도 미등록).
-    "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5*",
+    # Foundation models (실제 추론이 실행되는 리소스) — Anthropic 은 `claude-*` 한 줄로 둔다.
+    # 예전엔 세대·계열별로 적었다(opus-4-*, sonnet-5*, haiku-5* …). 이유는 "fable 을 IAM 에서도
+    # 막는다" 였는데 0042 가 Fable 을 등록하면서 그 이유가 없어졌고, 그 방식은 신모델마다
+    # "IaC 를 안 고치면 조용히 AccessDenied" 를 반복했다(0027 Claude 5, 0041 Haiku 5.5).
+    # 벤더(anthropic)·Claude 라인으로는 여전히 한정된다 — openai 등 타 벤더는 아래 별도 줄이다.
+    # ⚠️ Fable 은 IAM 만으로 호출되지 않는다: 실행 계정의 요청 리전 데이터 보존 모드가
+    #    aws_review 여야 한다(0042 docstring — PUT https://bedrock.<region>.amazonaws.com/data-retention).
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-*",
     # Global cross-region inference profiles (application 이 호출하는 엔트리포인트)
     "arn:aws:bedrock:*::inference-profile/global.anthropic.claude-*",
     "arn:aws:bedrock:*:*:inference-profile/global.anthropic.claude-*",

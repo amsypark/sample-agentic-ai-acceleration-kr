@@ -1187,7 +1187,7 @@ AccessDeniedException: User: arn:aws:sts::ACCT:assumed-role/.../gateway-proxy
 |---|---|---|
 | `global.anthropic.claude-sonnet-4-6` | Inference Profile (cross-region) | `arn:aws:bedrock:*::inference-profile/global.anthropic.claude-*` 또는 account-scoped `arn:aws:bedrock:*:ACCT:inference-profile/global.anthropic.claude-*` |
 | `apac.anthropic.claude-sonnet-4-20250514-v1:0` | Inference Profile (APAC) | `arn:aws:bedrock:ap-northeast-2::inference-profile/apac.anthropic.claude-*` |
-| `anthropic.claude-sonnet-4-6` | Foundation Model | `arn:aws:bedrock:ap-northeast-2::foundation-model/anthropic.claude-sonnet-4-*` |
+| `anthropic.claude-sonnet-4-6` | Foundation Model | `arn:aws:bedrock:*::foundation-model/anthropic.claude-*` (리전은 `*` — CRIS 는 실행 리전을 호출자가 고르지 못한다) |
 
 ### 해결
 
@@ -1195,10 +1195,9 @@ AccessDeniedException: User: arn:aws:sts::ACCT:assumed-role/.../gateway-proxy
 
 ```hcl
 bedrock_allowed_model_arns = [
-  # Foundation models (실제 추론 실행)
-  "arn:aws:bedrock:ap-northeast-2::foundation-model/anthropic.claude-opus-4-*",
-  "arn:aws:bedrock:ap-northeast-2::foundation-model/anthropic.claude-sonnet-4-*",
-  "arn:aws:bedrock:ap-northeast-2::foundation-model/anthropic.claude-haiku-4-*",
+  # Foundation models (실제 추론 실행) — 계열·세대별로 좁히면 신모델마다 조용한 AccessDenied 가 난다.
+  # 리전도 `*` 로 둔다: global./apac. 프로파일은 다른 리전(또는 리전 없는 ARN)에서 실행된다.
+  "arn:aws:bedrock:*::foundation-model/anthropic.claude-*",
 
   # Global cross-region inference profiles (application 진입점)
   "arn:aws:bedrock:*::inference-profile/global.anthropic.claude-*",

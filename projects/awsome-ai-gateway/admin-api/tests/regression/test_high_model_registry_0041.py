@@ -10,7 +10,7 @@
    입력의 0.05배다(다른 모델은 0.1배). Haiku 5.5 의 long 은 5배이고 임계는 100K 다.
 3. **IAM 이 등록된 모든 모델을 덮는다.** DB 행만으로는 호출되지 않는다(0027 의 Claude 5
    AccessDenied). terraform 의 ``bedrock_allowed_model_arns`` 가 각 모델의 inference-profile
-   과 foundation-model ARN 을 **둘 다** 허용하는지, 그리고 fable 은 여전히 막는지 본다.
+   과 foundation-model ARN 을 **둘 다** 허용하는지 본다(Fable 은 0042 가 연다 — 그 테스트 참고).
 4. **재실행·선등록에 안전하다.** 단가 INSERT 가 열린 행이 있으면 건너뛰고(0034 부분 유니크),
    alias 가 우리 모델일 때만 붙는다.
 5. **downgrade 가 FK 자식까지 정리한다.**
@@ -280,15 +280,6 @@ def test_iam_allows_every_0041_model_on_both_resources(tf):
     # OpenAI 호환 엔드포인트는 project 리소스도 검사한다(실측: 없으면 gpt-5.6 까지 401).
     project = "arn:aws:bedrock:us-east-2:123456789012:project/default"
     assert _allowed(project, pats), f"{tf.parent.name}: {project} 가 없다 → runtime 평면 전부 401"
-
-
-@pytest.mark.parametrize("tf", _TF_ENVS, ids=lambda p: p.parent.name)
-def test_iam_still_blocks_fable(tf):
-    pats = _allowed_arns(tf)
-    for fm in ("anthropic.claude-fable-5", "anthropic.claude-fable-5-1"):
-        for r in _CLAUDE_FM_REGIONS:
-            arn = f"arn:aws:bedrock:{r}::foundation-model/{fm}"
-            assert not _allowed(arn, pats), f"{tf.parent.name}: {arn} 가 열렸다"
 
 
 # --- 실제 PostgreSQL 상태 증명 -----------------------------------------------

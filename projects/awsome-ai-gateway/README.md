@@ -87,6 +87,7 @@ alias 를 해석하고(Redis 300s 캐시) `status='INACTIVE'` 로만 차단합�
 
 | 계열 | alias | 백엔드 엔트리포인트 | 등록 |
 |------|-------|--------------------|------|
+| Claude Fable | `claude-fable-5`, `claude-fable-5-1` | `global.anthropic.claude-fable-5{,-1}` | migration `0042` |
 | Claude 5.5 | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | `global.anthropic.claude-{opus,sonnet,haiku}-5-5` | migration `0041` |
 | Claude 5 | `claude-opus-5`, `claude-sonnet-5` | `global.anthropic.claude-{opus,sonnet}-5` | migration `0027` |
 | Claude 4.x | `claude-opus-4-*`, `claude-sonnet-4-*`, `claude-haiku-4-5` | `global.anthropic.claude-*` | baseline~`0004` |
@@ -97,7 +98,10 @@ alias 를 해석하고(Redis 300s 캐시) `status='INACTIVE'` 로만 차단합�
 
 - codex 의 기본 모델은 `0028` 에서 `codex-gpt`(5.5) → **`codex-gpt-5.6-terra`** 로 전환됩니다.
   적용 후 `routing_profile:codex` Redis 캐시를 지우거나 TTL(300s) 을 기다려야 반영됩니다.
-- **Fable 5 는 의도적으로 미등록**입니다 — ap-northeast-2 에 inference profile 이 없습니다.
+- **Fable 5 / 5.1 은 계정 설정이 있어야 호출됩니다.** 요청을 실행하는 계정의 요청 리전에서 Bedrock
+  데이터 보존 모드를 `aws_review` 로 켜야 합니다(`PUT https://bedrock.<region>.amazonaws.com/data-retention`).
+  켜지 않으면 400 입니다. 켜면 Fable 트래픽은 최대 30일 보존되고 AWS 가 검토할 수 있습니다(다른 모델은 그대로).
+  cross-account 클라이언트는 그 계정도 켜야 합니다 — 자세한 내용은 migration `0042` docstring.
 - bedrock-runtime 의 OpenAI 호환 엔드포인트(`gpt-5.6-*`, `gpt-6*`)는 IAM 이 `project/default` 리소스도
   허용해야 합니다. 없으면 모델 ARN 이 다 허용돼 있어도 401 입니다(`bedrock_allowed_model_arns` 주석 참고).
 - GPT-6 Astra · 6.1 Sol 의 `service_tier: "ultrafast"`(Standard 의 6배)는 게이트웨이가 400 으로 거절합니다.
