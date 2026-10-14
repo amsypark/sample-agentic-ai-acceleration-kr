@@ -456,7 +456,7 @@ gatewayProxy:
 
   # ⚠️ 이 값을 늘려도 SIGTERM 뒤의 SSE 는 살아남지 않는다 — uvicorn graceful shutdown 이 진행 중
   #    스트림을 즉시 끊는다. 스트림이 끝날 수 있는 창은 preStop sleep(15s, 템플릿 주석 참조)이고,
-  #    이 값은 preStop + lifespan 셧다운(회계 drain 최대 12s + flush)이 들어갈 상한이다.
+  #    이 값은 preStop + lifespan 셧다운(회계 drain 최대 12.5s + flush)이 들어갈 상한이다.
   terminationGracePeriodSeconds: 60
 
   livenessProbe:

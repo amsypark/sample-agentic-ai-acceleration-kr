@@ -92,8 +92,8 @@ spec:
           #      클라이언트는 종결 이벤트 없는 EOF 를 받는다(회귀 테스트:
           #      gateway-proxy tests/regression/test_critical_stream_disconnect_ledger_gap.py).
           #    · 잘린 턴의 회계는 drain 이 지금까지 생성된 출력(역산)과 프롬프트(추정)로 마무리하고,
-          #      lifespan 셧다운이 그것을 기다린다(최대 10s + 2s, services/bg_tasks.py drain).
-          #    더 긴 스트림을 살리려면 이 sleep 을 늘린다. 단 sleep + 셧다운(≤12s) 이
+          #      lifespan 셧다운이 그것을 기다린다(최대 12.5s, services/bg_tasks.py drain).
+          #    더 긴 스트림을 살리려면 이 sleep 을 늘린다. 단 sleep + 셧다운(≤12.5s) 이
           #    terminationGracePeriodSeconds 안에 들어가야 한다(values.gatewayProxy).
           lifecycle:
             preStop:
