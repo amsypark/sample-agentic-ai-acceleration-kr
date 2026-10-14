@@ -14,7 +14,10 @@ Two credential paths, mirroring :class:`~app.services.mantle_credentials.MantleC
 * cross-account (``role_arn`` set) — STS AssumeRole, creds cached ~1h. A failed AssumeRole is
   remembered for ``PROFILE_FAILURE_BACKOFF`` seconds per (role, ExternalId, session name): until
   then requests for that key fail at once (the adapter's usual 502) instead of each calling STS
-  again behind the lock and waiting out its timeout.
+  again behind the lock and waiting out its timeout. Cached credentials with more than
+  ``STALE_SERVE_MIN`` seconds left keep signing while a refresh is in flight, after a refresh
+  fails, and during that memory; a retry in flight after the memory is waited for at most
+  ``PROFILE_RETRY_WAIT`` seconds.
 
 It vends SIGNATURES where the Mantle broker vends BEARER TOKENS; the duplication of the
 assume+cache block is deliberate. Folding both into one broker would mean editing the
@@ -44,6 +47,7 @@ from botocore.credentials import Credentials
 
 from app.services.account_credentials import (
     SESSION_NAME_RUNTIME,
+    STALE_SERVE_MIN,
     AccountCredentialsUnavailable,
     ProfileAssumeBackoff,
     ProfileFailureMemory,
@@ -159,8 +163,20 @@ class SigV4Signer:
         cached = self._creds.get(key)
         if cached and cached.expires_at - _CRED_REFRESH_SKEW > self._now():
             return cached.creds
-        if self._profile_failures.blocked(key):
-            raise ProfileAssumeBackoff(role_arn)
+        # 갱신(또는 첫 assume) 차례다. 그 키의 AssumeRole 이 방금 실패했거나(기억 5초) 그 키의 STS
+        # 호출이 진행 중이면 STS 도 lock 도 기다리지 않는다 — native 와 같은 규칙
+        # (BedrockAccountClientProvider.credentials): 1분 넘게 남은 캐시 자격증명이면 그것으로
+        # 서명하고, 없으면 기억이 끝난 뒤의 재시도를 잠깐(PROFILE_RETRY_WAIT) 기다린 뒤 실패한다.
+        blocked = self._profile_failures.blocked(key)
+        if blocked or self._profile_failures.in_flight(key):
+            usable = self._usable(key)
+            if usable is None and blocked:
+                await self._profile_failures.wait_for_retry(key)
+                usable = self._usable(key)
+                if usable is None:
+                    raise ProfileAssumeBackoff(role_arn)
+            if usable is not None:
+                return usable.creds
         async with self._lock:
             now = self._now()
             cached = self._creds.get(key)
@@ -172,14 +188,39 @@ class SigV4Signer:
                     f"{role_arn} for the cross-account runtime path"
                 )
             if self._profile_failures.blocked(key):  # lock 을 기다리는 사이 앞 요청이 실패했다
-                raise ProfileAssumeBackoff(role_arn)
-            with self._profile_failures.attempt(key):
-                creds, expires_at = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: self._assume(role_arn, external_id)
+                usable = self._usable(key)
+                if usable is None:
+                    raise ProfileAssumeBackoff(role_arn)
+                return usable.creds
+            try:
+                with self._profile_failures.attempt(key):
+                    creds, expires_at = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: self._assume(role_arn, external_id)
+                    )
+            except Exception:
+                # 갱신 실패 — 쓸 수 있는지는 실패한 **지금** 다시 본다(native 와 같다).
+                usable = self._usable(key)
+                if usable is None:
+                    raise
+                logger.warning(
+                    "sigv4_xacct_refresh_failed_serving_cached",
+                    role_arn=role_arn,
+                    seconds_left=int(usable.expires_at - self._now()),
                 )
+                return usable.creds
             self._creds[key] = _CachedCreds(creds=creds, expires_at=expires_at)
             logger.info("sigv4_xacct_creds_assumed", role_arn=role_arn)
             return creds
+
+    def _usable(self, key: tuple) -> _CachedCreds | None:
+        """1분 넘게 남은 캐시 자격증명(STALE_SERVE_MIN) — STS 를 건너뛰거나 갱신이 실패했을 때 쓴다.
+
+        만료됐거나 곧 만료될 자격증명은 돌려주지 않는다.
+        """
+        cached = self._creds.get(key)
+        if cached and cached.expires_at - STALE_SERVE_MIN > self._now():
+            return cached
+        return None
 
     def _assume(self, role_arn: str, external_id: Optional[str]) -> tuple[Credentials, float]:
         kwargs: dict = {

@@ -11,10 +11,12 @@ alias 별 대상 계정(0043/0044) 이후 이 클래스는 **alias 계정 자격
     (RoleSessionName ``gw-bedrock-xacct``, 1h, ExternalId), 만료 300s 전 재빌드, 실패는 raise 해
     호출자(BedrockAdapter._get_client)가 in-account 로 투명 폴백한다.
     실패는 ``PROFILE_FAILURE_BACKOFF``(5초)만 기억한다(``ProfileFailureMemory``, alias 의
-    ``_failures`` 와 따로다). 그 동안 이 경로의 요청은 STS 를 부르지도, 진행 중인 재시도를
-    기다리지도 않고 곧바로 in-account 로 간다 — STS 가 응답 없이 멈춰도 줄 선 요청이 각자
-    타임아웃을 차례로 기다리지 않는다. 이 경로의 실패는 alias 의 30초 기억에 쓰지 않는다 — 같은
-    역할을 고른 alias 의 요청이 이 경로의 일시 실패 때문에 500 이 되지 않는다.
+    ``_failures`` 와 따로다). 그 동안 이 경로의 요청은 STS 를 부르지 않고 곧바로 in-account 로
+    가고, 기억이 끝난 뒤의 재시도는 ``PROFILE_RETRY_WAIT``(1초)까지만 기다린다 — STS 가 응답 없이
+    멈춰도 줄 선 요청이 각자 타임아웃을 차례로 기다리지 않는다. 1분 넘게 남은 캐시 자격증명이
+    있으면(갱신 창) 기억 안에서도, 갱신이 진행 중일 때도 그것을 쓴다. 이 경로의 실패는 alias 의
+    30초 기억에 쓰지 않는다 — 같은 역할을 고른 alias 의 요청이 이 경로의 일시 실패 때문에 500 이
+    되지 않는다.
   * ``get_account_client(target, region)`` — alias 계정의 native 호출.
   * ``credentials(target, session_name=...)`` — alias 계정의 runtime(SigV4)·Mantle(bearer) 서명.
     ``(자격증명, 그 만료)`` 를 한 lock 안에서 함께 돌려준다 — 만료를 따로 읽으면 그 사이 다른
@@ -53,6 +55,7 @@ from botocore.credentials import Credentials
 
 from app.services.account_credentials import (
     SESSION_NAME_NATIVE,
+    STALE_SERVE_MIN,
     AccountCredentialsUnavailable,
     AccountTarget,
     ProfileFailureMemory,
@@ -67,8 +70,8 @@ _CLIENT_REFRESH_SKEW = 300       # creds 하드만료 이 초 전에 재assume �
 #: 운영자는 재시작 없이 30초 안에 동작을 봐야 한다.
 FAILURE_BACKOFF = 30
 #: 갱신이 실패해도 캐시된 자격증명을 계속 쓰는 최소 잔여 시간. 이보다 짧으면 그 자격증명으로 시작한
-#: 호출(긴 스트림 포함)이 도중에 만료될 수 있어 실패로 돌려준다.
-_STALE_SERVE_MIN = 60
+#: 호출(긴 스트림 포함)이 도중에 만료될 수 있어 실패로 돌려준다. 세 경로가 같은 값이다.
+_STALE_SERVE_MIN = STALE_SERVE_MIN
 #: boto3 기본 세션의 client 생성 직렬화(모듈 docstring). 빌드는 키마다 시간당 한 번꼴이라 싸다.
 _BUILD_LOCK = threading.Lock()
 
@@ -145,10 +148,23 @@ class BedrockAccountClientProvider:
         클라이언트, SigV4Signer 의 세션, Mantle 브로커의 매 mint 새 세션)가 그대로 맡는다.
         """
         key: _CredKey = (target.role_arn, target.external_id or "", session_name)
-        # 프로필 경로: 그 키의 AssumeRole 이 방금 실패했거나 그 재시도가 진행 중이면 lock 뒤에 줄
-        # 서지 않는다 — 줄 서면 STS 가 멈춰 있는 동안 그 재시도의 타임아웃을 통째로 기다린다.
-        if not remember_failure and self._profile_failures.blocked(key):
-            return self._profile_cached_or_raise(key, target)
+        # 프로필 경로: 그 키의 AssumeRole 이 방금 실패했거나(기억 5초) 그 키의 STS 호출(갱신·
+        # 재시도)이 진행 중이면 lock 뒤에 줄 서지 않는다 — 줄 서면 STS 가 멈춰 있는 동안 그 호출의
+        # 타임아웃을 통째로 기다린다.
+        #   * 1분 넘게 남은 캐시 자격증명이 있으면 그것(_profile_cached_or_raise 와 같은 규칙).
+        #     갱신이 진행 중일 때도다 — 처음 갱신이 멈춘 STS 에 걸려도 다른 요청은 기다리지 않는다.
+        #   * 없고 기억이 끝난 뒤의 재시도가 진행 중이면 그 결과를 잠깐 기다린다
+        #     (PROFILE_RETRY_WAIT). 그래도 없으면 실패 — 호출자가 in-account 로 폴백한다.
+        #   * 실패한 적 없는 첫 assume 이 진행 중이고 쓸 것이 없으면 지금처럼 그것을 기다린다.
+        if not remember_failure:
+            blocked = self._profile_failures.blocked(key)
+            if blocked or self._profile_failures.in_flight(key):
+                cached = self._creds.get(key)
+                if cached and cached.expires_at - _STALE_SERVE_MIN > self._now():
+                    return cached.creds, cached.expires_at
+                if blocked:
+                    await self._profile_failures.wait_for_retry(key)
+                    return self._profile_cached_or_raise(key, target)
         async with self._locks.setdefault(("creds", *key), asyncio.Lock()):
             now = self._now()
             cached = self._creds.get(key)

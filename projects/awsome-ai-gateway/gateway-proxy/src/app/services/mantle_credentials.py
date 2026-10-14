@@ -12,6 +12,7 @@ from botocore.credentials import Credentials
 from app.schemas.routing import RoutingProfileSchema
 from app.services.account_credentials import (
     SESSION_NAME_MANTLE,
+    STALE_SERVE_MIN,
     AccountCredentialsUnavailable,
     AccountTarget,
     ProfileAssumeBackoff,
@@ -64,6 +65,10 @@ class MantleCredentialBroker:
     AssumeRole of the profile's role is remembered for ``PROFILE_FAILURE_BACKOFF``
     seconds per (role, ExternalId, ``gw-mantle``): until then those requests fail at
     once (the adapter's usual 502) instead of each calling STS again behind the lock.
+    Cached credentials with more than ``STALE_SERVE_MIN`` seconds left keep minting
+    bearers while a refresh is in flight, after a refresh fails, and during that memory
+    (same rule as ``SigV4Signer``); a retry in flight after the memory is waited for at
+    most ``PROFILE_RETRY_WAIT`` seconds.
 
     alias 별 대상 계정(0043): ``bearer_token(profile, account=AccountTarget)`` 이면 프로필
     계정보다 **우선해** 그 계정으로 mint 한다. 자격증명은 세 경로가 공유하는
@@ -132,8 +137,23 @@ class MantleCredentialBroker:
         cached_bearer = self._bearers.get(bearer_key)
         if cached_bearer and cached_bearer.expires_at > self._now():
             return cached_bearer.token
-        if profile_key is not None and self._profile_failures.blocked(profile_key):
-            raise ProfileAssumeBackoff(profile.account_role_arn)
+        if profile_key is not None:
+            # 그 키의 AssumeRole 이 방금 실패했거나(기억 5초) 그 키의 STS 호출이 진행 중이면 STS 도
+            # lock 도 기다리지 않는다 — SigV4Signer._resolve_creds 와 같은 규칙: 1분 넘게 남은 캐시
+            # 자격증명이면 그것으로 mint 하고, 없으면 기억이 끝난 뒤의 재시도를 잠깐
+            # (PROFILE_RETRY_WAIT) 기다린 뒤 실패한다(어댑터의 502).
+            blocked = self._profile_failures.blocked(profile_key)
+            if blocked or self._profile_failures.in_flight(profile_key):
+                usable = self._usable(profile_key)
+                if usable is None and blocked:
+                    await self._profile_failures.wait_for_retry(profile_key)
+                    usable = self._usable(profile_key)
+                    if usable is None:
+                        raise ProfileAssumeBackoff(profile.account_role_arn)
+                if usable is not None:
+                    return await self._mint(
+                        bearer_key, usable.creds, usable.expires_at, profile.region, self._now()
+                    )
         async with self._lock:
             now = self._now()
             cached_bearer = self._bearers.get(bearer_key)
@@ -147,14 +167,28 @@ class MantleCredentialBroker:
                 creds = await asyncio.get_running_loop().run_in_executor(None, self._in_account_creds)
                 cred_expiry = now + _ASSUME_DURATION
 
-            token = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: BedrockTokenGenerator().get_token(creds, profile.region),
-            )
-            # Never let the bearer outlive the underlying creds it was minted from.
-            bearer_expiry = min(now + _BEARER_TTL, cred_expiry - _BEARER_CRED_SKEW)
-            self._bearers[bearer_key] = _CachedBearer(token=token, expires_at=bearer_expiry)
-            return token
+            return await self._mint(bearer_key, creds, cred_expiry, profile.region, now)
+
+    async def _mint(self, bearer_key, creds, cred_expiry: float, region: str, now: float) -> str:
+        """``creds`` 로 bearer 를 만들어 ``bearer_key`` 에 캐시한다."""
+        token = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: BedrockTokenGenerator().get_token(creds, region),
+        )
+        # Never let the bearer outlive the underlying creds it was minted from.
+        bearer_expiry = min(now + _BEARER_TTL, cred_expiry - _BEARER_CRED_SKEW)
+        self._bearers[bearer_key] = _CachedBearer(token=token, expires_at=bearer_expiry)
+        return token
+
+    def _usable(self, key: tuple) -> _CachedCreds | None:
+        """1분 넘게 남은 캐시 자격증명(STALE_SERVE_MIN) — STS 를 건너뛰거나 갱신이 실패했을 때 쓴다.
+
+        만료됐거나 곧 만료될 자격증명은 돌려주지 않는다.
+        """
+        cached = self._creds.get(key)
+        if cached and cached.expires_at - STALE_SERVE_MIN > self._now():
+            return cached
+        return None
 
     async def _account_bearer(self, profile: RoutingProfileSchema, account: AccountTarget) -> str:
         """alias 계정으로 mint 한 bearer. region 은 프로필 그대로(bearer 는 region-bound).
@@ -211,7 +245,10 @@ class MantleCredentialBroker:
             return cached.creds
 
         if self._profile_failures.blocked(key):  # lock 을 기다리는 사이 앞 요청이 실패했다
-            raise ProfileAssumeBackoff(role_arn)
+            usable = self._usable(key)
+            if usable is None:
+                raise ProfileAssumeBackoff(role_arn)
+            return usable.creds
         kwargs = {
             "RoleArn": role_arn,
             "RoleSessionName": "gw-mantle",
@@ -220,10 +257,23 @@ class MantleCredentialBroker:
         if external_id:
             kwargs["ExternalId"] = external_id
 
-        with self._profile_failures.attempt(key):
-            resp = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._sts.assume_role(**kwargs)
+        try:
+            with self._profile_failures.attempt(key):
+                resp = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._sts.assume_role(**kwargs)
+                )
+        except Exception:
+            # 갱신 실패 — 쓸 수 있는지는 실패한 **지금** 다시 본다(native 와 같다). 그 자격증명의
+            # 만료는 호출자가 같은 캐시 항목에서 읽는다 — bearer 가 그보다 오래 살지 않는다.
+            usable = self._usable(key)
+            if usable is None:
+                raise
+            logger.warning(
+                "mantle_xacct_refresh_failed_serving_cached",
+                role_arn=role_arn,
+                seconds_left=int(usable.expires_at - self._now()),
             )
+            return usable.creds
         c = resp["Credentials"]
         creds = Credentials(c["AccessKeyId"], c["SecretAccessKey"], c["SessionToken"])
         expires_at = c["Expiration"].timestamp()

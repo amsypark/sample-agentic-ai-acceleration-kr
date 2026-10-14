@@ -47,6 +47,7 @@ alias 계정이 없는 요청에만 걸린다.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -105,10 +106,26 @@ class AccountCredentialsUnavailable(RuntimeError):
 #: * 짧게 둔다. claude-code 는 이 동안 파드 계정으로 청구되고 runtime·Mantle 은 실패하므로, 복구된
 #:   STS(또는 고친 신뢰 정책)는 최대 5초 안에 다시 쓰여야 한다. 30초는 그 비용이 alias 의 500 뿐인
 #:   경로의 값이다.
-#: * 기억이 끝나면 다음 요청 **하나만** STS 를 다시 부른다. 그 재시도가 진행 중이면 같은 키의 다른
-#:   요청은 그것을 기다리지 않고 폴백한다(:meth:`ProfileFailureMemory.blocked`). 그래서 STS 가 응답
-#:   없이 멈춰 있어도 (5초 + 한 번의 STS 시간)마다 요청 하나만 기다린다.
+#: * 기억이 끝나면 다음 요청 **하나만** STS 를 다시 부른다. 그 재시도가 진행 중일 때 온 같은
+#:   키의 다른 요청은 그 결과를 최대 :data:`PROFILE_RETRY_WAIT` 초 기다리고, 그래도 끝나지
+#:   않으면 폴백한다(:meth:`ProfileFailureMemory.wait_for_retry`). 그래서 STS 가 응답 없이
+#:   멈춰 있어도 (5초 + 한 번의 STS 시간)마다 요청 하나만 STS 를 기다리고, 나머지는 길어야
+#:   그만큼 더 기다린다.
+#: * 1분 넘게 남은 캐시 자격증명이 있으면(갱신 창), 기억 안이거나 갱신이 진행 중일 때 그것으로
+#:   서명한다(:data:`STALE_SERVE_MIN`) — STS 도, 진행 중인 갱신도 기다리지 않는다.
 PROFILE_FAILURE_BACKOFF = 5.0
+
+#: 기억이 끝난 뒤의 재시도를 같은 키의 다른 요청이 기다리는 상한(초). 정상 AssumeRole 은
+#: 수십~수백 밀리초라 복구된 STS 의 재시도는 이 안에 끝나고, 그 사이 온 요청도 프로필 계정으로
+#: 간다 — 예전에는 재시도가 끝나기 전에 온 요청이 전부 폴백했다(native 는 파드 계정,
+#: runtime·Mantle 은 502). STS 가 아직 멈춰 있으면 이만큼만 더 기다리고 폴백한다.
+PROFILE_RETRY_WAIT = 1.0
+
+#: 갱신 창(만료 300초 전부터)에서 캐시된 자격증명으로 계속 서명할 수 있는 최소 잔여 시간(초).
+#: STS 를 건너뛸 때(실패 기억 안, 갱신 진행 중)와 갱신이 실패했을 때 쓴다. 이보다 짧으면 그
+#: 자격증명으로 시작한 호출(긴 스트림 포함)이 도중에 만료될 수 있어 쓰지 않는다. 만료된 자격증명은
+#: 어떤 경우에도 쓰지 않는다. 세 경로(native·runtime·Mantle)와 alias 경로가 같은 값이다.
+STALE_SERVE_MIN = 60
 
 
 class ProfileAssumeBackoff(RuntimeError):
@@ -140,18 +157,42 @@ class ProfileFailureMemory:
         self._now = now
         self._until: dict[tuple, float] = {}
         self._in_flight: dict[tuple, int] = {}
+        #: 키마다, 진행 중인 STS 호출이 끝나면 서는 이벤트(:meth:`wait_for_retry`).
+        self._done: dict[tuple, asyncio.Event] = {}
 
     def blocked(self, key: tuple) -> bool:
-        """True = STS 를 부르지도, 진행 중인 STS 호출을 기다리지도 말고 그 경로의 폴백으로 간다.
+        """True = STS 를 부르지도, 진행 중인 STS 호출 뒤에 줄 서지도 않는다.
 
         마지막 시도가 실패였을 때만 True 다. 기억하는 동안(실패 시각 + PROFILE_FAILURE_BACKOFF)
-        이거나, 기억은 끝났지만 그 키의 STS 재시도가 지금 진행 중일 때. 성공하면 기억을 지우므로,
-        처음 호출이나 성공한 뒤의 갱신은 지금처럼 진행 중인 호출을 기다린다(single-flight).
+        이거나, 기억은 끝났지만 그 키의 STS 재시도가 지금 진행 중일 때. 호출자는 쓸 수 있는 캐시
+        자격증명이 있으면 그것을 쓰고, 없으면 재시도를 잠깐 기다린 뒤(:meth:`wait_for_retry`)
+        폴백한다. 성공하면 기억을 지우므로 처음 호출은 지금처럼 진행 중인 호출을 기다린다
+        (single-flight).
         """
         until = self._until.get(key)
         if until is None:
             return False
         return until > self._now() or self._in_flight.get(key, 0) > 0
+
+    def in_flight(self, key: tuple) -> bool:
+        """그 키의 STS 호출이 지금 진행 중이다(첫 assume·갱신·재시도 무엇이든)."""
+        return self._in_flight.get(key, 0) > 0
+
+    async def wait_for_retry(self, key: tuple) -> None:
+        """기억이 끝난 뒤의 재시도가 진행 중이면 끝나기를 최대 PROFILE_RETRY_WAIT 초 기다린다.
+
+        기억 안이거나(실패 직후 5초 — 아무도 STS 를 부르지 않는다) 진행 중인 호출이 없으면 곧바로
+        돌아온다. 결과는 돌려주지 않는다 — 호출자가 자기 캐시를 다시 본다(재시도가 성공했으면 새
+        자격증명이 있다).
+        """
+        done = self._done.get(key)
+        until = self._until.get(key)
+        if done is None or until is None or until > self._now():
+            return
+        try:
+            await asyncio.wait_for(done.wait(), PROFILE_RETRY_WAIT)
+        except TimeoutError:
+            pass
 
     @contextmanager
     def attempt(self, key: tuple):
@@ -160,7 +201,10 @@ class ProfileFailureMemory:
         취소(``CancelledError``, 클라이언트 연결 끊김 등)는 실패로 치지 않는다 — STS 가 실패한 것이
         아니다.
         """
-        self._in_flight[key] = self._in_flight.get(key, 0) + 1
+        started = self._in_flight.get(key, 0)
+        self._in_flight[key] = started + 1
+        if not started:
+            self._done[key] = asyncio.Event()
         try:
             yield
         except Exception:
@@ -174,6 +218,7 @@ class ProfileFailureMemory:
                 self._in_flight[key] = left
             else:
                 del self._in_flight[key]
+                self._done.pop(key).set()
 
 
 @dataclass(frozen=True)

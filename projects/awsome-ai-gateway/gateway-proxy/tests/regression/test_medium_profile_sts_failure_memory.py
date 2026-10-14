@@ -16,8 +16,12 @@
 * 세 프로필 경로: 실패를 ``PROFILE_FAILURE_BACKOFF``(5초) 동안 (역할, ExternalId, 세션 이름)마다
   기억한다. 시계는 실패를 기록할 때 읽는다. 그 동안 새 요청과 lock 뒤에서 기다리던 요청은 STS 를
   부르지 않고 그 경로의 오늘 폴백으로 간다(native = 파드 계정, runtime·Mantle = 502). 기억이
-  끝나면 다음 요청 하나가 다시 부르고, 그 재시도가 진행 중인 동안 같은 키의 다른 요청은 그것을
-  기다리지 않는다.
+  끝나면 다음 요청 하나가 다시 부르고, 그 재시도가 진행 중일 때 온 같은 키의 다른 요청은 그
+  결과를 최대 ``PROFILE_RETRY_WAIT``(1초) 기다린다 — 복구된 STS 면 모두 프로필 계정으로 가고,
+  멈춘 STS 면 그 뒤 폴백한다.
+* 갱신 창(만료 300초 전부터)에서 1분 넘게 남은 캐시 자격증명은, 기억 안이거나 갱신이 진행
+  중이거나 갱신이 실패했을 때 그대로 쓴다(세 경로가 같은 규칙). 1분 이하로 남았거나 만료된
+  자격증명은 쓰지 않는다.
 * alias 경로는 그대로다 — 500 + 실패 시각부터 30초.
 
 대역은 STS 하나뿐이다(제어 시계를 STS 안에서 쓴 만큼 민다). 프로바이더·서명기·브로커·어댑터는
@@ -43,6 +47,7 @@ from app.services import mantle_credentials as mc
 from app.services.account_credentials import (
     ACCOUNT_UNAVAILABLE_STATUS,
     PROFILE_FAILURE_BACKOFF,
+    PROFILE_RETRY_WAIT,
     SESSION_NAME_NATIVE,
     AccountCredentialsUnavailable,
     AccountTarget,
@@ -221,25 +226,138 @@ async def test_the_memory_runs_from_the_failure_and_the_next_request_retries(pat
 
 
 @pytest.mark.parametrize("path", _PATHS)
-async def test_requests_do_not_wait_for_a_retry_after_a_failure(path, monkeypatch):
-    """기억이 끝나 한 요청이 다시 STS 를 부르는 중(응답 없음)일 때 같은 키의 다른 요청은 그것을
-    기다리지 않고 폴백한다 — 그렇지 않으면 STS 가 멈춰 있는 내내 재시도마다 줄이 다시 선다."""
+async def test_under_a_hung_sts_no_request_waits_longer_than_the_bound_for_a_retry(
+    path, monkeypatch
+):
+    """기억이 끝나 한 요청이 다시 STS 를 부르는 중(응답 없음)일 때 같은 키의 다른 요청은 그 재시도를
+    ``PROFILE_RETRY_WAIT`` 초까지만 기다리고 폴백한다 — STS 를 부르지도, 재시도의 타임아웃을
+    기다리지도 않는다. 그렇지 않으면 STS 가 멈춰 있는 내내 재시도마다 줄이 다시 선다. 재시도하는
+    요청 하나만 STS 시간을 쓴다(STS 클라이언트 타임아웃이 그 상한이다)."""
     clock = [1000.0]
     sts = _HungSTS(clock)
     p = _Path(path, sts, monkeypatch)
     assert await p.request() == "fallback"
     clock[0] = 1035.0 + PROFILE_FAILURE_BACKOFF
     sts.gate = threading.Event()
+
+    async def _timed():
+        started = time.monotonic()
+        got = await p.request()
+        return got, time.monotonic() - started
+
     try:
         retry = asyncio.create_task(p.request())
         await _until(lambda: len(sts.calls) == 2)
-        late = await asyncio.wait_for(p.request(), timeout=1.0)
-        assert late == "fallback"
+        late = await asyncio.wait_for(
+            asyncio.gather(*(_timed() for _ in range(3))), timeout=PROFILE_RETRY_WAIT + 2
+        )
+        assert [got for got, _ in late] == ["fallback"] * 3
+        waited = [round(s, 2) for _, s in late]
+        bound = PROFILE_RETRY_WAIT + 0.5
+        assert all(PROFILE_RETRY_WAIT * 0.9 <= s <= bound for s in waited), waited
         assert not retry.done(), "재시도는 아직 STS 안에 있다"
     finally:
         sts.gate.set()
     assert await retry == "fallback"
     assert len(sts.calls) == 2, f"재시도 중에 다른 요청이 STS 를 불렀다: {sts.calls}"
+
+
+@pytest.mark.parametrize("path", _PATHS)
+async def test_on_recovery_requests_that_arrive_during_the_retry_wait_for_it(path, monkeypatch):
+    """STS 가 돌아온 뒤의 재시도 중에 온 같은 키의 요청은 그 재시도를 기다려 모두 프로필 계정으로
+    간다(STS 는 재시도 한 번만). 예전에는 재시도가 끝나기 전에 온 요청이 전부 폴백했다 — native 는
+    파드 계정으로 청구되고 runtime·Mantle 은 502 였다."""
+    clock = [1000.0]
+    sts = _HungSTS(clock)
+    p = _Path(path, sts, monkeypatch)
+    assert await p.request() == "fallback"
+    clock[0] = 1035.0 + PROFILE_FAILURE_BACKOFF
+    sts.fail = False
+    sts.gate = threading.Event()
+    try:
+        retry = asyncio.create_task(p.request())
+        await _until(lambda: len(sts.calls) == 2)
+        during = [asyncio.create_task(p.request()) for _ in range(3)]
+        await asyncio.sleep(0.2)
+        assert not any(t.done() for t in during), "재시도를 잠깐 기다린다"
+    finally:
+        sts.gate.set()
+    assert await asyncio.gather(retry, *during) == ["account"] * 4
+    assert len(sts.calls) == 2, f"기다린 요청이 STS 를 불렀다: {sts.calls}"
+
+
+# 갱신 창: 1000 에 받은 자격증명은 4600 에 끝난다(1시간). 갱신은 4300 부터.
+_EXPIRY = 1000.0 + 3600
+
+
+@pytest.mark.parametrize("path", _PATHS)
+async def test_a_refresh_in_flight_does_not_hold_up_requests_with_usable_credentials(
+    path, monkeypatch
+):
+    """갱신 창(200초 남음)에서 한 요청의 갱신이 멈춘 STS 에 걸려 있는 동안, 같은 키의 다른 요청은
+    그 갱신을 기다리지 않고 캐시된 자격증명으로 곧바로 서명한다. 갱신이 실패하면 그 요청도 캐시로
+    간다(남은 시간이 1분을 넘는다). 예전에는 다른 요청이 lock 뒤에서 그 STS 호출을 통째로
+    기다렸다 — 세 경로 모두(native 도: 실패가 기록되기 전이라 "막힘" 이 아니었다)."""
+    clock = [1000.0]
+    sts = _HungSTS(clock)
+    sts.fail = False
+    p = _Path(path, sts, monkeypatch)
+    assert await p.request() == "account"
+    clock[0] = _EXPIRY - 200
+    sts.fail = True
+    sts.gate = threading.Event()
+    try:
+        refresh = asyncio.create_task(p.request())
+        await _until(lambda: len(sts.calls) == 2)
+        others = await asyncio.wait_for(
+            asyncio.gather(*(p.request() for _ in range(3))), timeout=0.5
+        )
+        assert others == ["account"] * 3
+        assert not refresh.done(), "갱신은 아직 STS 안에 있다"
+    finally:
+        sts.gate.set()
+    assert await refresh == "account"
+    assert len(sts.calls) == 2
+
+
+@pytest.mark.parametrize("path", _PATHS)
+async def test_a_failed_refresh_and_the_memory_after_it_serve_the_cached_credentials(
+    path, monkeypatch
+):
+    """갱신이 실패해도(35초 걸려 165초 남음) 그 요청은 캐시된 자격증명으로 서명하고, 그 뒤 기억 안의
+    요청도 STS 없이 캐시로 간다. 예전에 runtime·Mantle 은 둘 다 502 였다(native 는 이미 이랬다)."""
+    clock = [1000.0]
+    sts = _HungSTS(clock)
+    sts.fail = False
+    p = _Path(path, sts, monkeypatch)
+    assert await p.request() == "account"
+    clock[0] = _EXPIRY - 200
+    sts.fail = True
+    assert await p.request() == "account"
+    assert clock[0] == _EXPIRY - 200 + STS_SECONDS
+    clock[0] += 1.0
+    assert await p.request() == "account"
+    assert len(sts.calls) == 2, f"기억 안에서 STS 를 불렀다: {sts.calls}"
+
+
+@pytest.mark.parametrize("path", _PATHS)
+async def test_credentials_with_a_minute_or_less_left_are_never_served(path, monkeypatch):
+    """1분 이하로 남았거나 만료된 자격증명은 어떤 경우에도 쓰지 않는다 — 그 자격증명으로 시작한
+    호출(긴 스트림)이 도중에 만료된다. 61초 남았을 때 시작한 갱신이 1초 걸려 실패하면 남은 것은
+    정확히 60초라 폴백이고, 기억 안의 요청도, 만료 뒤의 재시도 실패도 폴백이다."""
+    clock = [1000.0]
+    sts = _HungSTS(clock, seconds=1.0)
+    sts.fail = False
+    p = _Path(path, sts, monkeypatch)
+    assert await p.request() == "account"
+    sts.fail = True
+    clock[0] = _EXPIRY - 61
+    assert await p.request() == "fallback"
+    clock[0] += 0.5
+    assert await p.request() == "fallback"
+    clock[0] = _EXPIRY + 100
+    assert await p.request() == "fallback"
+    assert len(sts.calls) == 3
 
 
 @pytest.mark.parametrize("path", _PATHS)
