@@ -56,6 +56,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from structlog.testing import capture_logs
 
 import app
@@ -86,6 +88,13 @@ REDIS_CLUSTER_URL = os.environ.get("REDIS_CLUSTER_URL")
 _MAX_TOKENS = 1000
 _SMALL_USAGE = TokenUsage(input_tokens=10, output_tokens=100, total_tokens=110)
 
+#: 실 Redis 클라이언트 설정. ⚠️ 재시도를 끈다 — redis-py 는 응답이 socket_timeout 뒤에 온 **직접**
+#: EVAL(예약 검사)을 다시 보내 서버에서 두 번 실행한다(실측: INCRBY 100 한 번이 200 이 됐다).
+#: 그러면 부하가 큰 머신에서 카운터가 조용히 틀려 로직 결함처럼 보인다(load average 150–300 에서
+#: ``…leaves_the_actual_tokens[cluster-partial]`` 가 한 번 실패한 것). 늦은 응답은 오류로 드러나야
+#: 한다. 30초는 그런 부하에서도 거의 넘지 않는다.
+_CLIENT_KW = {"socket_timeout": 30, "retry": Retry(NoBackoff(), 0)}
+
 
 def _client(kind: str):
     """실 Redis 클라이언트 — 운영과 같이 ``decode_responses`` 없이(bytes). env 가 없으면 skip."""
@@ -98,7 +107,7 @@ def _client(kind: str):
             )
         import redis.asyncio as aioredis
 
-        return aioredis.from_url(REDIS_PROOF_URL, socket_timeout=5)
+        return aioredis.from_url(REDIS_PROOF_URL, **_CLIENT_KW)
     if not REDIS_CLUSTER_URL:
         pytest.skip(
             "REDIS_CLUSTER_URL 미설정 — 진짜 Redis Cluster 필요(단일 노드는 CROSSSLOT 을 "
@@ -106,7 +115,7 @@ def _client(kind: str):
         )
     from redis.asyncio.cluster import RedisCluster
 
-    return RedisCluster.from_url(REDIS_CLUSTER_URL, socket_timeout=5)
+    return RedisCluster.from_url(REDIS_CLUSTER_URL, **_CLIENT_KW)
 
 
 @pytest.fixture(params=["single", "cluster"])
@@ -193,22 +202,32 @@ async def _reserve(monkeypatch, r, auth, *, user: bool, team: bool, max_tokens=_
         request_id=f"req-{uuid.uuid4().hex[:8]}",
     )
     assert rejected is None, "예약 단계에서 거부됐다 — 한도 설정을 확인"
-    return state, set(_of(await _cost_keyspace(r), auth))
+    return state, set(_of(await _cost_keyspace(r, auth), auth))
 
 
 def _text(raw) -> str:
     return raw.decode() if isinstance(raw, bytes) else str(raw)
 
 
-async def _cost_keyspace(r) -> dict[str, tuple[float, int]]:
-    """``rl:cost:*`` 전체 — {키: (값, TTL)}. 클러스터면 모든 primary 를 훑는다(scan_iter)."""
+async def _cost_keyspace(r, *auths: AuthContext) -> dict[str, tuple[float, int]]:
+    """이 시나리오 사용자·팀의 ``rl:cost:*`` — {키: (값, TTL)}. 클러스터면 모든 primary 를 훑는다.
+
+    SCAN 패턴을 시나리오의 id 로 좁힌다 — 같은 PROOF 실행의 다른 테스트(같은 Redis 를 쓰는 다른
+    실행도)가 남긴 키가 "TTL 없는 키·음수 없음" 단정을 오염시키지 않게. 정산이 다른 창·다른 스코프에
+    잘못 쓴 키도 같은 id 라 여전히 잡힌다.
+    """
     out: dict[str, tuple[float, int]] = {}
-    async for raw_key in r.scan_iter(match="rl:cost:*", count=500):
-        key = _text(raw_key)
-        raw = await r.get(key)
-        if raw is None:  # SCAN 과 GET 사이에 만료
-            continue
-        out[key] = (float(_text(raw)), int(await r.ttl(key)))
+    for auth in auths:
+        for pattern in (
+            f"rl:cost:user:{{{auth.user_id}}}:*",
+            f"rl:cost:team:{{{auth.team_id}}}:*",
+        ):
+            async for raw_key in r.scan_iter(match=pattern, count=500):
+                key = _text(raw_key)
+                raw = await r.get(key)
+                if raw is None:  # SCAN 과 GET 사이에 만료
+                    continue
+                out[key] = (float(_text(raw)), int(await r.ttl(key)))
     return out
 
 
@@ -243,7 +262,7 @@ async def _finalize(r, auth, state, usage: TokenUsage) -> None:
 
 
 async def _cleanup(r, auth: AuthContext) -> None:
-    for key in _of(await _cost_keyspace(r), auth):
+    for key in _of(await _cost_keyspace(r, auth), auth):
         await r.delete(key)
     for key in (
         f"budget:user:{{{auth.user_id}}}:*",
@@ -287,7 +306,7 @@ async def test_settle_adjusts_only_the_scopes_that_were_reserved(
     try:
         state, keys = await _reserve(monkeypatch, r, auth, user=user, team=team)
         assert len(keys) == 2 * (int(user) + int(team))
-        before = _of(await _cost_keyspace(r), auth)
+        before = _of(await _cost_keyspace(r, auth), auth)
         assert all(v[0] == pytest.approx(_reserved(state)) and v[1] > 0 for v in before.values())
 
         actual = float(calculate_cost(_SMALL_USAGE, _model()))
@@ -295,7 +314,7 @@ async def test_settle_adjusts_only_the_scopes_that_were_reserved(
         with capture_logs() as logs:
             await _finalize(r, auth, state, _SMALL_USAGE)
 
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(keyspace)
         after = _of(keyspace, auth)
         assert set(after) == keys, (
@@ -319,7 +338,7 @@ async def test_no_cost_limit_reserves_and_settles_nothing(real_redis, monkeypatc
         assert state["rate_limit_state"]["cost_reserved"] == Decimal("0")
         assert state["rate_limit_state"].get("cost_reserved_keys", ()) == ()
         await _finalize(r, auth, state, _SMALL_USAGE)
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(keyspace)
         assert _of(keyspace, auth) == {}
     finally:
@@ -356,7 +375,7 @@ async def test_settle_after_minute_and_hour_boundary_stays_in_the_reserved_windo
         actual = float(calculate_cost(_SMALL_USAGE, _model()))
         await _finalize(r, auth, state, _SMALL_USAGE)
 
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(keyspace)
         after = _of(keyspace, auth)
         assert set(after) == keys, f"다음 창에 키가 생겼다: {sorted(set(after) - keys)}"
@@ -399,7 +418,7 @@ async def test_an_extra_charge_after_the_reserved_window_lands_in_the_current_wi
         clock[0] = boundary + 0.5
         await _finalize(r, auth, state, big)
 
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(keyspace)
         after = _of(keyspace, auth)
         extra = actual - reserved
@@ -444,7 +463,7 @@ async def test_settle_after_the_reserved_cpm_key_expired_does_not_resurrect_it(
         actual = float(calculate_cost(_SMALL_USAGE, _model()))
         await _finalize(r, auth, state, _SMALL_USAGE)
 
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(keyspace)
         after = _of(keyspace, auth)
         assert set(after) == keys - cpm_keys, (
@@ -475,7 +494,7 @@ async def test_zero_usage_refund_returns_the_reserved_counters_to_exactly_zero(
         assert len(keys) == 2
         await _finalize(r, auth, state, TokenUsage())
 
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(keyspace)
         after = _of(keyspace, auth)
         assert set(after) == keys, (
@@ -511,7 +530,7 @@ async def test_extra_charge_lands_in_the_reserved_window_and_never_resurrects_an
         await _finalize(r, live, s_live, big)
         await _finalize(r, expired, s_exp, big)
 
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, live, expired)
         _assert_no_ttl_less_or_negative(keyspace)
         after_live = _of(keyspace, live)
         assert set(after_live) == k_live, sorted(after_live)
@@ -543,7 +562,7 @@ async def test_fallback_release_undoes_only_the_reserved_scope_exactly_once(
         captured = state["rate_limit_state"]
 
         await release_reservations(redis=r, state=state, auth_context=auth)
-        mid = await _cost_keyspace(r)
+        mid = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(mid)
         assert set(_of(mid, auth)) == keys
         assert all(v[0] == 0.0 for v in _of(mid, auth).values()), _of(mid, auth)
@@ -551,7 +570,7 @@ async def test_fallback_release_undoes_only_the_reserved_scope_exactly_once(
         await CostRecorder().finalize(
             r, auth, _model(), TokenUsage(), "req-captured", True, 1, rate_limit_state=captured
         )
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(keyspace)
         after = _of(keyspace, auth)
         assert set(after) == keys
@@ -578,7 +597,7 @@ async def test_legacy_state_without_reserved_keys_writes_no_cost_key(real_redis,
         with capture_logs() as logs:
             await _finalize(r, auth, state, _SMALL_USAGE)
 
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(keyspace)
         after = _of(keyspace, auth)
         assert set(after) == keys, (
@@ -671,7 +690,7 @@ async def test_a_negative_counter_left_by_the_old_settlement_is_clamped_and_coun
         with capture_logs() as logs:
             await _finalize(r, auth, state, TokenUsage())
 
-        keyspace = await _cost_keyspace(r)
+        keyspace = await _cost_keyspace(r, auth)
         _assert_no_ttl_less_or_negative(keyspace)
         assert all(v[0] == 0.0 for v in _of(keyspace, auth).values()), _of(keyspace, auth)
         assert [e["event"] for e in logs if e.get("event") == "cost_settle_clamped"] == [

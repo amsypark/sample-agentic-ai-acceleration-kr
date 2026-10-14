@@ -335,6 +335,10 @@ jobs:
       #    파라미터 그룹 family valkey7).
       # 노드 6개를 컨테이너 하나에 띄우고 127.0.0.1 로 알린다. 노드끼리는 컨테이너 안에서, 러너의
       # pytest 는 publish 한 포트로 같은 주소(127.0.0.1:7001-7006)에 닿는다.
+      # 이미지는 digest 로 고정한다 — `7.2` 태그는 패치 릴리스마다 움직여, 같은 커밋의 CI 가 다른
+      # 엔진에서 돌 수 있다. 이 digest 는 2026-10-15 의 `valkey/valkey:7.2`(= 7.2.14) 멀티아키
+      # index 다(linux/amd64 포함). 올릴 때는 `docker buildx imagetools inspect valkey/valkey:7.2`
+      # 의 Digest 로 바꾼다.
       - name: Start a Valkey 7.2 cluster (3 primaries + 3 replicas)
         env:
           CLUSTER_CONTAINER: proof-valkey-cluster
@@ -342,7 +346,9 @@ jobs:
           set -euo pipefail
           ports="7001 7002 7003 7004 7005 7006"
           docker run -d --name "$CLUSTER_CONTAINER" --tmpfs /data \
-            -p 127.0.0.1:7001-7006:7001-7006 valkey/valkey:7.2 sh -c "
+            -p 127.0.0.1:7001-7006:7001-7006 \
+            valkey/valkey:7.2@sha256:ef0f9fb533b1f06fb7aba6478d758ca1c077d49e2bcb2b4365a4ea7f50b6d42e \
+            sh -c "
               for p in $ports; do
                 valkey-server --port \$p --cluster-enabled yes \
                   --cluster-config-file /data/nodes-\$p.conf --cluster-node-timeout 5000 \
@@ -409,7 +415,7 @@ jobs:
           tail -30 /tmp/proof3.txt
           if [ "$status" -ne 0 ]; then exit "$status"; fi
           passed=$(grep -oE "[0-9]+ passed" /tmp/proof3.txt | tail -1 | grep -oE "[0-9]+" || echo 0)
-          # 로컬 실측 기준선: 177 passed, 0 skipped (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
+          # 로컬 실측 기준선: 197 passed, 0 skipped (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
           #   + long-context 티어 27: calculate_cost/tier/감사 16 + 웹서치 턴별 티어 9
           #     + 실 PG 마이그레이션 2
           #   + 스트림 끊김 원장 공백 10: 실 uvicorn 8 + 실 Redis 대사 2
@@ -417,16 +423,21 @@ jobs:
           #   형제 계정 불일치·비활성 형제·전부 비활성(kill switch)
           #   + 웹서치 예약 정산 20: 첫 턴 alias 계정 실패 6(비스트리밍 출구 3 × 라우트 2)
           #     + 스트리밍 대조 6(출구 3 × 라우트 2) + 나중 턴 실패 2 + 성공 경로 6)
-          #   + 비용 정산 스코프·창 23: 한도 구성 3(user/team/둘 다) + 한도 없음 1 + 분·시 경계를
-          #     넘긴 정산 1 + 만료된 cpm 키 1 + zero-usage 환불 2 + 추가 청구 1 + release 1
-          #     + 옛 모양의 정산 상태 1, 각각 단일 노드·클러스터 = 22, + 클러스터의 CROSSSLOT 거부 1
-          #   + TPM 정산 버킷 22: 같은 버킷 3(부분·zero-usage·추가 청구) + 한 번 회전 1 + 두 번
-          #     회전 1 + 키 만료 1 + 회전 직후 거부의 TTL 1 + release 1 + 옛 모양의 상태 1
-          #     + fail-open 스코프 1 + 옛 정산이 남긴 음수 1, 각각 단일 노드·클러스터
+          #   + 비용 정산 스코프·창 29: 한도 구성 3(user/team/둘 다) + 한도 없음 1 + 분·시 경계를
+          #     넘긴 정산 1 + 예약한 창이 지난 추가 청구 2(분·시) + 만료된 cpm 키 1 + zero-usage
+          #     환불 2 + 추가 청구 1 + release 1 + 옛 모양의 정산 상태 1 + 옛 정산이 남긴 음수 1,
+          #     각각 단일 노드·클러스터 = 28, + 클러스터의 CROSSSLOT 거부 1
+          #   + TPM 정산 버킷 30: 같은 버킷 3(부분·zero-usage·추가 청구) + 한 번 회전 1 + 두 번
+          #     회전 1 + 키 만료 1 + 예약한 버킷이 지난 추가분 4(회전·미회전·두 번·만료) + 회전 직후
+          #     거부의 TTL 1 + release 1 + 옛 모양의 상태 1 + fail-open 스코프 1 + 옛 정산이 남긴
+          #     음수 1, 각각 단일 노드·클러스터
           #   + 거부된 요청의 예약 되돌리기 12: 비용 TEAM 거부 1 + 비용 거부의 TPM 1 + TPM TEAM 거부 1
           #     + TPM GLOBAL 거부 1 + fail-closed 2(TPM·비용), 각각 단일 노드·클러스터
+          #   + 자격증명 실패와 서킷 브레이커 6: 프로필 X 의 STS 실패가 Y 의 브레이커를 열지 않음 2
+          #     (비스트리밍·스트리밍) + 파드 폴백 없는 native 2 + alias 계정 500 1 + 상류 502 는 연다(대조)
+          #     1 — 단일 노드만(브레이커 키에 hash tag 가 없어 클러스터에서는 기록이 거부된다, 그 파일)
           #   + 클러스터 rate-limit 3: 합친 EVAL 의 CROSSSLOT 재현 + RPM 분리 집행 + TPM·비용 분리 집행.
-          #   클러스터 변형 32건은 위 Valkey 클러스터 스텝(REDIS_CLUSTER_URL)이 있어야 돈다 — 그 스텝이
+          #   클러스터 변형 39건은 위 Valkey 클러스터 스텝(REDIS_CLUSTER_URL)이 있어야 돈다 — 그 스텝이
           #   빠지거나 실패하면 skip 으로 바뀌어 통과 수가 떨어지고 여기서 실패한다.
           #   예약 해제 14 중 4건(비-2xx 스트림 이중 환불: 메커니즘 1 + 라우터 2 + /v1/messages 1)이
           #   실 Redis 를 요구한다.
@@ -434,11 +445,11 @@ jobs:
           #    카운터를 움직이는 것이라, 가짜 Redis 로는 부호가 반대인 환불도 통과한다.
           #    원장 공백 파일의 대사 2건도 REDIS_PROOF_URL 이 없으면 skip 된다 — "카운터는 맞고
           #    원장만 짧다" 는 같은 실 Redis 에서 차감과 XADD 를 대사해야만 드러난다.
-          #    웹서치 예약 정산 20건과 비용 정산·TPM 정산·거부 되돌리기의 단일 노드 변형 28건도 전부
-          #    REDIS_PROOF_URL 이 없으면 skip 된다.
+          #    웹서치 예약 정산 20건, 비용 정산·TPM 정산·거부 되돌리기의 단일 노드 변형 35건, 브레이커
+          #    6건도 전부 REDIS_PROOF_URL 이 없으면 skip 된다.
           #    세 env 중 하나라도 안 걸리면 통과 수가 떨어져 여기서 실패한다.
-          if [ "${passed:-0}" -lt 177 ]; then
-            echo "::error::통과 ${passed} 건(기대 177) — PROOF_DSN/REDIS_PROOF_URL/REDIS_CLUSTER_URL 이 안 걸려 skip 됐다."
+          if [ "${passed:-0}" -lt 197 ]; then
+            echo "::error::통과 ${passed} 건(기대 197) — PROOF_DSN/REDIS_PROOF_URL/REDIS_CLUSTER_URL 이 안 걸려 skip 됐다."
             exit 1
           fi
 

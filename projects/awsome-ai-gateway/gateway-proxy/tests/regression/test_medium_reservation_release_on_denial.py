@@ -37,6 +37,8 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 
 import app
 from app.schemas.domain import (
@@ -59,6 +61,13 @@ _SCRIPTS = Path(app.__file__).resolve().parent / "redis_scripts"
 REDIS_PROOF_URL = os.environ.get("REDIS_PROOF_URL")
 REDIS_CLUSTER_URL = os.environ.get("REDIS_CLUSTER_URL")
 
+#: 실 Redis 클라이언트 설정. ⚠️ 재시도를 끈다 — redis-py 는 응답이 socket_timeout 뒤에 온 **직접**
+#: EVAL(예약 검사)을 다시 보내 서버에서 두 번 실행한다(실측: INCRBY 100 한 번이 200 이 됐다).
+#: 그러면 부하가 큰 머신에서 카운터가 조용히 틀려 로직 결함처럼 보인다(load average 150–300 에서
+#: ``…leaves_the_actual_tokens[cluster-partial]`` 가 한 번 실패한 것). 늦은 응답은 오류로 드러나야
+#: 한다. 30초는 그런 부하에서도 거의 넘지 않는다.
+_CLIENT_KW = {"socket_timeout": 30, "retry": Retry(NoBackoff(), 0)}
+
 
 def _client(kind: str):
     if kind == "single":
@@ -69,7 +78,7 @@ def _client(kind: str):
             )
         import redis.asyncio as aioredis
 
-        return aioredis.from_url(REDIS_PROOF_URL, socket_timeout=5)
+        return aioredis.from_url(REDIS_PROOF_URL, **_CLIENT_KW)
     if not REDIS_CLUSTER_URL:
         pytest.skip(
             "REDIS_CLUSTER_URL 미설정 — 진짜 Redis Cluster 필요(단일 노드는 CROSSSLOT 을 "
@@ -77,7 +86,7 @@ def _client(kind: str):
         )
     from redis.asyncio.cluster import RedisCluster
 
-    return RedisCluster.from_url(REDIS_CLUSTER_URL, socket_timeout=5)
+    return RedisCluster.from_url(REDIS_CLUSTER_URL, **_CLIENT_KW)
 
 
 @pytest.fixture(params=["single", "cluster"])
@@ -155,10 +164,21 @@ def _text(raw) -> str:
     return raw.decode() if isinstance(raw, bytes) else str(raw)
 
 
-async def _keyspace(r) -> dict[str, tuple[float, int]]:
-    """``rl:cost:*`` 와 ``{*}:tpm:*`` 전체 — {키: (값, TTL)}. 클러스터면 모든 primary."""
+async def _keyspace(r, case: _Case) -> dict[str, tuple[float, int]]:
+    """이 시나리오의 ``rl:cost:*`` 와 ``{*}:tpm:*`` — {키: (값, TTL)}. 클러스터면 모든 primary.
+
+    SCAN 패턴을 시나리오의 id·모델 alias 로 좁힌다 — 같은 PROOF 실행의 다른 테스트가 남긴 키가
+    "TTL 없는 키·음수 없음" 단정을 오염시키지 않게.
+    """
     out: dict[str, tuple[float, int]] = {}
-    for pattern in ("rl:cost:*", "{*}:tpm:*"):
+    uid, tid, alias = case.auth.user_id, case.auth.team_id, case.model.alias
+    for pattern in (
+        f"rl:cost:user:{{{uid}}}:*",
+        f"rl:cost:team:{{{tid}}}:*",
+        f"{{USER:{uid}:*}}:tpm:*",
+        f"{{TEAM:{tid}:*}}:tpm:*",
+        f"{{GLOBAL:*:{alias}}}:tpm:*",
+    ):
         async for raw_key in r.scan_iter(match=pattern, count=500):
             key = _text(raw_key)
             raw = await r.get(key)
@@ -232,7 +252,7 @@ async def test_a_team_cost_denial_undoes_only_this_requests_user_reservation(
         assert rejected is not None and rejected.status_code == 429
         assert _body(rejected)["error"]["code"].startswith("team_")
 
-        keyspace = await _keyspace(r)
+        keyspace = await _keyspace(r, case)
         _assert_clean(keyspace)
         assert _cost(keyspace, "user", case.auth.user_id) == {"cpm": reserved_a, "cph": reserved_a}
         assert _cost(keyspace, "team", case.auth.team_id) == {"cpm": reserved_a, "cph": reserved_a}
@@ -257,7 +277,7 @@ async def test_a_cost_denial_also_undoes_the_tpm_reservations(real_redis, monkey
         )
         assert rejected is not None and rejected.status_code == 429
 
-        keyspace = await _keyspace(r)
+        keyspace = await _keyspace(r, case)
         _assert_clean(keyspace)
         assert {s: _tpm_cur(keyspace, case, s) for s in case.tpm} == {
             "USER": 0, "TEAM": 0, "GLOBAL": 0
@@ -291,7 +311,7 @@ async def test_a_team_tpm_denial_undoes_only_this_requests_user_reservation(
         assert rejected is not None and rejected.status_code == 429
         assert _body(rejected)["error"]["code"] == "team_tpm_exceeded"
 
-        keyspace = await _keyspace(r)
+        keyspace = await _keyspace(r, case)
         _assert_clean(keyspace)
         assert _tpm_cur(keyspace, case, "USER") == reserved_a
         assert _tpm_cur(keyspace, case, "TEAM") == reserved_a
@@ -312,7 +332,7 @@ async def test_a_global_tpm_denial_undoes_the_user_and_team_reservations(
             _limits({"tpm": _OPEN["tpm"]}, {"tpm": _OPEN["tpm"]}, {"tpm": 10}),
         )
         assert rejected is not None and rejected.status_code == 429
-        keyspace = await _keyspace(r)
+        keyspace = await _keyspace(r, case)
         _assert_clean(keyspace)
         assert {s: _tpm_cur(keyspace, case, s) for s in case.tpm} == {
             "USER": 0, "TEAM": 0, "GLOBAL": 0
@@ -353,7 +373,7 @@ async def test_a_fail_closed_team_check_undoes_the_user_reservation(
     try:
         _s, rejected = await _enforce(monkeypatch, r, case, limits)
         assert rejected is not None and rejected.status_code == 429
-        keyspace = await _keyspace(r)
+        keyspace = await _keyspace(r, case)
         _assert_clean(keyspace)
         if stage == "tpm":
             assert _tpm_cur(keyspace, case, "USER") == 0

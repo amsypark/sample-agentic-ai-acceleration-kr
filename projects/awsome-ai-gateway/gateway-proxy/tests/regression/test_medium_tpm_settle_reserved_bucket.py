@@ -36,6 +36,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from structlog.testing import capture_logs
 
 import app
@@ -66,6 +68,13 @@ REDIS_CLUSTER_URL = os.environ.get("REDIS_CLUSTER_URL")
 _USAGE = TokenUsage(input_tokens=200, output_tokens=1000, total_tokens=1200)
 _ACTUAL = compute_tpm_incr(_USAGE)  # 1200
 
+#: 실 Redis 클라이언트 설정. ⚠️ 재시도를 끈다 — redis-py 는 응답이 socket_timeout 뒤에 온 **직접**
+#: EVAL(예약 검사)을 다시 보내 서버에서 두 번 실행한다(실측: INCRBY 100 한 번이 200 이 됐다).
+#: 그러면 부하가 큰 머신에서 카운터가 조용히 틀려 로직 결함처럼 보인다(load average 150–300 에서
+#: ``…leaves_the_actual_tokens[cluster-partial]`` 가 한 번 실패한 것). 늦은 응답은 오류로 드러나야
+#: 한다. 30초는 그런 부하에서도 거의 넘지 않는다.
+_CLIENT_KW = {"socket_timeout": 30, "retry": Retry(NoBackoff(), 0)}
+
 
 def _client(kind: str):
     if kind == "single":
@@ -76,7 +85,7 @@ def _client(kind: str):
             )
         import redis.asyncio as aioredis
 
-        return aioredis.from_url(REDIS_PROOF_URL, socket_timeout=5)
+        return aioredis.from_url(REDIS_PROOF_URL, **_CLIENT_KW)
     if not REDIS_CLUSTER_URL:
         pytest.skip(
             "REDIS_CLUSTER_URL 미설정 — 진짜 Redis Cluster 필요(단일 노드는 CROSSSLOT 을 "
@@ -84,7 +93,7 @@ def _client(kind: str):
         )
     from redis.asyncio.cluster import RedisCluster
 
-    return RedisCluster.from_url(REDIS_CLUSTER_URL, socket_timeout=5)
+    return RedisCluster.from_url(REDIS_CLUSTER_URL, **_CLIENT_KW)
 
 
 @pytest.fixture(params=["single", "cluster"])
@@ -190,15 +199,24 @@ def _text(raw) -> str:
     return raw.decode() if isinstance(raw, bytes) else str(raw)
 
 
-async def _tpm_keyspace(r) -> dict[str, tuple[int, int]]:
-    """``{*}:tpm:*`` 전체 — {키: (값, TTL)}. 클러스터면 모든 primary 를 훑는다."""
+async def _tpm_keyspace(r, case: _Case) -> dict[str, tuple[int, int]]:
+    """이 시나리오(사용자·팀·모델)의 ``{*}:tpm:*`` — {키: (값, TTL)}. 클러스터면 모든 primary.
+
+    SCAN 패턴을 시나리오의 id·모델 alias 로 좁힌다 — 같은 PROOF 실행의 다른 테스트(같은 Redis 를
+    쓰는 다른 실행도)가 남긴 키가 "TTL 없는 키·음수 없음" 단정을 오염시키지 않게.
+    """
     out: dict[str, tuple[int, int]] = {}
-    async for raw_key in r.scan_iter(match="{*}:tpm:*", count=500):
-        key = _text(raw_key)
-        raw = await r.get(key)
-        if raw is None:
-            continue
-        out[key] = (int(float(_text(raw))), int(await r.ttl(key)))
+    for pattern in (
+        f"{{USER:{case.auth.user_id}:*}}:tpm:*",
+        f"{{TEAM:{case.auth.team_id}:*}}:tpm:*",
+        f"{{GLOBAL:*:{case.model.alias}}}:tpm:*",
+    ):
+        async for raw_key in r.scan_iter(match=pattern, count=500):
+            key = _text(raw_key)
+            raw = await r.get(key)
+            if raw is None:
+                continue
+            out[key] = (int(float(_text(raw))), int(await r.ttl(key)))
     return out
 
 
@@ -251,12 +269,12 @@ async def test_settle_in_the_reserved_bucket_leaves_the_actual_tokens(
         assert rejected is None
         reserved = _reserved(state)
         assert reserved > _ACTUAL
-        before = _values(await _tpm_keyspace(r), case)
+        before = _values(await _tpm_keyspace(r, case), case)
         assert all(v["cur"] == reserved for v in before.values()), before
 
         await _finalize(r, case, state, usage)
 
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         expect = compute_tpm_incr(usage)
         for scope, v in _values(keyspace, case).items():
@@ -273,7 +291,7 @@ async def test_extra_tokens_land_in_the_reserved_bucket(real_redis, monkeypatch)
         state, _ = await _reserve(monkeypatch, r, case, max_tokens=10)
         assert _reserved(state) < compute_tpm_incr(big)
         await _finalize(r, case, state, big)
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         for v in _values(keyspace, case).values():
             assert v == {"cur": compute_tpm_incr(big), "prev": 0, "window": clock.bucket}
@@ -306,7 +324,7 @@ async def test_settle_after_one_rotation_adjusts_prev_not_the_new_bucket(real_re
 
         await _finalize(r, case, state_a, _USAGE)
 
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         for scope, v in _values(keyspace, case).items():
             assert v == {"cur": reserved_x, "prev": _ACTUAL, "window": b + 1}, (scope, v)
@@ -323,11 +341,11 @@ async def test_settle_after_two_rotations_writes_nothing(real_redis, monkeypatch
         clock.now += 120  # 분 B+2
         state_x, _ = await _reserve(monkeypatch, r, case, max_tokens=500)
         reserved_x = _reserved(state_x)
-        before = _values(await _tpm_keyspace(r), case)
+        before = _values(await _tpm_keyspace(r, case), case)
 
         await _finalize(r, case, state_a, _USAGE)
 
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         after = _values(keyspace, case)
         assert after == before
@@ -350,11 +368,11 @@ async def test_settle_after_the_bucket_keys_expired_creates_nothing(real_redis, 
             for key in keys:
                 await r.pexpire(key, 1)
         await asyncio.sleep(0.05)
-        assert _values(await _tpm_keyspace(r), case) == {s: {} for s in case.groups}
+        assert _values(await _tpm_keyspace(r, case), case) == {s: {} for s in case.groups}
 
         await _finalize(r, case, state, _USAGE)
 
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         assert _values(keyspace, case) == {s: {} for s in case.groups}, "만료된 버킷이 되살아났다"
     finally:
@@ -411,7 +429,7 @@ async def test_extra_tokens_after_the_reserved_bucket_land_in_the_current_bucket
 
         await _finalize(r, case, state_a, _BIG)
 
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         for scope, v in _values(keyspace, case).items():
             assert v == expect, (scope, v)
@@ -432,7 +450,7 @@ async def test_a_denial_right_after_a_rotation_leaves_no_key_without_a_ttl(
     try:
         state, rejected = await _reserve(monkeypatch, r, case)
         assert rejected is None
-        first = await _tpm_keyspace(r)
+        first = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(first)
         assert all("prev" in v for v in _values(first, case).values())
 
@@ -442,7 +460,7 @@ async def test_a_denial_right_after_a_rotation_leaves_no_key_without_a_ttl(
         )
         assert rejected is not None and rejected.status_code == 429
 
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         user = _values(keyspace, case)["USER"]
         assert user == {"cur": 0, "prev": 0, "window": clock.bucket}
@@ -466,7 +484,7 @@ async def test_fallback_release_refunds_exactly_once(real_redis, monkeypatch):
         await CostRecorder().finalize(
             r, case.auth, case.model, TokenUsage(), "req-c", True, 1, rate_limit_state=captured
         )
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         assert all(v["cur"] == 0 for v in _values(keyspace, case).values())
     finally:
@@ -482,7 +500,7 @@ async def test_legacy_state_without_tpm_keys_writes_nothing(real_redis, monkeypa
         state["rate_limit_state"].pop("tpm_reserved_keys", None)
         with capture_logs() as logs:
             await _finalize(r, case, state, _USAGE)
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         assert all(v["cur"] == reserved for v in _values(keyspace, case).values())
         assert [e["event"] for e in logs if e.get("event", "").startswith("tpm_settle")] == [
@@ -514,7 +532,7 @@ async def test_a_scope_whose_check_failed_open_is_not_settled(real_redis, monkey
         state, rejected = await _reserve(monkeypatch, r, case)
         assert rejected is None
         await _finalize(r, case, state, _USAGE)
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         values = _values(keyspace, case)
         assert values["TEAM"] == {}, f"예약하지 않은 TEAM 에 키가 생겼다: {values['TEAM']}"
@@ -547,7 +565,7 @@ async def test_a_negative_counter_left_by_the_old_settlement_is_clamped_and_gets
         assert rejected is None
         with capture_logs() as logs:
             await _finalize(r, case, state, _USAGE)
-        keyspace = await _tpm_keyspace(r)
+        keyspace = await _tpm_keyspace(r, case)
         _assert_no_ttl_less_or_negative(keyspace)
         assert all(v["cur"] == 0 for v in _values(keyspace, case).values())
         # 0 하한은 조용하지 않다 — 스코프마다 경고와 카운터.
