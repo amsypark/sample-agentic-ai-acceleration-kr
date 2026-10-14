@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -171,3 +170,136 @@ async def test_enforce_cpm_pass_injects_cost_reserved(monkeypatch, mock_redis):
 
     assert resp is None
     assert state["rate_limit_state"]["cost_reserved"] == Decimal("0.021")
+
+
+# ── 272K long-context 티어와 pre-reserve 추정의 정합성 (0038) ────────────────────
+#
+# `_estimate_cost` 의 존재 이유는 **과대 예약**이다 — 게이트가 실제보다 큰 값으로 판정해야
+# CPM/CPH 한도가 fail-closed 로 걸린다. long 티어를 무시하면 그 불변식이 깨지고, 깨진 사실은
+# 어디에도 로그로 남지 않는다(settle 이 사후에 차액을 맞춰 원장도 정상으로 보인다).
+# 그래서 여기서 "예약 ≥ 실제" 를 직접 고정한다.
+
+_THRESHOLD = 272_000
+
+
+def _tiered_model() -> ModelConfigSchema:
+    """``gpt-5.6-terra`` (runtime, Geo CRIS) 의 **시드 단가** — db/init + alembic head 를 마친
+    실 PG 의 ``model.model_pricings`` 열린 행에서 그대로 옮겼다(0032 short, 0038 long).
+
+    ★ 값을 손으로 적지 말 것. long 은 0038 이 short 에 카드 배수를 곱해 채운다:
+      input   0.0022  → 0.0044  = 2.0x
+      output  0.0132  → 0.0198  = 1.5x
+      c_write 0.00275 → 0.0055  = 2.0x (5m·1h 동일)
+      c_read  0.00022 → 0.00044 = 2.0x
+    두 열을 바꿔 적으면(예: output 자리에 cache_write) "long output = short × 1.5" 라는 티어 정의가
+    테스트에서 사라지고, 아래 과대예약 검증이 실제보다 약한 조건으로 통과한다 — 아래 배수 고정
+    테스트가 그것을 막는다.
+    """
+    return ModelConfigSchema(
+        provider_model_id="us.openai.gpt-5.6-terra",
+        alias="gpt-5.6-terra",
+        provider=ProviderType.BEDROCK_RUNTIME_OPENAI,
+        api_format=ApiFormat.OPENAI_RESPONSES,
+        endpoint="",
+        pricing=ModelPricingSchema(
+            input_per_1k=Decimal("0.0022"),
+            output_per_1k=Decimal("0.0132"),
+            cache_write_per_1k=Decimal("0.00275"),
+            cache_write_1h_per_1k=Decimal("0.00275"),
+            cache_read_per_1k=Decimal("0.00022"),
+            long_context_threshold_tokens=_THRESHOLD,
+            long_input_per_1k=Decimal("0.0044"),
+            long_output_per_1k=Decimal("0.0198"),
+            long_cache_write_per_1k=Decimal("0.0055"),
+            long_cache_write_1h_per_1k=Decimal("0.0055"),
+            long_cache_read_per_1k=Decimal("0.00044"),
+        ),
+        status=ModelStatus.ACTIVE,
+    )
+
+
+def test_tiered_fixture_matches_the_documented_tier_multipliers():
+    """픽스처가 티어 정의(입력·캐시 2배, 출력 1.5배)를 실제로 담고 있는지 고정한다."""
+    p = _tiered_model().pricing
+    assert p.long_input_per_1k == p.input_per_1k * 2
+    assert p.long_output_per_1k == p.output_per_1k * Decimal("1.5")
+    assert p.long_cache_write_per_1k == p.cache_write_per_1k * 2
+    assert p.long_cache_write_1h_per_1k == p.cache_write_1h_per_1k * 2
+    assert p.long_cache_read_per_1k == p.cache_read_per_1k * 2
+
+
+def test_estimate_cost_below_threshold_uses_short_rates():
+    cost = _estimate_cost(_tiered_model(), estimated_input=100_000, max_output=1_000)
+    # 100000/1000 * 0.0022 + 1000/1000 * 0.0132 = 0.22 + 0.0132
+    assert cost == Decimal("0.233200")
+
+
+def test_estimate_cost_at_threshold_is_still_short():
+    # 모델카드의 "272K input tokens or fewer" = short. 경계 자체는 넘지 않은 것이다.
+    cost = _estimate_cost(_tiered_model(), estimated_input=_THRESHOLD, max_output=0)
+    assert cost == Decimal(_THRESHOLD) / Decimal(1000) * Decimal("0.0022")
+
+
+def test_estimate_cost_above_threshold_uses_long_rates():
+    cost = _estimate_cost(_tiered_model(), estimated_input=_THRESHOLD + 1, max_output=0)
+    expected = Decimal(_THRESHOLD + 1) / Decimal(1000) * Decimal("0.0044")
+    assert cost == expected.quantize(Decimal("0.000001"))
+
+
+def test_estimate_cost_above_threshold_covers_actual_billed_cost():
+    """예약 ≥ 실제. 깨지면 CPM/CPH 가 $2 남은 사용자가 $2.24 요청을 통과시킨다.
+
+    티어를 무시하던 코드: 500K 프롬프트 + max_output 4,000 → 예약 $1.1528 vs 실제 $2.2396
+    (출력 2,000) — **절반**이었다.
+    """
+    from app.schemas.domain import TokenUsage
+    from app.services.cost_recorder import calculate_cost
+
+    model = _tiered_model()
+    prompt = 500_000
+    reserved = _estimate_cost(model, estimated_input=prompt, max_output=4_000)
+
+    # 실제 청구: 같은 프롬프트, 출력은 상한보다 작게 나온 흔한 경우.
+    actual = calculate_cost(
+        TokenUsage(input_tokens=prompt, output_tokens=2_000, total_tokens=prompt + 2_000),
+        model,
+    )
+    assert actual == Decimal("2.239600")
+    assert reserved >= actual, f"under-reserved: {reserved} < {actual}"
+
+
+def test_estimate_cost_tier_decision_matches_the_billing_path():
+    """추정기와 청구가 **같은 판정점**을 쓴다 — 경계 양쪽에서 교차 확인."""
+    from app.schemas.domain import TokenUsage
+    from app.services.cost_recorder import calculate_cost
+
+    model = _tiered_model()
+    for prompt, expected_rate in ((_THRESHOLD, "0.0022"), (_THRESHOLD + 1, "0.0044")):
+        reserved = _estimate_cost(model, estimated_input=prompt, max_output=0)
+        billed = calculate_cost(
+            TokenUsage(input_tokens=prompt, output_tokens=0, total_tokens=prompt), model
+        )
+        want = (Decimal(prompt) / Decimal(1000) * Decimal(expected_rate)).quantize(
+            Decimal("0.000001")
+        )
+        assert reserved == want, f"estimator used the wrong rate at {prompt}"
+        assert billed == want, f"biller used the wrong rate at {prompt}"
+
+
+def test_estimate_cost_untiered_model_unaffected():
+    """threshold 가 없는 모델(Claude 등)은 프롬프트가 아무리 커도 단일 요율이다."""
+    cost = _estimate_cost(_model(), estimated_input=1_000_000, max_output=0)
+    assert cost == Decimal(1_000_000) / Decimal(1000) * Decimal("0.003")
+
+
+def test_estimate_cost_falls_back_to_short_when_long_rate_missing():
+    """long 단가가 비면 그 항만 short 로 폴백 — calculate_cost 와 같은 fail-safe.
+
+    admin-api 스키마 검증이 막는 조합이지만 DB 직접 수정으로 도달할 수 있다. 여기서 크래시하면
+    예약 단계가 500 이 되어 **모든** 요청이 막힌다.
+    """
+    model = _tiered_model()
+    model.pricing.long_input_per_1k = None
+    cost = _estimate_cost(model, estimated_input=_THRESHOLD + 1, max_output=0)
+    expected = Decimal(_THRESHOLD + 1) / Decimal(1000) * Decimal("0.0022")
+    assert cost == expected.quantize(Decimal("0.000001"))

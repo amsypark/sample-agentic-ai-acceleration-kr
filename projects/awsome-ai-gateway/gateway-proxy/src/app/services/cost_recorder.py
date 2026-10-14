@@ -35,16 +35,32 @@ def resolve_context_tier(usage: TokenUsage, pricing: ModelConfigSchema) -> str |
       으로 분해하므로, AWS 가 말하는 "input tokens"(캐시 포함 프롬프트)를 되살리려면 셋을 다시
       더해야 한다. input_tokens 만 보면 캐시 히트가 큰 요청이 임계값 아래로 오판돼 과소청구된다.
 
-    청구와 감사가 어긋나지 않도록(청구=long/기록=short) 판정은 여기 한 곳에서만 한다.
+    청구와 감사가 어긋나지 않도록(청구=long/기록=short) 판정은 여기 한 곳에서만 한다 —
+    임계값 비교 자체는 :func:`resolve_tier_for_prompt_total` (pre-reserve 추정과 공유).
     """
-    threshold = pricing.pricing.long_context_threshold_tokens
-    if threshold is None:
-        return None
     prompt_total = (
         usage.input_tokens
         + usage.cache_read_input_tokens
         + usage.cache_creation_input_tokens
     )
+    return resolve_tier_for_prompt_total(prompt_total, pricing)
+
+
+def resolve_tier_for_prompt_total(prompt_total: int, pricing: ModelConfigSchema) -> str | None:
+    """임계값 비교 그 자체 — 프롬프트 총량(토큰)만 받는다.
+
+    :func:`resolve_context_tier` 가 실측 usage 로, pre-reserve 비용 추정
+    (``rate_limit_enforcement._estimate_cost``)이 **추정** 프롬프트 크기로 부른다.
+
+    ⚠️ 비교를 한 곳에 두는 이유: 추정 쪽이 자기 사본으로 판정하면 "예약은 short, 청구는 long"
+       으로 갈라지고, CPM/CPH 게이트가 실제 비용의 절반 수준 예약으로 통과를 허용한다. 그
+       갈라짐은 로그에 남지 않는다(settle 이 사후에 차액을 맞춰 원장은 정상으로 보인다).
+
+    경계는 "초과"(``>``) — 모델카드의 "272K input tokens or fewer" = short.
+    """
+    threshold = pricing.pricing.long_context_threshold_tokens
+    if threshold is None:
+        return None
     return "long" if prompt_total > threshold else "short"
 
 
