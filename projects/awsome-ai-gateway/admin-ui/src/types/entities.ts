@@ -78,6 +78,41 @@ export interface ModelListItem {
   context_window: number;
   description: string | null;
   display_name: string | null;
+  /**
+   * 대상 AWS 계정(마이그레이션 0044) — 레지스트리 이름. null/없음 = 기본값(앱 라우팅 프로필
+   * 계정, 없으면 게이트웨이 계정). 편집 다이얼로그가 이 값으로 prefill 한다 — 빠지면 계정 칸을
+   * 건드리지 않은 저장도 선택을 지운다.
+   */
+  account_name?: string | null;
+  /** 게이트웨이가 실제로 서명에 쓰는 역할(트리거가 유지하는 사본). 읽기 전용 표시용. */
+  account_role_arn?: string | null;
+}
+
+// ─── AWS Accounts (migration 0044) ───────────────────────────────────────────
+
+/** `/admin/aws-accounts` 항목 — 한 번 등록하고 모델에서 이름으로 고른다. */
+export interface AwsAccount {
+  name: string;
+  display_name: string;
+  role_arn: string;
+  account_id: string;
+  external_id: string | null;
+  description: string | null;
+  /** 이 계정을 고른 모델 alias — 그 호출이 이 계정으로 서명된다. */
+  aliases: string[];
+  /** 같은 역할을 앱 라우팅 프로필 계정으로도 쓰는 앱(정보용). */
+  app_profiles: string[];
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+/** 앱 단위(라우팅 프로필) 계정 — 모델 계정이 "기본값" 일 때 무엇인지 설명하는 데 쓴다. */
+export interface AppAccount {
+  client: string;
+  backend: string;
+  role_arn: string;
+  account_id: string;
+  registered_as: string | null;
 }
 
 // ─── Team Model Access ───────────────────────────────────────────────────────

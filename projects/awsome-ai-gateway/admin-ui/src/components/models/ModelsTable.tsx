@@ -5,7 +5,7 @@
 
 import { useState, useTransition } from 'react';
 import { useTranslations } from 'next-intl';
-import type { ModelListItem } from '@/types/entities';
+import type { AwsAccount, ModelListItem } from '@/types/entities';
 import { activateModelAction } from '@/lib/actions/models';
 import { useToast } from '@/components/common/ToastProvider';
 import { Badge, type BadgeTone } from '@/components/common/Badge';
@@ -15,6 +15,29 @@ import { DeactivateModelDialog } from './DeactivateModelDialog';
 
 interface ModelsTableProps {
   models: ModelListItem[];
+  /** 등록된 AWS 계정(0044) — 계정 열 표시와 편집 다이얼로그의 선택지. */
+  accounts?: AwsAccount[];
+}
+
+/** 모델의 대상 계정 칸. 선택이 없으면 "기본값" 과 그 뜻을 툴팁으로. */
+function AccountCell({ model, accounts }: { model: ModelListItem; accounts: AwsAccount[] }) {
+  const t = useTranslations('models');
+  if (!model.account_name) {
+    return (
+      <span className="text-muted-foreground" title={t('accountColumnDefaultTitle')}>
+        {t('accountColumnDefault')}
+      </span>
+    );
+  }
+  const acct = accounts.find((a) => a.name === model.account_name);
+  // 계정 번호는 게이트웨이가 실제로 서명에 쓰는 사본(account_role_arn)에서 읽는다.
+  const accountId = model.account_role_arn?.split(':')[4] ?? acct?.account_id ?? '';
+  return (
+    <span title={model.account_role_arn ?? undefined}>
+      {acct?.display_name ?? model.account_name}
+      {accountId && <span className="block text-xs text-muted-foreground font-mono">{accountId}</span>}
+    </span>
+  );
 }
 
 function ProviderBadge({ provider }: { provider: string }) {
@@ -50,7 +73,7 @@ export function formatPer1k(n: number): string {
   });
 }
 
-export function ModelsTable({ models }: ModelsTableProps) {
+export function ModelsTable({ models, accounts = [] }: ModelsTableProps) {
   const t = useTranslations('models');
   const { toast } = useToast();
   const [isPending, startTransition] = useTransition();
@@ -102,13 +125,14 @@ export function ModelsTable({ models }: ModelsTableProps) {
               <Th numeric>{t('cache5min')}</Th>
               <Th numeric>{t('cache1h')}</Th>
               <Th numeric>{t('cacheRead')}</Th>
+              <Th>{t('accountColumnHeader')}</Th>
               <Th>{t('status')}</Th>
               <Th>{t('actions')}</Th>
             </Tr>
           </THead>
           <TBody>
             {models.length === 0 ? (
-              <TEmpty colSpan={11}>{t('noModels')}</TEmpty>
+              <TEmpty colSpan={12}>{t('noModels')}</TEmpty>
             ) : (
               models.map((model) => (
                 <Tr key={model.alias}>
@@ -141,6 +165,9 @@ export function ModelsTable({ models }: ModelsTableProps) {
                     {model.cache_read_price_per_1k > 0
                       ? `$${formatPer1k(model.cache_read_price_per_1k)}/1K`
                       : '—'}
+                  </Td>
+                  <Td className="text-xs">
+                    <AccountCell model={model} accounts={accounts} />
                   </Td>
                   <Td>
                     <StatusBadge isActive={model.is_active} activeLabel={t('active')} inactiveLabel={t('inactive')} />
@@ -185,6 +212,7 @@ export function ModelsTable({ models }: ModelsTableProps) {
           setSelectedModel(null);
         }}
         editModel={selectedModel ?? undefined}
+        accounts={accounts}
       />
 
       <DeactivateModelDialog
