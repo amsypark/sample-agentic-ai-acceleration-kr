@@ -150,6 +150,37 @@ async def test_a_reassume_for_one_external_id_keeps_the_other_ones_bearer(monkey
     assert minted == ["ASIA1", "ASIA2", "ASIA3"], "b 의 bearer 가 a 의 재assume 에 휩쓸렸다"
 
 
+async def test_a_reassume_invalidates_that_keys_bearers_in_every_region(monkeypatch):
+    """한 리전의 요청이 자격증명을 다시 assume 하면, 같은 키로 다른 리전에 이미 mint 해 둔 bearer 도
+    버린다 — 그 리전의 다음 요청은 새 자격증명으로 다시 mint 한다. 옛 자격증명의 bearer 를 그
+    TTL(옛 자격증명 만료 − 60초)까지 계속 내주지 않는다. 자격증명은 10분짜리다.
+
+    이 무효화(``_get_creds`` 의 ``k[0] != key``)가 깨져도 위 테스트들은 통과한다 — 위 재assume
+    테스트에서는 무효화할 bearer 가 이미 만료돼 있다.
+    """
+    minted: list[tuple[str, str]] = []
+
+    class _Gen:
+        def get_token(self, creds, region):
+            minted.append((creds.access_key, region))
+            return f"BEARER-{creds.access_key}-{region}"
+
+    monkeypatch.setattr(mc, "BedrockTokenGenerator", lambda: _Gen())
+    now = [1000.0]
+    sts = _STS(clock=now, lifetime={"ext-a": 600})
+    broker = mc.MantleCredentialBroker(sts_client=sts, now=lambda: now[0])
+    west, east = _profile("ext-a"), _profile("ext-a")
+    east.region = "us-east-2"
+
+    assert await broker.bearer_token(west) == "BEARER-ASIA1-us-west-2"  # bearer: 1540 까지
+    now[0] = 1350.0  # 자격증명(1600 만료)은 갱신 창, us-west-2 의 bearer 는 아직 유효
+    assert await broker.bearer_token(east) == "BEARER-ASIA2-us-east-2"  # 재assume
+    now[0] = 1351.0
+    assert await broker.bearer_token(west) == "BEARER-ASIA2-us-west-2", "옛 자격증명의 bearer"
+    assert minted == [("ASIA1", "us-west-2"), ("ASIA2", "us-east-2"), ("ASIA2", "us-west-2")]
+    assert len(sts.external_ids) == 2
+
+
 async def test_native_profiles_with_different_external_ids_get_separate_clients(monkeypatch):
     """claude-code native 프로필 경로(공유 provider)는 이미 (역할, ExternalId, 세션 이름)으로 키를
     잡는다 — 세 경로가 같은 규칙인지 같이 본다."""
