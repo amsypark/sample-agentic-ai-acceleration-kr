@@ -43,14 +43,20 @@ Bedrock 호출의 대상 계정은 **요청에 서명한 자격증명**으로 �
 
 ### 1.3 실패하면 — 다른 계정으로 대신 호출하지 않는다
 
-모델에 고른 계정으로 전환하지 못하면(신뢰 정책, 게이트웨이 권한, External ID 불일치 등) 그 요청은 **HTTP 500**과 고정 메시지(`The AWS account configured for this model could not be used (AssumeRole failed)...`)로 끝납니다. 이때:
+모델에 고른 계정으로 전환하지 못하면(신뢰 정책, 게이트웨이 권한, External ID 불일치 등) 그 요청은 **HTTP 500**과 고정 메시지(`The AWS account configured for this model could not be used (AssumeRole failed)...`)로 끝납니다.
+
+> **예외 — 웹 검색 루프의 스트리밍 응답은 HTTP 200입니다.** 서버사이드 웹 검색이 켜진 앱(앱 프로필 `web_search_enabled`)의 스트리밍 요청(`/v1/messages`, `/v1/responses`)은 웹 검색 루프가 첫 상류 호출보다 먼저 응답 상태(200)를 보내므로, 같은 고정 메시지를 스트림 안의 `event: error` 이벤트로만 받습니다. 루프 없이 처리되는 요청(클라이언트가 자기 `web_search` 도구를 선언했거나 AgentCore 연결에 실패한 경우)과 비스트리밍 요청은 500입니다.
+>
+> 그래서 이 실패는 상태 코드나 접근 로그 기준의 경보에 잡히지 않습니다. 게이트웨이 로그 `account_credentials_assume_failed`(역할 ARN과 오류 코드 포함)로 찾습니다. 이 로그는 STS 호출이 실패할 때 남고, 실패를 기억하는 30초 동안은 STS를 다시 부르지 않으므로 요청마다가 아니라 30초에 한 번꼴로 남습니다. 실패한 요청은 어느 경로에서도 사용 기록(usage_logs)에 남지 않습니다.
+
+이때:
 
 - 게이트웨이 계정이나 앱 프로필 계정으로 **대신 호출하지 않습니다.** 그렇게 하면 성공 응답이 운영자가 고르지 않은 계정에 청구되고, 어떤 상태 코드도 그 사실을 드러내지 않습니다.
 - 가용성 폴백(다른 모델로)을 하지 않고 서킷 브레이커도 올리지 않습니다. 계정 설정 오류가 같은 모델 ID를 쓰는 다른 계정의 모델까지 끊지 않게 하기 위해서입니다.
 - 실패는 30초 동안 기억합니다(그 사이 STS를 반복 호출하지 않습니다). 원인을 고치면 최대 30초 안에 정상화됩니다.
 - 이미 받은 자격증명의 **갱신**(만료 5분 전부터)이 실패한 것은 실패로 치지 않습니다. 남은 유효 시간이 1분을 넘으면 그 자격증명으로 계속 서명하고 경고(`account_credentials_refresh_failed_serving_cached`)만 남기며, 갱신은 30초 간격으로 다시 시도합니다.
 - 상류가 502/503을 줄 때 올라가는 서킷 브레이커는 모델에 계정을 고른 경우 **그 계정 단위**입니다(키 `cb:<model-id>@<계정 번호>:*`). 계정을 고르지 않은 모델의 키는 이전과 같습니다(`cb:<model-id>:*`). 한 계정의 장애·쿼터가 같은 모델 ID를 다른 계정으로 부르는 모델을 막지 않습니다. Bedrock native에서 계정 쿼터 초과(`ServiceQuotaExceededException`)는 429로 답하며 브레이커와 폴백 대상이 아닙니다.
-- 클라이언트로 가는 Bedrock·Mantle 오류 본문과 스트림 도중의 오류 이벤트에서는 ARN과 12자리 계정 번호를 `<arn>`·`<account-id>`로 지웁니다(AccessDenied 문장에 대상 계정의 역할 ARN이 들어 있습니다). 나머지 문장은 그대로이고(클라이언트가 그 문장으로 동작합니다 — 예: `prompt is too long`), 원문은 게이트웨이 로그에 남습니다.
+- 게이트웨이가 만들어 클라이언트에 보내는 오류에서는 ARN과 12자리 계정 번호를 `<arn>`·`<account-id>`로 지웁니다(AccessDenied 문장에 대상 계정의 역할 ARN이 들어 있습니다). 대상은 실패한 Bedrock·Mantle 호출의 오류 본문과, 스트림이 도중에 예외로 끊겼을 때 게이트웨이의 SSE 헬퍼(`/v1/messages`, `/v1/chat/completions`, `/v1/responses`)가 만들어 보내는 오류 이벤트입니다 — Bedrock native 스트림의 도중 오류가 이 경로로 옵니다. 지운 경우에도 나머지 문장은 그대로이고(클라이언트가 그 문장으로 동작합니다 — 예: `prompt is too long`), 원문은 게이트웨이 로그에 남습니다. 상류가 200 스트림 **안에** 직접 보낸 오류 이벤트(OpenAI Bedrock Runtime·Mantle 스트림)는 받은 그대로 전달되며 지우지 않습니다. OpenAI Bedrock Runtime·Mantle의 스트리밍 요청이 시작 전에 실패하면 상류 본문 대신 고정 문장(`... stream HTTP <상태>`)만 보냅니다.
 
 반면 **앱 프로필의 계정**(예: claude-code의 cross-account)은 이 기능 이전과 같이, 전환에 실패하면 게이트웨이 계정으로 투명하게 폴백합니다. 이 동작은 모델에 계정을 고르지 않은 요청에만 적용됩니다.
 
@@ -217,7 +223,7 @@ Bedrock invocation log나 CloudTrail과 대조할 때는 `bedrock_request_id`를
 | 계정 등록이 422, 역할 ARN 칸에 오류 | ARN 형식 | `arn:aws:iam::<12자리>:role/<이름>`이어야 합니다(경로·이름은 `A-Z a-z 0-9 + = , . @ _ / -`만, 와일드카드 불가). 사용자 ARN이나 Bedrock ARN은 AssumeRole 대상이 아닙니다 |
 | 모델 저장이 409, `other active aliases of model id` | 같은 model ID를 쓰는 다른 활성 모델이 다른 계정을 부름 | 메시지의 모델에도 같은 계정을 적용합니다(콘솔 "모두 적용", API `apply_to_siblings: true`). 2.5의 "같은 model ID" 참고 |
 | 모델 활성화가 409, `then activate it` | 활성화하려는 모델의 계정이 같은 model ID의 활성 모델과 다름 | 그 모델을 먼저 편집해 계정을 맞춘 뒤 활성화합니다 |
-| 해당 모델 요청이 500, 본문에 `AssumeRole failed` | 게이트웨이가 대상 역할로 전환하지 못함(2.1 신뢰 정책, 2.2 권한, External ID 불일치 중 하나) | 게이트웨이 로그 `account_credentials_assume_failed`에 역할 ARN과 오류 코드가 남습니다. 고치면 최대 30초 안에 다음 요청부터 정상화됩니다 |
+| 해당 모델 요청이 500, 본문에 `AssumeRole failed`(웹 검색 루프의 스트리밍 요청은 HTTP 200에 스트림 안의 `event: error`로, 1.3) | 게이트웨이가 대상 역할로 전환하지 못함(2.1 신뢰 정책, 2.2 권한, External ID 불일치 중 하나) | 게이트웨이 로그 `account_credentials_assume_failed`에 역할 ARN과 오류 코드가 남습니다. 웹 검색 스트리밍의 실패는 상태 코드로 보이지 않으므로 이 로그로 찾습니다. 고치면 최대 30초 안에 다음 요청부터 정상화됩니다 |
 | Bedrock `AccessDeniedException`(403) | 대상 역할의 권한 정책 또는 모델 액세스 누락 | 2.1을 확인합니다 |
 | `/v1/messages/count_tokens`만 403 | 대상 역할에 `bedrock:CountTokens` 누락 | 2.1 권한 정책에 추가합니다 |
 | 고른 계정이 아니라 이전 계정으로 호출됨 | 이미지가 구버전이거나(2.4) 모델 캐시가 아직 갱신되지 않음 | 네 이미지가 모두 롤링됐는지 확인합니다. DB를 직접 고쳤다면 최대 5분 기다립니다 |
