@@ -266,13 +266,15 @@ jobs:
           # 통과했더라도 실질 실행이 0건이면 실패다 — 그게 이 잡을 만든 이유다.
           # ⚠️ 하한만 본다. 정확한 통과 수는 DB 에 쌓인 데이터에 따라 달라진다 — 일부
           #    테스트는 대상 테이블이 비어 있으면 스스로 skip 한다(플랜 어서션 등). 로컬
-          #    실측은 200 passed / 2 skipped 다(AWS 자동연동 real-PG 2건, 0044 계정 레지스트리
-          #    트리거 27건, 계정 API 7건 포함). 하한의 목적은 "PROOF_DSN 이 안 걸려 대부분
-          #    skip 된" 상태를 잡는 것이다.
+          #    실측은 224 passed / 2 skipped 다(init SQL + alembic head 의 새 DB — 이 잡과 같은
+          #    레시피. AWS 자동연동 real-PG 2건, 0044 계정 레지스트리 트리거·동시성 45건, 계정
+          #    API 13건 포함. skip 2건은 빈 usage_logs 에서 스스로 skip 하는 nonsargable 플랜
+          #    어서션이다). 하한은 그 실측 바로 아래다: 파일 하나(계정 API 13건)만 통째로 skip
+          #    돼도 여기서 잡힌다 — 95 는 200 건 중 절반이 skip 돼도 통과했다.
           passed=$(grep -oE "[0-9]+ passed" /tmp/proof.txt | tail -1 | grep -oE "[0-9]+" || echo 0)
           echo "passed=${passed}"
-          if [ "${passed:-0}" -lt 95 ]; then
-            echo "::error::통과 수가 ${passed} 건뿐이다(하한 95). PROOF_DSN/REDIS_PROOF_URL 이 안 걸려 대부분 skip 된 것으로 보인다."
+          if [ "${passed:-0}" -lt 220 ]; then
+            echo "::error::통과 수가 ${passed} 건뿐이다(하한 220). PROOF_DSN/REDIS_PROOF_URL 이 안 걸려 일부가 skip 된 것으로 보인다."
             exit 1
           fi
 
@@ -334,11 +336,12 @@ jobs:
           tail -30 /tmp/proof3.txt
           if [ "$status" -ne 0 ]; then exit "$status"; fi
           passed=$(grep -oE "[0-9]+ passed" /tmp/proof3.txt | tail -1 | grep -oE "[0-9]+" || echo 0)
-          # 로컬 실측 기준선: 95 passed (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
+          # 로컬 실측 기준선: 97 passed (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
           #   + long-context 티어 27: calculate_cost/tier/감사 16 + 웹서치 턴별 티어 9
           #     + 실 PG 마이그레이션 2
           #   + 스트림 끊김 원장 공백 10: 실 uvicorn 8 + 실 Redis 대사 2
-          #   + alias 계정 7: 레지스트리 선택 → 트리거 사본 → 리졸버 → AccountTarget).
+          #   + alias 계정 9: 레지스트리 선택 → 트리거 사본 → 리졸버 → AccountTarget, 모델 id
+          #   형제 계정 불일치·비활성 형제·전부 비활성(kill switch)).
           #   예약 해제 14 중 4건(비-2xx 스트림 이중 환불: 메커니즘 1 + 라우터 2 + /v1/messages 1)이
           #   실 Redis 를 요구한다.
           # ⚠️ 예약 해제 파일은 REDIS_PROOF_URL 을 요구한다 — 환불은 incrbyfloat 로
@@ -346,8 +349,8 @@ jobs:
           #    원장 공백 파일의 대사 2건도 REDIS_PROOF_URL 이 없으면 skip 된다 — "카운터는 맞고
           #    원장만 짧다" 는 같은 실 Redis 에서 차감과 XADD 를 대사해야만 드러난다.
           #    두 env 중 하나라도 안 걸리면 통과 수가 떨어져 여기서 실패한다.
-          if [ "${passed:-0}" -lt 95 ]; then
-            echo "::error::통과 ${passed} 건(기대 95) — PROOF_DSN/REDIS_PROOF_URL 이 안 걸려 skip 됐다."
+          if [ "${passed:-0}" -lt 97 ]; then
+            echo "::error::통과 ${passed} 건(기대 97) — PROOF_DSN/REDIS_PROOF_URL 이 안 걸려 skip 됐다."
             exit 1
           fi
 
