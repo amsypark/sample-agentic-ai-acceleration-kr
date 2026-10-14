@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import datetime as _dt
 import io
 import re
 import uuid
@@ -40,6 +41,24 @@ logger = structlog.get_logger()
 _PERIOD_RE = re.compile(r"^\d{4}-\d{2}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+#: 직접 입력 범위의 최대 길이(일, 양끝 포함). 캐시되지 않는 요청 하나가 usage_logs 전체 집계를
+#: 6~9번 돌리므로(요약·모델·팀·사용자·추이·seed), 상한이 없으면 2000-01-01~2100-12-31 같은 범위가
+#: 그대로 전 테이블 스캔이 된다. 93일 = 연속한 석 달(분기)을 담는 가장 짧은 길이.
+#: admin-ui lib/utils/analyticsQuery.ts 의 MAX_ANALYTICS_RANGE_DAYS 와 같아야 한다.
+MAX_ANALYTICS_RANGE_DAYS = 93
+
+#: CSV 셀이 이 문자로 시작하면 스프레드시트가 **수식**으로 해석한다(=HYPERLINK, +cmd, @SUM …).
+#: 표시 이름·이메일·팀 이름은 사용자가 정할 수 있는 값이라, 내보낸 파일을 연 관리자 PC 에서
+#: 수식이 실행될 수 있다(CSV/formula injection). OWASP 권고대로 앞에 작은따옴표를 붙여 텍스트로 만든다.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_text(value: str | None) -> str | None:
+    """사용자 유래 텍스트 셀을 수식으로 해석되지 않게 만든다(숫자 셀에는 쓰지 않는다)."""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
 
 def _validate_period_date(period: str, date: str) -> None:
     """period=YYYY-MM, date=YYYY-MM-DD, and date must be within period's month."""
@@ -72,6 +91,12 @@ def _resolve_date_range(start_date: str | None, end_date: str | None) -> tuple[s
     if not start_date or not end_date:
         raise ValidationError("start_date and end_date must be provided together")
     day_range_to_utc(start_date, end_date)  # 형식 / 달력 / 역순 / 연도 범위 → ValidationError
+    # ⚠️ 상한이 없으면 2000-01-01~2100-12-31 한 번이 캐시 없이 usage_logs 전체 집계를 6~9번 돈다.
+    span_days = (_dt.date.fromisoformat(end_date) - _dt.date.fromisoformat(start_date)).days + 1
+    if span_days > MAX_ANALYTICS_RANGE_DAYS:
+        raise ValidationError(
+            f"date range is {span_days} days; at most {MAX_ANALYTICS_RANGE_DAYS} days per request"
+        )
     return start_date, end_date
 
 
@@ -95,6 +120,13 @@ class AnalyticsService:
         # ⚠️ 범위 모드에서도 period 형식은 검증한다. 월 필터를 타지 않는 경로라 검증이
         #    빠지면 period='garbage' 가 200 + 응답 라벨로 그대로 나간다(캐시 키에도 들어간다).
         period_to_utc_range(period)
+        # ⚠️ 범위 모드의 period 는 **start_date 의 달**이어야 한다(admin-ui 는 그렇게 보낸다).
+        #    period 는 응답 라벨·캐시 키·seed(월 상수) 판정에 쓰이므로, 범위와 다른 달이 오면 seed 를
+        #    엉뚱한 달에서 더하거나 같은 범위가 period 별로 다른 캐시 키를 갖는다.
+        if date_range and date_range[0][:7] != period:
+            raise ValidationError(
+                f"period {period} must be the month of start_date ({date_range[0][:7]})"
+            )
         period_filter = cost_day_range_filter(*date_range) if date_range else cost_period_filter(period)
 
         # Determine scope filter
@@ -732,23 +764,24 @@ class AnalyticsService:
         period_label = (
             f"{data.start_date}~{data.end_date}" if data.start_date and data.end_date else data.period
         )
+        # 이름·이메일·팀·모델 셀은 _csv_text 로 감싼다(수식 주입 방지) — 숫자 셀은 우리가 만든 값이다.
         if group_by == "team":
             writer.writerow(["period", "team", "team_id", "cost_usd", "active_users"])
             for team_item in data.by_team:
                 writer.writerow([
-                    period_label, team_item.team, team_item.team_id,
+                    period_label, _csv_text(team_item.team), _csv_text(team_item.team_id),
                     str(team_item.cost_usd), team_item.active_users,
                 ])
         elif group_by == "user":
             writer.writerow(["period", "user", "email", "cost_usd", "requests"])
             for user_item in data.by_user:
                 writer.writerow([
-                    period_label, user_item.user, user_item.email,
+                    period_label, _csv_text(user_item.user), _csv_text(user_item.email),
                     str(user_item.cost_usd), user_item.requests,
                 ])
         else:
             # 모델 축의 헤더는 예전 그대로 둔다(기존 소비자가 이 3열을 읽는다).
             writer.writerow(["period", "model", "cost_usd"])
             for model_item in data.by_model:
-                writer.writerow([period_label, model_item.model, str(model_item.cost_usd)])
+                writer.writerow([period_label, _csv_text(model_item.model), str(model_item.cost_usd)])
         return output.getvalue()

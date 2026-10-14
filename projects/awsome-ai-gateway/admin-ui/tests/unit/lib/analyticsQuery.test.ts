@@ -8,7 +8,13 @@
 // 읽었다(카드 설명은 "기간 내 …", 선택기는 고른 날짜를 그대로 표시).
 
 import { describe, it, expect } from 'vitest';
-import { buildAnalyticsQuery } from '@/lib/utils/analyticsQuery';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  MAX_ANALYTICS_RANGE_DAYS,
+  buildAnalyticsQuery,
+  customRangeDays,
+} from '@/lib/utils/analyticsQuery';
 import type { AnalyticsFilterForm } from '@/types/api';
 import type { PeriodType } from '@/types/enums';
 
@@ -77,5 +83,31 @@ describe('buildAnalyticsQuery', () => {
       '2026-09',
     );
     expect(q.period).toBe('2026-07');
+  });
+});
+
+describe('custom range cap', () => {
+  it('counts both ends, across months', () => {
+    expect(customRangeDays('2026-09-01', '2026-09-01')).toBe(1);
+    expect(customRangeDays('2026-08-31', '2026-09-01')).toBe(2);
+    expect(customRangeDays('2026-09-01', '2026-12-02')).toBe(93);
+    expect(customRangeDays('2026-09-01', '2026-12-03')).toBe(94);
+  });
+
+  it('is null for a half-filled or malformed range (control)', () => {
+    expect(customRangeDays('2026-09-01', null)).toBeNull();
+    expect(customRangeDays(null, '2026-09-01')).toBeNull();
+    expect(customRangeDays('2026-9-1', '2026-09-05')).toBeNull();
+  });
+
+  it('matches the server cap (admin-api rejects longer ranges with 400)', () => {
+    // ⚠️ 한쪽만 바꾸면 UI 경고 없이 400 이 나거나, 받을 수 있는 범위에 경고가 뜬다.
+    const py = readFileSync(
+      join(process.cwd(), '..', 'admin-api', 'src', 'app', 'services', 'analytics_service.py'),
+      'utf8',
+    );
+    const m = /^MAX_ANALYTICS_RANGE_DAYS = (\d+)$/m.exec(py);
+    expect(m, 'admin-api 상수를 찾지 못함').not.toBeNull();
+    expect(Number(m![1])).toBe(MAX_ANALYTICS_RANGE_DAYS);
   });
 });

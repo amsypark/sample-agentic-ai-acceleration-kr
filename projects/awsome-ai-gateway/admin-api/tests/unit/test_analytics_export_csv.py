@@ -173,3 +173,32 @@ async def test_json_export_carries_the_range():
         )
     assert ctype == "application/json"
     assert '"start_date": "2026-08-01"' in content
+
+
+# ── CSV 수식 주입 ─────────────────────────────────────────────────────────────
+
+INJECTIONS = ["=HYPERLINK(\"http://x\")", "+cmd|' /C calc'!A0", "-2+3", "@SUM(A1:A2)", "\tTAB", "\rCR"]
+
+
+@pytest.mark.parametrize("payload", INJECTIONS)
+def test_user_and_email_cells_cannot_start_a_formula(payload):
+    resp = _response(by_user=[UserBreakdown(user=payload, email=payload, cost_usd=Decimal("1.00"), requests=1)])
+    row = _rows(AnalyticsService._to_csv(resp, "user"))[1]
+    assert row[1] == "'" + payload and row[2] == "'" + payload, row
+
+
+@pytest.mark.parametrize("payload", INJECTIONS)
+def test_team_and_model_cells_cannot_start_a_formula(payload):
+    resp = _response(
+        by_team=[TeamBreakdown(team=payload, team_id=str(TEAM_ID), cost_usd=Decimal("1"), active_users=1)],
+        by_model=[ModelBreakdown(model=payload, requests=1, cost_usd=Decimal("1"))],
+    )
+    assert _rows(AnalyticsService._to_csv(resp, "team"))[1][1] == "'" + payload
+    assert _rows(AnalyticsService._to_csv(resp, "model"))[1][1] == "'" + payload
+
+
+def test_ordinary_text_and_numbers_are_untouched():
+    """대조군 — 평범한 이름·이메일과 숫자 셀(우리가 만든 값)은 그대로다."""
+    resp = _response(by_user=[UserBreakdown(user="alice", email="alice@example.com", cost_usd=Decimal("6.00"), requests=4)])
+    row = _rows(AnalyticsService._to_csv(resp, "user"))[1]
+    assert row[1:] == ["alice", "alice@example.com", "6.00", "4"]

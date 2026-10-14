@@ -4,6 +4,21 @@ import type { AnalyticsFilterForm } from '@/types/api';
 import { resolveMonth } from '@/lib/utils/period';
 
 /**
+ * `직접 입력` 범위 상한(양끝 포함 일수). 서버(admin-api analytics_service.py 의
+ * MAX_ANALYTICS_RANGE_DAYS)가 넘으면 400 으로 거절한다 — 두 값은 같아야 한다(테스트가 대조).
+ */
+export const MAX_ANALYTICS_RANGE_DAYS = 93;
+
+/** 'YYYY-MM-DD' 두 개의 양끝 포함 일수. 하나라도 비었거나 형식이 틀리면 null. */
+export function customRangeDays(start?: string | null, end?: string | null): number | null {
+  const re = /^\d{4}-\d{2}-\d{2}$/;
+  if (!start || !end || !re.test(start) || !re.test(end)) return null;
+  // UTC 자정끼리의 차 — 로컬 TZ/서머타임이 끼어들지 않는다.
+  const ms = Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`);
+  return Number.isNaN(ms) ? null : Math.round(ms / 86_400_000) + 1;
+}
+
+/**
  * `/admin/analytics` 질의 파라미터 빌더 — **단일 출처**.
  *
  * analytics 페이지의 여러 서버 컴포넌트(ROIMetricsCards/CostTrendChart/BreakdownChart)

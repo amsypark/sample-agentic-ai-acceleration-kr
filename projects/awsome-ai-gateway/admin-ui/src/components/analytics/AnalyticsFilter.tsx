@@ -7,6 +7,7 @@ import { useTranslations } from 'next-intl';
 import type { AnalyticsFilterForm } from '@/types/api';
 import type { GroupByType } from '@/types/enums';
 import { currentCalendarMonth, monthsAgo, toKoreanMonthLabel } from '@/lib/utils/period';
+import { MAX_ANALYTICS_RANGE_DAYS, customRangeDays } from '@/lib/utils/analyticsQuery';
 
 interface AnalyticsFilterProps {
   defaultValue: AnalyticsFilterForm;
@@ -27,6 +28,10 @@ export function AnalyticsFilter({ defaultValue, periods, currentMonth }: Analyti
     { value: 'user', label: t('groupByOptions.user') },
   ];
   const isCustom = defaultValue.period === 'custom';
+  // ⚠️ 상한을 넘는 범위는 서버가 400 으로 거절한다 → 카드/차트가 "불러오지 못했습니다" 만 보인다.
+  //    이유를 선택기 옆에 적는다(조용히 그 달 숫자로 바꿔 보여주면 범위 라벨과 숫자가 어긋난다).
+  const rangeDays = isCustom ? customRangeDays(defaultValue.start_date, defaultValue.end_date) : null;
+  const rangeTooLong = rangeDays !== null && rangeDays > MAX_ANALYTICS_RANGE_DAYS;
   const thisMonth = currentCalendarMonth();
   const lastMonth = monthsAgo(1);
 
@@ -161,6 +166,11 @@ export function AnalyticsFilter({ defaultValue, periods, currentMonth }: Analyti
               className="rounded-apple-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
             />
           </div>
+          {rangeTooLong && (
+            <p role="alert" className="mb-2 text-xs text-destructive">
+              조회 기간은 최대 {MAX_ANALYTICS_RANGE_DAYS}일입니다 (선택: {rangeDays}일).
+            </p>
+          )}
         </div>
       )}
 

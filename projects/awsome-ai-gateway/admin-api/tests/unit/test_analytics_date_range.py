@@ -177,3 +177,42 @@ async def test_period_is_still_validated_in_range_mode():
 async def test_single_day_range_is_allowed():
     resp, _ = await _run(start_date="2026-09-03", end_date="2026-09-03")
     assert (resp.start_date, resp.end_date) == ("2026-09-03", "2026-09-03")
+
+
+# ── 범위 상한 / period 정합 ────────────────────────────────────────────────────
+
+
+async def test_range_longer_than_the_cap_is_rejected():
+    """2000-01-01~2100-12-31 같은 범위는 캐시되지 않는 요청 하나로 usage_logs 전체 집계를 6~9번 돌린다."""
+    from app.services.analytics_service import MAX_ANALYTICS_RANGE_DAYS
+
+    assert MAX_ANALYTICS_RANGE_DAYS == 93
+    with pytest.raises(ValidationError, match="at most 93 days"):
+        await _run(start_date="2026-09-01", end_date="2026-12-03")  # 양끝 포함 94일
+    with patch("app.services.analytics_service.AnalyticsRepository") as MockRepo:
+        _repo(MockRepo)
+        with pytest.raises(ValidationError):
+            await AnalyticsService().get_analytics(
+                _session(), period="2000-01", scope="all", start_date="2000-01-01",
+                end_date="2100-12-31", actor=_admin(),
+            )
+
+
+async def test_range_at_the_cap_is_allowed():
+    """대조군 — 정확히 93일(양끝 포함)은 받는다."""
+    resp, _ = await _run(start_date="2026-09-01", end_date="2026-12-02")
+    assert (resp.start_date, resp.end_date) == ("2026-09-01", "2026-12-02")
+
+
+async def test_period_must_be_the_month_of_start_date():
+    """period 는 응답 라벨·캐시 키·seed 판정에 쓰인다 — 범위와 다른 달이면 400."""
+    with pytest.raises(ValidationError, match="month of start_date"):
+        await _run(start_date="2026-08-25", end_date="2026-09-05")  # _run 은 period=2026-09
+
+    with patch("app.services.analytics_service.AnalyticsRepository") as MockRepo:
+        _repo(MockRepo)
+        resp = await AnalyticsService().get_analytics(  # 대조군 — start 의 달이면 달을 넘어도 된다
+            _session(), period="2026-08", scope="all", start_date="2026-08-25",
+            end_date="2026-09-05", actor=_admin(),
+        )
+    assert resp.start_date == "2026-08-25"

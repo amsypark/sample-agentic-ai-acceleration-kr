@@ -349,8 +349,9 @@ async def test_range_boundaries_are_kst_half_open(session):
 
 
 async def test_cross_month_range_reaches_into_the_previous_month(session):
-    """[08-31, 09-01] — 전월 마지막 순간(32)과 9월 첫 건(1). 월 필터로는 만들 수 없는 질의다."""
-    resp = await _analytics(session, start="2026-08-31", end="2026-09-01")
+    """[08-31, 09-01] — 전월 마지막 순간(32)과 9월 첫 건(1). 월 필터로는 만들 수 없는 질의다.
+    period 는 start_date 의 달이어야 한다(admin-ui 가 그렇게 보낸다)."""
+    resp = await _analytics(session, start="2026-08-31", end="2026-09-01", period="2026-08")
     assert resp.cost_summary.total_cost_usd == Decimal("33.00")
 
 
