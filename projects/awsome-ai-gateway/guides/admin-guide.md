@@ -709,9 +709,11 @@ Request body:
 |--------|------|------|
 | GET | `/admin/rate-limits/tree` | 계층 트리 |
 | PUT | `/admin/rate-limits/user/{user_id}` | 사용자 RL 설정 |
-| DELETE | `/admin/rate-limits/user/{user_id}` | 사용자 개인 RL 제거 — 팀 RL 상속으로 복귀 |
+| DELETE | `/admin/rate-limits/user/{user_id}` | 사용자 개인 RL 제거 — 팀이 있으면 팀 RL 을 다시 상속하고, 팀이 없으면 개인 한도 없이 GLOBAL 만 남는다 |
 | PUT | `/admin/rate-limits/team/{team_id}` | 팀 RL 설정 |
 | PUT | `/admin/rate-limits/global/{model}` | 글로벌 RL 설정 (`?release_alias=` — 아래 참고) |
+
+Rate Limit API 는 모두 **ADMIN 전용**이다(개인 RL 제거 포함). TEAM_LEADER 와 DEVELOPER 는 403 이다.
 
 Request body:
 ```jsonc
