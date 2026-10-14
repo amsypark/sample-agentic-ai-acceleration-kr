@@ -51,8 +51,6 @@ from app.services.account_credentials import (
 from app.services.bedrock_account_client import BedrockAccountClientProvider
 from app.services.router_service import RouterService
 
-pytestmark = pytest.mark.asyncio
-
 PROFILE_ROLE = "arn:aws:iam::444455556666:role/claude-code-bedrock"
 ALIAS_ROLE = "arn:aws:iam::111122223333:role/in-region-bedrock"
 OTHER_ROLE = "arn:aws:iam::777788889999:role/fallback-account"

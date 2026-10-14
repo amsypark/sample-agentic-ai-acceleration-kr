@@ -56,8 +56,6 @@ from app.services.account_credentials import (
 from app.services.bedrock_account_client import FAILURE_BACKOFF, BedrockAccountClientProvider
 from app.services.sigv4_signer import SigV4Signer
 
-pytestmark = pytest.mark.asyncio
-
 ROLE_ALIAS = "arn:aws:iam::111122223333:role/in-region-bedrock"
 ROLE_PROFILE = "arn:aws:iam::444455556666:role/app-bedrock"
 RUNTIME_ENDPOINT = "https://bedrock-runtime.us-east-2.amazonaws.com/openai"
