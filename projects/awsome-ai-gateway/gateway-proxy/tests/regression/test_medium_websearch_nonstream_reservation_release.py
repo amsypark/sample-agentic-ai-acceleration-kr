@@ -28,7 +28,8 @@ alias 하나에 클라이언트 재시도가 겹치면 그 사용자의 **다른
 
   (a) alias 계정 AssumeRole 실패 → 500. 카운터는 정확히 0.0, 원장 행은 없다
       (zero-usage finalize 는 XADD 전에 return 한다). 비스트리밍 출구 셋 × 두 라우트.
-      스트리밍 경로의 같은 실패도 같은 결과다(HTTP 는 200 + ``event: error``).
+      스트리밍 경로의 같은 실패도 세 출구 모두 같은 정산이다. HTTP 는 도구 루프만 200 +
+      ``event: error`` 이고, 두 패스스루는 어댑터의 500 을 그대로 쓴다.
   (b) 1턴 성공(usage) 뒤 2턴 실패 → 한 번만 정산, 원장에 1턴 usage, 음수 없음.
   (c) 성공 경로 → 한 번 정산, 카운터 = 실제 비용·토큰, 원장 한 행.
 
@@ -557,21 +558,30 @@ async def test_a_first_turn_account_failure_releases_the_reservation_exactly_onc
 
 
 @_redis_required
+@pytest.mark.parametrize("exit_", ["loop", "client_tool", "mcp_down"])
 @pytest.mark.parametrize("route", ["responses", "messages"])
 async def test_a_the_stream_path_settles_the_same_failure_the_same_way(
-    monkeypatch, real_redis, route
+    monkeypatch, real_redis, route, exit_
 ):
-    """대조: 스트리밍 스티처는 고치기 전에도 항상 on_usage 를 쐈다. 비스트리밍이 이것과 같아야 한다.
+    """대조: 스트리밍 출구 셋은 고치기 전에도 항상 정산했다. 비스트리밍이 이것과 같아야 한다.
 
-    HTTP 상태는 200 이다 — 스티처가 첫 턴 전에 상태를 고정하므로, 실패는 ``event: error`` 로만
-    보인다(docs/guides/multi-account-bedrock-setup.md §1.3).
+    정산하는 곳은 출구마다 다르다 — 도구 루프는 스티처의 finally, 두 패스스루(F-7 ·
+    AgentCore 다운)는 SSE 헬퍼의 zero-usage on_usage(KI-08). 결과는 같아야 한다.
+
+    HTTP 상태도 출구마다 다르다(docs/guides/multi-account-bedrock-setup.md §1.3). 도구 루프는
+    첫 턴 전에 200 을 고정하므로 실패가 ``event: error`` 로만 보이고, 두 패스스루는 어댑터의
+    500 을 그대로 쓴다.
     """
     out = await _drive(
-        monkeypatch, real_redis, route=route, exit_="loop", scenario="account_failure", stream=True
+        monkeypatch, real_redis, route=route, exit_=exit_, scenario="account_failure", stream=True
     )
 
-    assert out.status == 200
-    assert b"event: error" in out.raw and ACCOUNT_UNAVAILABLE_MESSAGE.encode() in out.raw, out.raw
+    if exit_ == "loop":
+        assert out.status == 200, out.raw
+        assert b"event: error" in out.raw, out.raw
+    else:
+        assert out.status == 500, out.raw
+    assert ACCOUNT_UNAVAILABLE_MESSAGE.encode() in out.raw, out.raw
     assert out.upstream_calls == 0
     _assert_reserved_before_settlement(out)
     assert all(abs(v) < 1e-9 for v in out.after.values()), out.after
