@@ -403,6 +403,7 @@ jobs:
             tests/regression/test_medium_cost_settle_reserved_scope.py \
             tests/regression/test_medium_tpm_settle_reserved_bucket.py \
             tests/regression/test_medium_reservation_release_on_denial.py \
+            tests/regression/test_medium_credential_failure_does_not_trip_breaker.py \
             tests/integration/test_rate_limit_cluster.py > /tmp/proof3.txt 2>&1
           status=$?
           tail -30 /tmp/proof3.txt

@@ -71,6 +71,16 @@ ACCOUNT_UNAVAILABLE_BODY = (
     b'{"error":{"type":"api_error","message":"' + ACCOUNT_UNAVAILABLE_MESSAGE.encode() + b'"}}'
 )
 
+#: 어댑터가 **상류를 부르기 전**, 자격증명 단계(프로필 역할의 AssumeRole, Mantle bearer mint,
+#: 프로필 계정 클라이언트 해석)에서 실패해 502 로 답할 때 그 headers dict 에 넣는 표지. 상태 코드와
+#: 본문은 표지가 없을 때와 같다. 폴백 루프는 표지가 있는 실패를 서킷 브레이커에 기록하지 않는다
+#: (``fallback_loop.run_fallback_loop``). 그 실패는 모델의 건강이 아니라 그 요청이 쓰는 계정의
+#: 문제이고, 브레이커 키(모델 id, alias 계정이 있으면 ``@계정``)는 라우팅 프로필을 모른다 — 세면
+#: 프로필 X 의 STS 장애가 같은 모델을 쓰는 프로필 Y 의 요청까지 브레이커가 열려 있는 동안 막는다.
+#: 라우트는 어댑터의 headers dict 를 클라이언트로 넘기지 않는다
+#: (``BedrockAdapter.invoke`` docstring).
+CREDENTIAL_FAILURE_MARKER = "x-gw-credential-failure"
+
 
 class AccountCredentialsUnavailable(RuntimeError):
     """대상 계정의 자격증명을 이번 요청에 쓸 수 없다.
@@ -106,7 +116,8 @@ class ProfileAssumeBackoff(RuntimeError):
 
     ⚠️ :class:`AccountCredentialsUnavailable` 의 하위 타입이 **아니다**. runtime·Mantle 어댑터는 그
     타입을 alias 계정의 고정 500 으로 바꾸고, 그 밖의 서명·인증 실패는 오늘처럼 502 다. 이 예외는
-    STS 실패가 그 경로에서 내던 것과 같은 502 로 가야 한다.
+    STS 실패가 그 경로에서 내던 것과 같은 502 로 가야 한다. 그 502 는 서킷 브레이커에 세지 않는다
+    (:data:`CREDENTIAL_FAILURE_MARKER`).
     """
 
     def __init__(self, role_arn: str) -> None:
