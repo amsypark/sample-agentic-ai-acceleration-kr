@@ -73,19 +73,32 @@ def _estimate_input_tokens(body: dict) -> int:
     return max(1, len(serialized.encode("utf-8")) // _BYTES_PER_TOKEN)
 
 
-def _base64_media_chars(node) -> int:
-    """body 안 base64 미디어 페이로드의 문자 수 합(base64 는 ASCII 라 바이트 수와 같다).
+#: 티어 판정에서 빼는 미디어 — AWS 가 해상도·길이 기반 토큰으로 세는 것만.
+_TOKENIZED_BY_SHAPE = ("image/", "audio/")
 
-    잡는 모양 — 티어가 있는 모델(GPT-5.6)이 받는 방언 중심:
-      · data URL ``data:<mime>;base64,<payload>`` — Responses ``input_image.image_url`` /
-        ``input_file.file_data``, Chat ``image_url.url`` / ``file.file_data``
+
+def _is_shape_media(mime: object) -> bool:
+    return isinstance(mime, str) and mime.lower().startswith(_TOKENIZED_BY_SHAPE)
+
+
+def _base64_media_chars(node) -> int:
+    """티어 판정에서 뺄 base64 이미지·오디오 페이로드의 문자 수 합(base64 는 ASCII = 바이트 수).
+
+    ⚠️ 이미지·오디오만 뺀다. 문서(PDF 등)와 텍스트는 그 **내용**이 프롬프트 토큰으로 청구되므로
+       빼면 short 예약·long 청구가 된다 — MIME 을 보지 않고 data URL·``bytes``·base64 dict 를
+       전부 빼던 처음 구현에서 1MB PDF 가 33 티어 토큰이 됐다(리뷰 프로브로 실측).
+
+    잡는 모양:
+      · data URL ``data:image/*`` / ``data:audio/*`` — Responses ``input_image.image_url``,
+        Chat ``image_url.url``
       · Chat ``input_audio.data`` (data URL 이 아닌 맨 base64)
-      · Anthropic ``{"type": "base64", "data": ...}``, Converse ``source.bytes``
+      · Anthropic ``{"type": "base64", "media_type": "image/*"|"audio/*", "data": ...}``
     """
     if isinstance(node, str):
         if node.startswith("data:"):
             head, sep, payload = node.partition(";base64,")
-            return len(payload) if sep and "," not in head else 0
+            if sep and "," not in head and _is_shape_media(head[len("data:"):]):
+                return len(payload)
         return 0
     if isinstance(node, list):
         return sum(_base64_media_chars(v) for v in node)
@@ -93,9 +106,11 @@ def _base64_media_chars(node) -> int:
         return 0
     total = 0
     for key, value in node.items():
-        if isinstance(value, str) and (
-            (key == "data" and node.get("type") == "base64")
-            or (key == "bytes")
+        if (
+            key == "data"
+            and isinstance(value, str)
+            and node.get("type") == "base64"
+            and _is_shape_media(node.get("media_type"))
         ):
             total += len(value)
         elif key == "input_audio" and isinstance(value, dict):
@@ -109,10 +124,11 @@ def _base64_media_chars(node) -> int:
 def _tier_prompt_tokens(model_config: ModelConfigSchema, body: dict, estimated_input: int) -> int:
     """272K 티어 **판정**에 쓰는 프롬프트 크기 — 예약량(``estimated_input``)은 바꾸지 않는다.
 
-    ⚠️ bytes/4 는 base64 미디어를 텍스트처럼 센다. AWS 는 이미지를 해상도 기반 수백~수천 토큰으로
-       세므로, ~1.1MB data URL 하나가 판정을 long 으로 밀어 CPM/CPH 를 2배로 잡고 멀티모달 요청에
-       거짓 429 를 낸다. 그래서 판정에서만 그 바이트를 뺀다. 이미지 토큰은 세지 않으므로 임계 근처의
-       텍스트+이미지 요청은 short 로 볼 수 있다 — 예약은 추정이고 settle 이 차액을 맞춘다.
+    ⚠️ bytes/4 는 base64 이미지·오디오를 텍스트처럼 센다. AWS 는 그것을 해상도·길이 기반 수백~수천
+       토큰으로 세므로, ~1.1MB data URL 하나가 판정을 long 으로 밀어 CPM/CPH 를 2배로 잡고 멀티모달
+       요청에 거짓 429 를 낸다. 그래서 판정에서만 그 바이트를 뺀다(문서·텍스트는 빼지 않는다 —
+       ``_base64_media_chars``). 이미지 토큰은 세지 않으므로 임계 근처의 텍스트+이미지 요청은 short
+       로 볼 수 있다 — 예약은 추정이고 settle 이 차액을 맞춘다.
 
     body 를 훑는 비용은 bytes/4 가 이미 long 일 때만 낸다(빼면 작아질 뿐이라 short 는 그대로).
     """

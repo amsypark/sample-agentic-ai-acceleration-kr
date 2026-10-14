@@ -305,12 +305,16 @@ def test_estimate_cost_falls_back_to_short_when_long_rate_missing():
     assert cost == expected.quantize(Decimal("0.000001"))
 
 
-# ── 티어 판정에서 base64 미디어 바이트 제외 ─────────────────────────────────────
+# ── 티어 판정에서 base64 이미지·오디오 바이트 제외 ──────────────────────────────
 #
 # 예약량(TPM·비용 크기)은 body 전체의 bytes/4 그대로 둔다. 바뀌는 것은 **티어 판정**뿐이다:
-# 이미지·파일의 base64 바이트는 프롬프트 토큰이 아니라서(AWS 는 이미지를 해상도 기반 수백~수천
-# 토큰으로 센다) ~1.1MB 짜리 data URL 하나가 요청을 long 티어로 밀어 CPM/CPH 를 2배로 잡고,
-# 멀티모달 요청에 거짓 429 를 낸다.
+# 이미지·오디오의 base64 바이트는 프롬프트 토큰이 아니라서(AWS 는 해상도·길이 기반 토큰으로
+# 센다) ~1.1MB 짜리 data URL 하나가 요청을 long 티어로 밀어 CPM/CPH 를 2배로 잡고, 멀티모달
+# 요청에 거짓 429 를 낸다.
+#
+# ⚠️ 문서(PDF 등)와 텍스트는 빼면 안 된다 — 그 **내용**이 프롬프트 토큰으로 청구된다. 처음 구현은
+#    MIME 을 보지 않고 data URL·``bytes``·``{"type":"base64","data"}`` 를 전부 뺐고, 1MB PDF 가 33
+#    티어 토큰이 되어 short 예약·long 청구로 "예약 ≥ 청구" 가 깨졌다(리뷰 프로브로 실측).
 
 _MEDIA = "A" * 1_100_000  # base64 1.1MB ≈ bytes/4 로 275K "토큰" — 임계(272K) 초과
 
@@ -328,16 +332,6 @@ _MEDIA_BODIES = {
         [
             {"type": "input_text", "text": "describe this"},
             {"type": "input_image", "image_url": f"data:image/png;base64,{_MEDIA}"},
-        ]
-    ),
-    "responses_input_file": _responses_body(
-        [
-            {"type": "input_text", "text": "summarize"},
-            {
-                "type": "input_file",
-                "filename": "a.pdf",
-                "file_data": f"data:application/pdf;base64,{_MEDIA}",
-            },
         ]
     ),
     "chat_image_url": {
@@ -365,6 +359,62 @@ _MEDIA_BODIES = {
             }
         ],
     },
+    "anthropic_image_base64": {
+        "model": "gpt-5.6-terra",
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": _MEDIA},
+                    },
+                ],
+            }
+        ],
+    },
+}
+
+#: 대조군 — 내용이 프롬프트 토큰으로 청구되므로 **빼면 안 되는** 것들(전부 long 으로 예약돼야 한다).
+_COUNTED_BODIES = {
+    "responses_pdf_input_file": _responses_body(
+        [
+            {"type": "input_text", "text": "summarize"},
+            {
+                "type": "input_file",
+                "filename": "spec.pdf",
+                "file_data": f"data:application/pdf;base64,{_MEDIA}",
+            },
+        ]
+    ),
+    "anthropic_pdf_document": {
+        "model": "gpt-5.6-terra",
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": _MEDIA,
+                        },
+                    },
+                ],
+            }
+        ],
+    },
+    "text_under_a_bytes_key": _responses_body(
+        [{"type": "input_text", "text": "call the tool"}]
+    )
+    | {"tools": [{"type": "function", "name": "w", "parameters": {"bytes": "x " * 550_000}}]},
+    "text_as_untyped_base64_dict": _responses_body(
+        [{"type": "x", "content": {"type": "base64", "data": "x " * 550_000}}]
+    ),
 }
 
 
@@ -442,5 +492,18 @@ async def test_text_over_the_threshold_still_reserves_at_long_rates(monkeypatch,
 
     body = _responses_body([{"type": "input_text", "text": "x" * 1_100_000}])
     estimated_input = _estimate_input_tokens(body)
+    reserved = await _reserved_cost_for(monkeypatch, mock_redis, body)
+    assert reserved == _expected(estimated_input, 1000, long=True), reserved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_COUNTED_BODIES))
+async def test_documents_and_text_still_count_for_the_tier(monkeypatch, mock_redis, shape):
+    """⚠️ 대조군 — 문서·텍스트는 티어 판정에서 빠지면 안 된다(short 예약·long 청구가 된다)."""
+    from app.services.rate_limit_enforcement import _estimate_input_tokens
+
+    body = _COUNTED_BODIES[shape]
+    estimated_input = _estimate_input_tokens(body)
+    assert estimated_input > _THRESHOLD, "전제: bytes/4 로 임계를 넘는 body 다"
     reserved = await _reserved_cost_for(monkeypatch, mock_redis, body)
     assert reserved == _expected(estimated_input, 1000, long=True), reserved
