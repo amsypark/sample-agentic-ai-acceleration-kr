@@ -5,6 +5,8 @@ from pathlib import Path
 
 import structlog
 
+from app.services.lua_loader import LuaScriptLoader
+
 logger = structlog.get_logger(__name__)
 
 _LUA_PATH = Path(__file__).resolve().parent.parent / "redis_scripts" / "circuit_breaker.lua"
@@ -32,7 +34,8 @@ class CircuitBreakerService:
         self.open_sec = open_sec
         self.halfopen_ttl_ms = halfopen_ttl_ms
         self.open_jitter_sec = open_jitter_sec
-        self._lua = _LUA_PATH.read_text(encoding="utf-8")
+        # 다른 스크립트와 같이 주석을 빼고 보낸다(LuaScriptLoader 참조 — EVAL 마다 본문이 간다).
+        self._lua = LuaScriptLoader.strip_comments(_LUA_PATH.read_text(encoding="utf-8"))
 
     @staticmethod
     def _keys(pmid: str) -> tuple[str, str, str]:
