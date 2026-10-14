@@ -260,13 +260,20 @@ CREATE TABLE IF NOT EXISTS model.rate_limit_configs (
 
 CREATE INDEX IF NOT EXISTS idx_rate_limit_configs_scope ON model.rate_limit_configs (scope, scope_id) WHERE is_active = true;
 
--- migration 0024 와 동일. model_alias 는 키에 넣지 않는다 — upsert 가 alias 무관하게
--- 해당 scope 의 활성 행 전부를 비활성화하므로, alias 를 넣으면 실제 중복 창이 열린다.
--- COALESCE(scope_id, ...) 는 필수 — GLOBAL scope 는 scope_id IS NULL 이고,
--- unique index 에서 NULL 은 서로 구별되므로 그냥 (scope, scope_id) 로는 보호되지 않는다.
+-- migration 0046 과 동일(0024 를 대체). 활성 행의 유일성은 두 인덱스로 나뉜다.
+--   USER/TEAM — 주체당 1개. model_alias 는 키에 넣지 않는다: 그 upsert 는 alias 무관하게 주체의
+--               활성 행 전부를 비활성화하므로, alias 를 넣으면 실제 중복 창이 열린다.
+--   GLOBAL    — model alias 당 1개(GLOBAL 행의 alias 는 model_alias 에 있고 scope_id 는 NULL 이다).
+--               Bedrock 쿼터는 모델별이고, 한 모델의 저장이 다른 모델의 한도를 풀지 않는다.
+-- COALESCE 는 필수 — unique index 에서 NULL 은 서로 구별되므로 NULL 인 키 컬럼은 묶어야 보호된다.
+-- ⚠️ 이 SQL 은 매 마이그레이션 Job 에서 alembic 보다 먼저 돈다. IF NOT EXISTS 는 이름만 보므로
+--    0045 DB 에서는 첫 문장이 no-op 이고(옛 정의가 남는다) 0046 이 그 정의를 바꾼다.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_limit_configs_active
     ON model.rate_limit_configs (scope, COALESCE(scope_id, '00000000-0000-0000-0000-000000000000'::uuid))
-    WHERE is_active = true;
+    WHERE is_active = true AND scope <> 'GLOBAL';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_limit_configs_global_active
+    ON model.rate_limit_configs (COALESCE(model_alias, ''))
+    WHERE is_active = true AND scope = 'GLOBAL';
 
 -- ------------------------------------------------------------
 -- 팀별 모델 접근 제어

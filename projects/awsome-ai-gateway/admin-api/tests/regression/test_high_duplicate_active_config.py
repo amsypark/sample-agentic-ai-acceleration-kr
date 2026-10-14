@@ -17,6 +17,11 @@ Fix, two independent layers:
 
 Both regressions share one fix, one migration and one test rig, so they share one file.
 
+Since migration ``0046`` GLOBAL rate limits are per model: one active GLOBAL row per model alias
+(``uq_rate_limit_configs_global_active``), while USER/TEAM keep one active row per subject
+(``uq_rate_limit_configs_active``, now excluding GLOBAL). ``TestGlobalIndexIsPerModel`` races
+writers of different and of identical aliases on that schema.
+
 Two findings were measured on real PostgreSQL 16 while developing this fix and are asserted below,
 because each is easy to get wrong in a way that still looks correct:
 
@@ -26,7 +31,8 @@ because each is easy to get wrong in a way that still looks correct:
     team that has none" is the common case.
   * The unique indexes MUST wrap the nullable key columns in ``COALESCE``. NULLs are distinct in a
     unique index, so a plain index leaves exactly the rows that matter unprotected: the org-wide
-    budget (``client IS NULL``) and the GLOBAL rate limit (``scope_id IS NULL``).
+    budget (``client IS NULL``) and the GLOBAL rate limit (``scope_id IS NULL``). Since 0046 the
+    GLOBAL index is keyed on ``COALESCE(model_alias, '')`` for the same reason.
 
 The static assertions run everywhere. The behavioural proofs need real PostgreSQL — MVCC snapshot
 semantics are the thing under test, so a mock or SQLite would prove nothing — and are skipped
@@ -230,6 +236,17 @@ def _migration_index_ddl(name: str) -> str:
     return match.group(0).replace("{NIL_UUID}", NIL_UUID)
 
 
+def _executed_0024_index_sql(name: str) -> str:
+    """The exact statement 0024's ``upgrade()`` executes for one index (module constants resolved) —
+    executable, unlike ``_migration_index_ddl``'s source fragment."""
+    from tests.regression.test_high_model_registry_claude5 import _op_execute_sql
+
+    prefix = f"CREATE UNIQUE INDEX IF NOT EXISTS {name} "
+    hits = [s for s in _op_execute_sql(_MIGRATION, "upgrade").split("\n") if s.startswith(prefix)]
+    assert len(hits) == 1, f"{name}: {hits}"
+    return hits[0]
+
+
 def _all_index_ddl(name: str) -> list[tuple[str, str]]:
     """(source label, emitted DDL) for both places the index is defined."""
     return [(_INIT_SQL.name, _index_ddl(name)), (_MIGRATION.name, _migration_index_ddl(name))]
@@ -255,6 +272,9 @@ def test_indexes_coalesce_the_nullable_key_columns():
         assert f"COALESCE(scope_id, '{NIL_UUID}'::uuid)" in ddl, (
             f"{label}: scope_id must be COALESCEd — GLOBAL scope stores NULL"
         )
+    assert "(COALESCE(model_alias, ''))" in _index_ddl("uq_rate_limit_configs_global_active"), (
+        "the GLOBAL index must COALESCE model_alias, or two alias-less GLOBAL rows coexist"
+    )
 
 
 @pytest.mark.unit
@@ -269,8 +289,9 @@ def test_dedupe_partitions_match_the_index_keys():
 
 @pytest.mark.unit
 def test_rate_limit_index_is_not_keyed_on_model_alias():
-    """Mirrors the lock key. Since the upsert deactivates alias-blind, keying the index on
-    model_alias would leave the real duplicate window open while looking protective."""
+    """Mirrors the lock key. Since the USER/TEAM upsert deactivates alias-blind, keying that index
+    on model_alias would leave the real duplicate window open while looking protective. (GLOBAL has
+    its own index, keyed on the alias — 0046.)"""
     for label, ddl in _all_index_ddl("uq_rate_limit_configs_active"):
         assert "model_alias" not in ddl, f"{label}: {ddl}"
 
@@ -282,6 +303,20 @@ def test_indexes_are_partial_on_is_active():
     for name in ("uq_budget_configs_active", "uq_rate_limit_configs_active"):
         for label, ddl in _all_index_ddl(name):
             assert "WHERE is_active = true" in ddl, f"{label}: {name} must be partial"
+    assert "WHERE is_active = true AND scope = 'GLOBAL'" in _index_ddl(
+        "uq_rate_limit_configs_global_active"
+    )
+
+
+@pytest.mark.unit
+def test_the_two_rate_limit_indexes_split_the_scopes_without_overlap():
+    """0046: the USER/TEAM index must exclude GLOBAL — or, keyed on (scope, nil) for every GLOBAL
+    row, it would keep GLOBAL single-slot no matter what the GLOBAL index says — and the GLOBAL
+    index must cover only GLOBAL."""
+    assert _index_ddl("uq_rate_limit_configs_active").endswith(
+        "WHERE is_active = true AND scope <> 'GLOBAL'"
+    )
+    assert "scope = 'GLOBAL'" in _index_ddl("uq_rate_limit_configs_global_active")
 
 
 # ===========================================================================
@@ -417,7 +452,7 @@ async def _drop_owned_db() -> None:
         await admin.dispose()
 
 
-async def _bootstrap(*, with_indexes: bool):
+async def _bootstrap(*, with_indexes: bool, extra_ddl: tuple[str, ...] = ()):
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -426,7 +461,12 @@ async def _bootstrap(*, with_indexes: bool):
     _require_scratch_db(PROOF_DSN)
     ddl = list(_BASE_DDL)
     if with_indexes:
-        ddl += [_index_ddl("uq_budget_configs_active"), _index_ddl("uq_rate_limit_configs_active")]
+        ddl += [
+            _index_ddl("uq_budget_configs_active"),
+            _index_ddl("uq_rate_limit_configs_active"),
+            _index_ddl("uq_rate_limit_configs_global_active"),
+        ]
+    ddl += list(extra_ddl)
 
     # gen_random_uuid() lives in pgcrypto on PostgreSQL < 13 and is built in from 13 on; the
     # shipped DDL relies on it, so make it available before the tables that default to it.
@@ -458,6 +498,18 @@ async def sm_no_index():
     await _drop_owned_db()
 
 
+@pytest.fixture
+async def sm_single_slot():
+    """Revision 0045's rate-limit index (0024's DDL, one active GLOBAL row in total) — the control
+    for the per-model GLOBAL proofs."""
+    engine, maker = await _bootstrap(
+        with_indexes=False, extra_ddl=(_executed_0024_index_sql("uq_rate_limit_configs_active"),)
+    )
+    yield maker
+    await engine.dispose()
+    await _drop_owned_db()
+
+
 def _budget(scope_id: uuid.UUID, amount: str, client: str | None = None):
     from app.models.budget import BudgetConfig, BudgetPolicy, BudgetScope, PeriodType
 
@@ -469,7 +521,7 @@ def _budget(scope_id: uuid.UUID, amount: str, client: str | None = None):
     )
 
 
-def _rate_limit(scope, scope_id: uuid.UUID | None, rpm: int, model_alias: str | None = None):
+def _rate_limit(scope, scope_id: uuid.UUID | None, rpm: int | None, model_alias: str | None = None):
     from app.models.model import RateLimitConfig
 
     return RateLimitConfig(
@@ -867,3 +919,68 @@ class TestLegitimateMultiRowCasesStillWork:
             sm, "SELECT count(*) FROM budget.budget_configs WHERE scope_id=:t", t=team
         ) == 4
         assert await _scalar(sm, _ACTIVE_BUDGETS, t=team) == 1
+
+
+_ACTIVE_GLOBAL_BY_ALIAS = (
+    "SELECT model_alias, rpm_limit FROM model.rate_limit_configs "
+    "WHERE scope='GLOBAL' AND scope_id IS NULL AND is_active=true ORDER BY model_alias"
+)
+
+
+async def _rows(sm, sql: str):
+    from sqlalchemy import text
+
+    async with sm() as session:
+        return [tuple(r) for r in (await session.execute(text(sql))).all()]
+
+
+@_DB
+@pytest.mark.integration
+class TestGlobalIndexIsPerModel:
+    """0046 — the schema keeps one active GLOBAL row per model alias. Exercised by the lock-free
+    adversary, so it is the index alone that is under test: it must reject a second active row for
+    the same model and admit rows for different models."""
+
+    async def test_index_rejects_an_unlocked_writer_of_the_same_alias(self, sm):
+        from app.models.model import RateLimitScope
+
+        errs = await _race(sm, _rl_upsert,
+                           _rate_limit(RateLimitScope.GLOBAL, None, 1000, "alias-a"),
+                           _rate_limit(RateLimitScope.GLOBAL, None, 2000, "alias-a"),
+                           repo=_LockFreeRateLimitRepo)
+        assert len(errs) == 1, f"expected the unlocked loser to be rejected, got {errs}"
+        assert "uq_rate_limit_configs_global_active" in str(errs[0])
+        assert await _rows(sm, _ACTIVE_GLOBAL_BY_ALIAS) == [("alias-a", 1000)]
+
+    async def test_control_without_the_index_the_unlocked_writers_duplicate(self, sm_no_index):
+        from app.models.model import RateLimitScope
+
+        errs = await _race(sm_no_index, _rl_upsert,
+                           _rate_limit(RateLimitScope.GLOBAL, None, 1000, "alias-a"),
+                           _rate_limit(RateLimitScope.GLOBAL, None, 2000, "alias-a"),
+                           repo=_LockFreeRateLimitRepo)
+        assert not errs, f"{errs}"
+        assert await _rows(sm_no_index, _ACTIVE_GLOBAL_BY_ALIAS) == [("alias-a", 1000), ("alias-a", 2000)]
+
+    async def test_index_admits_unlocked_writers_of_different_aliases(self, sm):
+        """The GLOBAL index must not over-constrain: different models are different keys."""
+        from app.models.model import RateLimitScope
+
+        errs = await _race(sm, _rl_upsert,
+                           _rate_limit(RateLimitScope.GLOBAL, None, 1000, "alias-a"),
+                           _rate_limit(RateLimitScope.GLOBAL, None, 2000, "alias-b"),
+                           repo=_LockFreeRateLimitRepo)
+        assert not errs, f"{errs}"
+        assert await _rows(sm, _ACTIVE_GLOBAL_BY_ALIAS) == [("alias-a", 1000), ("alias-b", 2000)]
+
+    async def test_control_the_0045_index_rejects_the_second_alias(self, sm_single_slot):
+        """Revision 0045's index is why per-model GLOBAL limits needed a migration, not just code."""
+        from app.models.model import RateLimitScope
+
+        errs = await _race(sm_single_slot, _rl_upsert,
+                           _rate_limit(RateLimitScope.GLOBAL, None, 1000, "alias-a"),
+                           _rate_limit(RateLimitScope.GLOBAL, None, 2000, "alias-b"),
+                           repo=_LockFreeRateLimitRepo)
+        assert len(errs) == 1 and "uq_rate_limit_configs_active" in str(errs[0]), f"{errs}"
+        assert await _rows(sm_single_slot, _ACTIVE_GLOBAL_BY_ALIAS) == [("alias-a", 1000)]
+
