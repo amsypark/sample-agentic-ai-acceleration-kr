@@ -29,6 +29,8 @@
   8. analytics scope 는 닫힌 집합이다 — TEAM_LEADER 가 'xyz'·'ALL'·' all' 로 물으면 데이터를 읽기 전에
      400 이고, 'all' 은 자기 팀으로만 좁혀진다(예전: 앞의 셋이 전사 범위로 떨어져 다른 팀 사용자
      이메일까지 화면·CSV 로 나갔다).
+  9. 팀 예산 배정(PUT /admin/budgets/team/{id}/allocate)은 그 팀의 멤버에게만 쓴다 — 리더가 자기 팀
+     URL 로 다른 팀 사용자의 개인 예산을 덮어쓰지 못한다(예전: user_id 의 소속을 보지 않았다).
 
 실행::
 
@@ -869,3 +871,64 @@ async def test_leader_all_is_scoped_to_the_own_team(session):
         session, format="csv", period=PERIOD, group_by="user", scope="all", actor=leader
     )
     assert "range-b@example.com" not in csv_body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. 팀 예산 배정 — 팀 밖 사용자
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _user_budget(session, user_id) -> Decimal | None:
+    from sqlalchemy import text
+
+    return (
+        await session.execute(
+            text(
+                "SELECT max_budget_usd FROM budget.budget_configs "
+                "WHERE scope = 'USER' AND scope_id = :u AND client IS NULL AND is_active"
+            ),
+            {"u": user_id},
+        )
+    ).scalar_one_or_none()
+
+
+async def test_leader_cannot_overwrite_another_teams_user_budget(session):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.core.auth import CurrentUser
+    from app.core.exceptions import ForbiddenError, ValidationError
+    from app.models.auth import UserRole
+    from app.schemas.budgets import AllocateBudgetItem, AllocateBudgetRequest, SetBudgetRequest
+    from app.services.budget_service import BudgetService
+
+    cache = MagicMock()
+    cache.invalidate = AsyncMock()
+    cache._redis = AsyncMock()
+    svc = BudgetService(cache_mgr=cache)
+    admin = CurrentUser(user_id=SEED_ADMIN_ID, email="admin@example.com", role=UserRole.ADMIN, team_id=None)
+    # 리더 신원은 실재하는 시드 팀 사용자여야 한다(budget_configs.allocated_by FK).
+    leader = CurrentUser(user_id=U_SEED, email="range-seed@example.com", role=UserRole.TEAM_LEADER, team_id=SEED_TEAM_ID)
+
+    # TEAM_B 사용자에게 개인 예산 $100 이 있다 — 이 값이 리더의 시도 뒤에도 그대로여야 한다.
+    await svc.set_user_budget(session, user_id=U_B, data=SetBudgetRequest(max_budget_usd=Decimal("100")), actor=admin)
+    await session.commit()
+    assert await _user_budget(session, U_B) == Decimal("100")
+
+    attack = AllocateBudgetRequest(allocations=[
+        AllocateBudgetItem(user_id=str(U_A), allocated_usd=Decimal("10")),  # 자기 팀 멤버
+        AllocateBudgetItem(user_id=str(U_B), allocated_usd=Decimal("0")),  # 다른 팀 사용자
+    ])
+    with pytest.raises(ForbiddenError):
+        await svc.allocate_team_budget(session, team_id=SEED_TEAM_ID, data=attack, actor=leader)
+    await session.rollback()
+    assert await _user_budget(session, U_B) == Decimal("100"), "다른 팀 사용자의 예산이 덮어써졌다"
+
+    with pytest.raises(ValidationError):  # 관리자라도 팀 밖 사용자는 이 팀의 배정 대상이 아니다
+        await svc.allocate_team_budget(session, team_id=SEED_TEAM_ID, data=attack, actor=admin)
+    await session.rollback()
+
+    # 대조군 — 자기 팀 멤버만이면 배정된다.
+    ok = AllocateBudgetRequest(allocations=[AllocateBudgetItem(user_id=str(U_A), allocated_usd=Decimal("10"))])
+    await svc.allocate_team_budget(session, team_id=SEED_TEAM_ID, data=ok, actor=leader)
+    await session.commit()
+    assert await _user_budget(session, U_A) == Decimal("10")

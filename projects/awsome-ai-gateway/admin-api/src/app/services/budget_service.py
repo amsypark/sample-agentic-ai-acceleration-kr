@@ -577,6 +577,36 @@ class BudgetService:
         if actor.role == UserRole.TEAM_LEADER and actor.team_id != team_id:
             raise ForbiddenError("Team leaders can only allocate budgets within their own team")
 
+        # ⚠️ 배정 대상이 **이 팀의 멤버인지** 확인한다. 위 검사는 URL 의 team_id 만 본다 — 본문의
+        #    user_id 는 아무 사용자나 될 수 있었고, 아래 루프가 그 사용자의 개인 예산 행을 그대로
+        #    덮어썼다. 즉 TEAM_LEADER 가 자기 팀 URL 로 **다른 팀(또는 팀 없는) 사용자의 예산**을
+        #    마음대로 바꿀 수 있었다(예: 남의 한도를 0 으로 만들어 차단, 자기 사람에게 무제한).
+        #    UUID 가 아닌 user_id 는 예전엔 uuid.UUID 의 ValueError 로 500 이었다 → 400.
+        user_ids: list[uuid.UUID] = []
+        for alloc in data.allocations:
+            try:
+                user_ids.append(uuid.UUID(alloc.user_id))
+            except ValueError:
+                raise ValidationError(f"Invalid user_id: {alloc.user_id!r}") from None
+        from sqlalchemy import select
+
+        from app.models.auth import User
+
+        members = set(
+            (
+                await session.execute(
+                    select(User.id).where(User.id.in_(user_ids), User.team_id == team_id)
+                )
+            ).scalars().all()
+        )
+        outsiders = sorted(str(u) for u in user_ids if u not in members)
+        if outsiders:
+            message = f"Users are not members of team {team_id}: {', '.join(outsiders)}"
+            # 리더에게는 권한 문제(403), 관리자에게는 잘못된 요청(400)이다 — 어느 쪽도 쓰지 않는다.
+            if actor.role == UserRole.TEAM_LEADER:
+                raise ForbiddenError(message)
+            raise ValidationError(message)
+
         repo = BudgetRepository(session)
         team_config = await repo.get_active_config(BudgetScope.TEAM, team_id)
         if team_config is None:
@@ -591,8 +621,7 @@ class BudgetService:
 
         # Batch upsert user budgets
         cache_keys: list[str] = []
-        for alloc in data.allocations:
-            uid = uuid.UUID(alloc.user_id)
+        for alloc, uid in zip(data.allocations, user_ids):
             config = BudgetConfig(
                 id=uuid.uuid4(),
                 scope=BudgetScope.USER,

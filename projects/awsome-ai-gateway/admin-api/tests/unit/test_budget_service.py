@@ -128,6 +128,13 @@ class TestSetUserBudget:
         repo.upsert_config.assert_called_once()
 
 
+def _members(session: AsyncMock, *user_ids: str) -> None:
+    """allocate 의 팀 멤버십 조회가 이 사용자들을 **그 팀의 멤버**로 돌려주게 한다."""
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [uuid.UUID(u) for u in user_ids]
+    session.execute = AsyncMock(return_value=result)
+
+
 class TestAllocateTeamBudget:
     async def test_team_leader_cannot_allocate_other_team(
         self, budget_service: BudgetService, mock_session: AsyncMock, team_leader_user: CurrentUser
@@ -150,6 +157,7 @@ class TestAllocateTeamBudget:
             AllocateBudgetItem(user_id=str(uuid.uuid4()), allocated_usd=Decimal("600.00")),
             AllocateBudgetItem(user_id=str(uuid.uuid4()), allocated_usd=Decimal("600.00")),
         ])
+        _members(mock_session, *(a.user_id for a in data.allocations))
 
         team_config = MagicMock(spec=BudgetConfig)
         team_config.max_budget_usd = Decimal("1000.00")
@@ -169,6 +177,7 @@ class TestAllocateTeamBudget:
         data = AllocateBudgetRequest(allocations=[
             AllocateBudgetItem(user_id=str(uuid.uuid4()), allocated_usd=Decimal("100.00")),
         ])
+        _members(mock_session, data.allocations[0].user_id)
 
         with patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo:
             MockBudgetRepo.return_value.get_active_config = AsyncMock(return_value=None)
@@ -177,6 +186,52 @@ class TestAllocateTeamBudget:
                 await budget_service.allocate_team_budget(
                     mock_session, team_id=team_id, data=data, actor=admin_user
                 )
+
+
+class TestAllocateMembership:
+    """배정 대상은 **그 팀의 멤버**여야 한다 — URL 의 team_id 검사만으로는 본문의 user_id 를 못 막는다."""
+
+    async def test_leader_cannot_allocate_to_a_user_outside_the_team(
+        self, budget_service: BudgetService, mock_session: AsyncMock, team_leader_user: CurrentUser
+    ):
+        member, outsider = str(uuid.uuid4()), str(uuid.uuid4())
+        data = AllocateBudgetRequest(allocations=[
+            AllocateBudgetItem(user_id=member, allocated_usd=Decimal("10.00")),
+            AllocateBudgetItem(user_id=outsider, allocated_usd=Decimal("0.00")),
+        ])
+        _members(mock_session, member)  # outsider 는 이 팀 멤버가 아니다
+
+        with patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo:
+            repo = MockBudgetRepo.return_value
+            repo.upsert_config = AsyncMock()
+            with pytest.raises(ForbiddenError, match=outsider):
+                await budget_service.allocate_team_budget(
+                    mock_session, team_id=team_leader_user.team_id, data=data, actor=team_leader_user
+                )
+        repo.upsert_config.assert_not_awaited()  # 팀 멤버 것도 쓰지 않는다 — 요청 전체가 거부다
+
+    async def test_admin_allocating_an_outsider_is_a_bad_request(
+        self, budget_service: BudgetService, mock_session: AsyncMock, admin_user: CurrentUser
+    ):
+        data = AllocateBudgetRequest(allocations=[
+            AllocateBudgetItem(user_id=str(uuid.uuid4()), allocated_usd=Decimal("1.00")),
+        ])
+        _members(mock_session)  # 아무도 멤버가 아니다
+        with pytest.raises(ValidationError, match="not members"):
+            await budget_service.allocate_team_budget(
+                mock_session, team_id=uuid.uuid4(), data=data, actor=admin_user
+            )
+
+    async def test_non_uuid_user_id_is_a_400_not_a_500(
+        self, budget_service: BudgetService, mock_session: AsyncMock, admin_user: CurrentUser
+    ):
+        data = AllocateBudgetRequest(allocations=[
+            AllocateBudgetItem(user_id="not-a-uuid", allocated_usd=Decimal("1.00")),
+        ])
+        with pytest.raises(ValidationError, match="Invalid user_id"):
+            await budget_service.allocate_team_budget(
+                mock_session, team_id=uuid.uuid4(), data=data, actor=admin_user
+            )
 
 
 class TestGetBudgetSummary:
