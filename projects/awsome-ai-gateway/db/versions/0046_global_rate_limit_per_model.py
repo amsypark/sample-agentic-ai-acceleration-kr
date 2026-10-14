@@ -89,7 +89,8 @@ init SQL 이 먼저 GLOBAL 인덱스를 만들고(옛 인덱스가 아직 있어
 
   * 실제 한도(rpm 또는 tpm)를 가진, alias 있는 활성 GLOBAL 행이 2개 이상이면 **실패한다**. 메시지에
     모델·한도 목록과 정리 방법을 담는다. 트랜잭션이 롤백되므로 아무것도 바뀌지 않고
-    ``alembic_version`` 도 0046 그대로다.
+    ``alembic_version`` 도 0046 그대로다. 메시지의 정리 SQL(``KEEP_ONE_GLOBAL_SQL``)은 남길 alias 에 실제
+    한도가 없으면(자리표시자를 그대로 두었거나 오타) 아무것도 해제하지 않고, COMMIT 없이 끝난다.
   * 아무것도 집행하지 않는 활성 GLOBAL 행은 판정에서 빼고 비활성화한다(삭제가 아니다, 이력은 남는다):
     rpm·tpm 이 모두 NULL 인 행(콘솔에서 값을 비우고 저장한 모델 — gateway-proxy 는 GLOBAL 의 cpm/cph 를
     읽지 않는다)과 alias 가 없는 행(SQL 로만 생기고, gateway-proxy 는 GLOBAL 을 alias 로만 읽으며 콘솔
@@ -106,6 +107,8 @@ init SQL 이 먼저 GLOBAL 인덱스를 만들고(옛 인덱스가 아직 있어
    만든다). 되돌릴 대상 리비전은 0045 가 아니라 **이전 차트의 alembic head** 다 — 순서와 명령은
    deployment/docs/eks-fargate/06-upgrade-rollback.md §4.4.
 """
+
+import textwrap
 
 from alembic import op
 
@@ -218,6 +221,42 @@ ACTIVE_GLOBAL_ROWS = (
     "ORDER BY model_alias NULLS FIRST"
 )
 
+# downgrade 거부 메시지의 정리 SQL — 한도 하나만 남기고 나머지를 해제한다. 남길 alias 는 한 곳에만 적는다.
+#   · 그 alias 에 실제 한도(rpm 또는 tpm)를 가진 활성 GLOBAL 행이 없으면(자리표시자 그대로·오타) DO 블록이
+#     멈춘다 — 예전 형태는 그 경우 남길 한도까지 전부 해제하고 커밋했다.
+#   · UPDATE 도 같은 조건을 다시 본다. psql 이 오류 뒤에도 계속 가는 설정(ON_ERROR_ROLLBACK)이어도 아무것도
+#     해제하지 않는다.
+#   · COMMIT 은 넣지 않는다 — 운영자가 돌려준 행을 보고 COMMIT 또는 ROLLBACK 한다.
+# 감사 기록까지 남기는 형태는 deployment/docs/eks-fargate/06-upgrade-rollback.md §4.4 에 있다(실 PG 대조:
+# admin-api tests/regression/test_high_global_rate_limit_0046_real_db.py).
+KEEP_ONE_GLOBAL_SQL = """\
+BEGIN;
+SET LOCAL rl.allow_global_release = 'on';
+SET LOCAL rl.keep_alias = '<alias to keep>';
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM model.rate_limit_configs
+         WHERE scope = 'GLOBAL' AND is_active
+           AND model_alias = current_setting('rl.keep_alias')
+           AND (rpm_limit IS NOT NULL OR tpm_limit IS NOT NULL)
+    ) THEN
+        RAISE EXCEPTION '% has no active GLOBAL limit. Nothing was changed; run ROLLBACK.',
+            current_setting('rl.keep_alias');
+    END IF;
+END
+$$;
+UPDATE model.rate_limit_configs SET is_active = false, updated_at = now()
+ WHERE scope = 'GLOBAL' AND is_active
+   AND model_alias IS DISTINCT FROM current_setting('rl.keep_alias')
+   AND EXISTS (
+       SELECT 1 FROM model.rate_limit_configs k
+        WHERE k.scope = 'GLOBAL' AND k.is_active
+          AND k.model_alias = current_setting('rl.keep_alias')
+          AND (k.rpm_limit IS NOT NULL OR k.tpm_limit IS NOT NULL))
+RETURNING model_alias, rpm_limit, tpm_limit;
+"""
+
 
 def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
@@ -247,13 +286,11 @@ def downgrade() -> None:
             "your call. Keep one and clear the rest, then rerun the downgrade:\n"
             "  - in the console: empty RPM and TPM and save (audit-logged; this downgrade then "
             "deactivates the empty rows), or\n"
-            "  - in SQL, in one transaction (0046 refuses to release a GLOBAL limit otherwise):\n"
-            "      BEGIN;\n"
-            "      SET LOCAL rl.allow_global_release = 'on';\n"
-            "      UPDATE model.rate_limit_configs SET is_active = false, updated_at = now()\n"
-            "       WHERE scope = 'GLOBAL' AND is_active\n"
-            "         AND model_alias IS DISTINCT FROM '<alias to keep>';\n"
-            "      COMMIT;\n"
+            "  - in SQL, in an interactive psql session. The SET LOCAL bypass is needed because 0046 "
+            "refuses to release a GLOBAL limit otherwise. The alias to keep goes in one place; if it "
+            "has no active GLOBAL limit, the block stops and changes nothing. Otherwise it leaves "
+            "the transaction open: check the returned rows, then COMMIT (or ROLLBACK):\n"
+            f"{textwrap.indent(KEEP_ONE_GLOBAL_SQL, '      ')}"
             "    (deployment/docs/eks-fargate/06-upgrade-rollback.md section 4.4 has the "
             "audit-logged form.)\n"
             "Nothing was changed."

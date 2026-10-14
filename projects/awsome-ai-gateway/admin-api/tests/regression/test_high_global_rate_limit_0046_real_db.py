@@ -9,8 +9,11 @@
      바꾸지 않는다(대조군: 판정이 없으면 0045 인덱스 생성이 PostgreSQL 의 중복 키 오류로 죽는다).
   3. 아무것도 집행하지 않는 행 — rpm·tpm 이 모두 NULL 이거나 alias 가 없는 행 — 은 판정에서 빠지고, 트리거를
      ``SET LOCAL`` 로 우회해 비활성화되며 감사 로그가 남는다(대조군: alias 없는 행을 세던 판정은 거부했다).
-  4. 문서(06-upgrade-rollback §4.4)의 정리 SQL 은 그 블록을 **그대로** 실행한다 — 우회 없이는 커밋에서
-     거부되고(대조군), 우회는 그 트랜잭션에만 걸린다.
+  4. 정리 SQL — 문서(06-upgrade-rollback §4.4)의 블록과 downgrade 거부 메시지의 SQL — 을 **그대로** 실행한다.
+     남길 alias 에 실제 한도가 없으면(자리표시자를 그대로 두었거나 오타) 멈추고 아무것도 바꾸지 않는다
+     (대조군: 예전 형태는 남길 한도까지 전부 해제하고 커밋했다). DO 블록 뒤에 psql 이 계속 가도 UPDATE 가 해제하지
+     않는다. 맞는 alias 면 운영자가 COMMIT 한 뒤에 한도 하나가 남는다. 우회 없이는 커밋에서 거부되고(대조군),
+     우회는 그 트랜잭션에만 걸린다.
   5. 0046 은 양방향 모두 ACCESS EXCLUSIVE 를 **먼저** 잡는다 — 이 테이블을 읽고 이어서 쓰는 트랜잭션이
      끝까지 간다(대조군: SHARE·SHARE ROW EXCLUSIVE 에서 올리던 순서는 그 트랜잭션을 교착으로 죽였다).
   6. init SQL 의 0046 블록은 객체가 있으면 잠그지 않고, 만들어야 할 때만 잠그며 그 대기는 lock_timeout 5s 로
@@ -42,6 +45,7 @@ import importlib.util
 import os
 import re
 import sys
+import textwrap
 import time
 import types
 from pathlib import Path
@@ -253,6 +257,8 @@ async def test_downgrade_refuses_while_two_models_hold_a_limit(engine, m0046):
     assert "claude-sonnet-4-6[1m]" not in message and "None: rpm" not in message
     assert "SET LOCAL rl.allow_global_release = 'on';" in message
     assert "updated_at = now()" in message and "Nothing was changed" in message
+    assert textwrap.indent(m0046.KEEP_ONE_GLOBAL_SQL, "      ") in message  # 아래 4 가 실행하는 SQL
+    assert "COMMIT;" not in message, "정리 SQL 이 운영자 확인 없이 커밋한다"
     # 트랜잭션이 롤백됐다 — 비활성화도 감사 기록도 남지 않았다.
     assert (await _state(engine), await _all(engine, _ACTIVE_GLOBAL)) == before
     assert await _all(engine, _AUDITED_RELEASES) == []
@@ -314,7 +320,7 @@ async def test_control_without_set_constraints_immediate_the_downgrade_ddl_is_re
     assert [kind for kind, _ in (await _state(engine))[1]] == ["function", "trigger"]
 
 
-# ── 4. 문서의 정리 SQL ────────────────────────────────────────────────────────────────────
+# ── 4. 정리 SQL(문서·거부 메시지) ───────────────────────────────────────────────────────────
 
 
 def _documented_cleanup(keep: str) -> str:
@@ -324,35 +330,159 @@ def _documented_cleanup(keep: str) -> str:
     assert len(blocks) == 1, f"정리 SQL 블록을 하나만 찾아야 한다: {len(blocks)}"
     sql = blocks[0]
     for placeholder in ("<남길 alias>", "<운영자 user id>"):
-        assert placeholder in sql, placeholder
+        assert sql.count(placeholder) == 1, placeholder
     return sql.replace("<남길 alias>", keep).replace("<운영자 user id>", str(SEED_ADMIN_ID))
 
 
-async def test_the_documented_cleanup_needs_the_bypass_and_it_stays_in_its_transaction(
-    dsn, engine, m0046
-):
-    import asyncpg
+def _message_cleanup(m0046, keep: str) -> str:
+    """downgrade 거부 메시지의 정리 SQL(``KEEP_ONE_GLOBAL_SQL``) — 자리표시자만 채운다."""
+    sql = m0046.KEEP_ONE_GLOBAL_SQL
+    assert sql.count("<alias to keep>") == 1
+    return sql.replace("<alias to keep>", keep)
 
+
+_SOURCES = ("doc", "message")
+_PLACEHOLDER = {"doc": "<남길 alias>", "message": "<alias to keep>"}
+
+
+def _cleanup(source: str, m0046, keep: str) -> str:
+    return _documented_cleanup(keep) if source == "doc" else _message_cleanup(m0046, keep)
+
+
+def _keep(source: str, keep: str) -> str:
+    return _PLACEHOLDER[source] if keep == "placeholder" else keep
+
+
+# 리뷰 전 형태 그대로(대조군으로만 쓴다) — 남길 alias 를 확인하지 않고 COMMIT 으로 끝났다.
+_PREVIOUS_CLEANUP = {
+    "doc": """\
+BEGIN;
+SET LOCAL rl.allow_global_release = 'on';
+WITH released AS (
+    UPDATE model.rate_limit_configs SET is_active = false, updated_at = now()
+     WHERE scope = 'GLOBAL' AND is_active AND model_alias IS DISTINCT FROM '{keep}'
+    RETURNING id, model_alias, rpm_limit, tpm_limit
+)
+INSERT INTO audit.audit_logs
+    (actor_user_id, actor_role, action, resource_type, resource_id, changes,
+     result, ip_address, request_id)
+SELECT '{actor}'::uuid, 'ADMIN', 'DELETE_RATE_LIMIT', 'RateLimitConfig', id::text,
+       jsonb_build_object(
+           'before', jsonb_build_object(
+               'scope', 'GLOBAL', 'model_alias', model_alias,
+               'rpm', rpm_limit, 'tpm', tpm_limit),
+           'after', jsonb_build_object('scope', 'GLOBAL', 'deactivated', 1),
+           'reason', 'manual cleanup before alembic downgrade below 0046'),
+       'SUCCESS', '0.0.0.0', 'manual-0046-downgrade'
+  FROM released
+RETURNING resource_id, changes -> 'before';
+COMMIT;
+""",
+    "message": """\
+BEGIN;
+SET LOCAL rl.allow_global_release = 'on';
+UPDATE model.rate_limit_configs SET is_active = false, updated_at = now()
+ WHERE scope = 'GLOBAL' AND is_active
+   AND model_alias IS DISTINCT FROM '{keep}';
+COMMIT;
+""",
+}
+
+_TWO_LIMITS = [("claude-opus-4-7", 60, None), ("claude-sonnet-4-6", 30, None)]
+
+
+async def _two_limits(engine) -> None:
     await _global(engine, "claude-opus-4-7", rpm=60)
     await _global(engine, "claude-sonnet-4-6", rpm=30)
-    sql = _documented_cleanup("claude-opus-4-7")
+    assert await _all(engine, _ACTIVE_GLOBAL) == _TWO_LIMITS
+
+
+@pytest.mark.parametrize("source", _SOURCES)
+@pytest.mark.parametrize("keep", ["placeholder", "claude-opus-4.7"])
+async def test_the_cleanup_sql_refuses_an_alias_to_keep_without_a_limit(dsn, engine, m0046, source, keep):
+    """자리표시자를 그대로 두었거나 alias 에 오타가 있으면 DO 블록이 멈춘다 — 아무것도 해제되지 않고 감사
+    기록도 없다. 트랜잭션은 실패 상태로 남아 운영자가 ROLLBACK 한다."""
+    import asyncpg
+
+    await _two_limits(engine)
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        with pytest.raises(asyncpg.RaiseError, match="has no active GLOBAL limit"):
+            await conn.execute(_cleanup(source, m0046, _keep(source, keep)))
+        assert conn.is_in_transaction()
+        await conn.execute("ROLLBACK")
+    finally:
+        await conn.close()
+    assert await _all(engine, _ACTIVE_GLOBAL) == _TWO_LIMITS
+    assert await _all(engine, _AUDITED_RELEASES) == []
+
+
+@pytest.mark.parametrize("source", _SOURCES)
+async def test_the_cleanup_update_releases_nothing_even_if_psql_goes_on_after_the_do_block(
+    dsn, engine, m0046, source
+):
+    """psql 이 오류 뒤에도 트랜잭션을 이어 가면(ON_ERROR_ROLLBACK) DO 블록 다음 문장이 돈다 — 그 경우를 DO 블록을
+    뺀 같은 SQL 로 본다. UPDATE 가 같은 조건을 다시 보므로 COMMIT 해도 해제되는 행이 없다."""
+    import asyncpg
+
+    await _two_limits(engine)
+    sql, removed = re.subn(r"DO \$\$\n.*?\n\s*\$\$;\n", "", _cleanup(source, m0046, "claude-opus-4.7"), flags=re.S)
+    assert removed == 1
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        await conn.execute(sql)
+        await conn.execute("COMMIT")
+    finally:
+        await conn.close()
+    assert await _all(engine, _ACTIVE_GLOBAL) == _TWO_LIMITS
+    assert await _all(engine, _AUDITED_RELEASES) == []
+
+
+@pytest.mark.parametrize("source", _SOURCES)
+@pytest.mark.parametrize("keep", ["placeholder", "claude-opus-4.7"])
+async def test_control_the_previous_cleanup_sql_released_every_limit(dsn, engine, source, keep):
+    """대조군 — 예전 형태는 자리표시자 그대로·오타 하나로 남길 한도까지 전부 해제하고 커밋했다(오류 없음)."""
+    import asyncpg
+
+    await _two_limits(engine)
+    sql = _PREVIOUS_CLEANUP[source].format(keep=_keep(source, keep), actor=SEED_ADMIN_ID)
+    conn = await asyncpg.connect(_plain(dsn))
+    try:
+        await conn.execute(sql)
+    finally:
+        await conn.close()
+    assert await _all(engine, _ACTIVE_GLOBAL) == []
+
+
+@pytest.mark.parametrize("source", _SOURCES)
+async def test_the_cleanup_sql_keeps_one_limit_once_the_operator_commits(dsn, engine, m0046, source):
+    import asyncpg
+
+    await _two_limits(engine)
+    sql = _cleanup(source, m0046, "claude-opus-4-7")
 
     conn = await asyncpg.connect(_plain(dsn))
     try:
-        # 대조군 — 우회 없는 같은 UPDATE 는 커밋에서 거부되고 아무것도 바뀌지 않는다.
+        # 대조군 — 우회 없는 같은 SQL 은 커밋에서 거부되고 아무것도 바뀌지 않는다.
         without_bypass = sql.replace("SET LOCAL rl.allow_global_release = 'on';", "")
+        assert without_bypass != sql
+        await conn.execute(without_bypass)
         with pytest.raises(asyncpg.CheckViolationError, match="claude-sonnet-4-6"):
-            await conn.execute(without_bypass)
-        if conn.is_in_transaction():
-            await conn.execute("ROLLBACK")
-        assert len(await _all(engine, _ACTIVE_GLOBAL)) == 2
+            await conn.execute("COMMIT")
+        assert await _all(engine, _ACTIVE_GLOBAL) == _TWO_LIMITS
 
-        await conn.execute(sql)  # 문서 그대로 — BEGIN … COMMIT
+        await conn.execute(sql)  # 그대로 — COMMIT 없이 끝난다
+        assert conn.is_in_transaction()
+        assert [tuple(r) for r in await conn.fetch(_ACTIVE_GLOBAL)] == [("claude-opus-4-7", 60, None)]
+        assert await _all(engine, _ACTIVE_GLOBAL) == _TWO_LIMITS, "COMMIT 전에 다른 연결에 보였다"
+        await conn.execute("COMMIT")
         assert await _all(engine, _ACTIVE_GLOBAL) == [("claude-opus-4-7", 60, None)]
-        assert await _all(engine, _AUDITED_RELEASES) == [("claude-sonnet-4-6", "30")]
+        audited = [("claude-sonnet-4-6", "30")] if source == "doc" else []
+        assert await _all(engine, _AUDITED_RELEASES) == audited
 
-        # 우회는 그 트랜잭션에서 끝났다 — 같은 연결의 다음 해제는 다시 거부된다.
+        # 우회와 남길 alias 는 그 트랜잭션에서 끝났다 — 같은 연결의 다음 해제는 다시 거부된다.
         assert await conn.fetchval("SELECT current_setting('rl.allow_global_release', true)") == ""
+        assert await conn.fetchval("SELECT current_setting('rl.keep_alias', true)") == ""
         with pytest.raises(asyncpg.CheckViolationError):
             await conn.execute(
                 "UPDATE model.rate_limit_configs SET is_active = false, updated_at = now() "

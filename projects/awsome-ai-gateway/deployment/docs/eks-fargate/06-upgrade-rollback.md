@@ -251,16 +251,37 @@ prod 의 이전 차트(main)는 head 가 0042 다. 0045 까지만 내리고 그 
    GLOBAL 행이 2개 이상이면 아무것도 바꾸지 않고 실패한다 — 자동으로 하나만 남기면 나머지 모델의 Bedrock 쿼터
    보호가 신호 없이 사라지고, 어느 모델을 남길지는 운영 판단이기 때문이다. 이 차트의 콘솔에서 나머지 모델의
    RPM·TPM 을 비우고 저장하거나(감사 로그가 남는다. 이전 콘솔에는 GLOBAL 노드가 없다), SQL 로 한 트랜잭션에서
-   우회와 감사 기록을 함께 남긴다(SQL 은 언제든 된다). `<운영자 user id>` 는 본인의 `auth.users.id` 다.
+   우회와 감사 기록을 함께 남긴다(SQL 은 언제든 된다). SQL 은 psql 대화형 세션에 붙여 넣는다. `<남길 alias>` 는
+   `SET LOCAL rl.keep_alias` 한 곳에만 적고, `<운영자 user id>` 는 본인의 `auth.users.id` 다.
 
    ```sql
    SELECT model_alias, rpm_limit, tpm_limit FROM model.rate_limit_configs
     WHERE scope = 'GLOBAL' AND is_active ORDER BY model_alias;
    BEGIN;
    SET LOCAL rl.allow_global_release = 'on';
+   SET LOCAL rl.keep_alias = '<남길 alias>';
+   DO $$
+   BEGIN
+       IF NOT EXISTS (
+           SELECT 1 FROM model.rate_limit_configs
+            WHERE scope = 'GLOBAL' AND is_active
+              AND model_alias = current_setting('rl.keep_alias')
+              AND (rpm_limit IS NOT NULL OR tpm_limit IS NOT NULL)
+       ) THEN
+           RAISE EXCEPTION '% has no active GLOBAL limit. Nothing was changed; run ROLLBACK.',
+               current_setting('rl.keep_alias');
+       END IF;
+   END
+   $$;
    WITH released AS (
        UPDATE model.rate_limit_configs SET is_active = false, updated_at = now()
-        WHERE scope = 'GLOBAL' AND is_active AND model_alias IS DISTINCT FROM '<남길 alias>'
+        WHERE scope = 'GLOBAL' AND is_active
+          AND model_alias IS DISTINCT FROM current_setting('rl.keep_alias')
+          AND EXISTS (
+              SELECT 1 FROM model.rate_limit_configs k
+               WHERE k.scope = 'GLOBAL' AND k.is_active
+                 AND k.model_alias = current_setting('rl.keep_alias')
+                 AND (k.rpm_limit IS NOT NULL OR k.tpm_limit IS NOT NULL))
        RETURNING id, model_alias, rpm_limit, tpm_limit
    )
    INSERT INTO audit.audit_logs
@@ -276,8 +297,14 @@ prod 의 이전 차트(main)는 head 가 0042 다. 0045 까지만 내리고 그 
           'SUCCESS', '0.0.0.0', 'manual-0046-downgrade'
      FROM released
    RETURNING resource_id, changes -> 'before';
-   COMMIT;
    ```
+
+   블록은 **COMMIT 없이** 끝난다. 마지막 `RETURNING` 이 해제한 행 — 남길 alias 를 뺀 활성 GLOBAL 행 전부 — 을
+   보여 준다. 맞으면 `COMMIT;`, 아니면 `ROLLBACK;` 을 직접 친다. `<남길 alias>` 에 실제 한도(rpm 또는 tpm)를 가진
+   활성 GLOBAL 행이 없으면(자리표시자를 그대로 두었거나 오타) DO 블록이 오류로 멈추고, 이어지는 문장은
+   `current transaction is aborted` 로 실행되지 않는다. 아무것도 바뀌지 않았으니 `ROLLBACK;` 한다. UPDATE 도
+   같은 조건을 다시 보므로, psql 이 오류 뒤에도 트랜잭션을 이어 가는 설정(`ON_ERROR_ROLLBACK`)이어도 해제되는
+   행은 없다.
 
    `SET LOCAL` 없이 같은 UPDATE 를 커밋하면 트리거가 거부한다. rpm·tpm 이 모두 비어 있는 행과 alias 없는 행은
    아무것도 집행하지 않으므로 다운그레이드가 비활성화하고 행마다 `DELETE_RATE_LIMIT` 감사 기록을 남긴다.
