@@ -25,6 +25,7 @@ def _make_entry(
     team_id: str = "00000000-0000-0000-0000-000000000002",
     cost: str = "0.01",
     threshold: int | None = None,
+    aws_account_id: str | None = None,
 ) -> CostStreamEntry:
     return CostStreamEntry(
         request_id=request_id,
@@ -46,6 +47,7 @@ def _make_entry(
         period="2026-04",
         date="2026-04-21",
         threshold_triggered=threshold,
+        aws_account_id=aws_account_id,
     )
 
 
@@ -173,3 +175,45 @@ async def test_daily_counter_pipeline_uses_hash_tag():
     # incrbyfloat 첫 호출의 key 확인 — hash tag 포함.
     keys_seen = [call.args[0] for call in pipe.incrbyfloat.call_args_list]
     assert any("{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}" in k for k in keys_seen)
+
+
+# ── 서빙 계정 (마이그레이션 0045) ─────────────────────────────────────────────────
+
+
+def test_insert_names_the_serving_account_column():
+    """usage_logs INSERT 가 aws_account_id 컬럼과 바인드를 둘 다 가져야 한다 — 하나만 있으면
+    값이 조용히 유실되거나(컬럼 없음) 매 flush 가 죽는다(바인드 없음)."""
+    from worker.batch_flusher import _INSERT_USAGE_LOGS
+
+    sql = str(_INSERT_USAGE_LOGS)
+    assert ", aws_account_id" in sql and ":aws_account_id" in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+async def test_insert_params_carry_the_serving_account():
+    session = AsyncMock()
+    session.execute = AsyncMock()
+    flusher = BatchFlusher(session_factory=MagicMock(), redis=MagicMock())
+
+    await flusher._insert_usage_logs(session, [_make_entry(aws_account_id="111122223333")])
+    assert session.execute.await_args.args[1][0]["aws_account_id"] == "111122223333"
+
+    # None = 게이트웨이 자신의 계정 — 그대로 NULL 로 간다.
+    session.execute.reset_mock()
+    await flusher._insert_usage_logs(session, [_make_entry()])
+    assert session.execute.await_args.args[1][0]["aws_account_id"] is None
+
+
+@pytest.mark.parametrize("bad", ["12345", "1111222233334", "ABCDEFGHIJKL", "", 111122223333])
+def test_a_malformed_account_is_dropped_rather_than_failing_the_batch(bad):
+    """VARCHAR(12) 원장 컬럼: 형식이 어긋난 값 하나가 INSERT 를 실패시키면 배치 전체가 기록되지
+    않는다(XACK 안 됨 → 재시도 반복). 감사 정보만 비우고 과금 행은 살린다."""
+    assert _make_entry(aws_account_id=bad).aws_account_id is None
+
+
+def test_an_entry_from_a_pre_0045_gateway_parses():
+    """롤아웃 순서 무관: 필드가 없는 엔트리도 그대로 읽힌다."""
+    raw = _make_entry().model_dump(mode="json")
+    raw.pop("aws_account_id")
+    assert CostStreamEntry.model_validate(raw).aws_account_id is None

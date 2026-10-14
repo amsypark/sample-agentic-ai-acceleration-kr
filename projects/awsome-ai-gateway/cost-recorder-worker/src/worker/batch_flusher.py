@@ -38,7 +38,7 @@ _INSERT_USAGE_LOGS = text(
         reasoning_tokens, web_search_count,
         cost_usd, latency_ms, ttft_ms, status, requested_at, completed_at,
         is_streaming, estimated_usage, downgraded_from, availability_fallback_from,
-        sso_subject, bedrock_request_id, client, context_tier
+        sso_subject, bedrock_request_id, client, context_tier, aws_account_id
     ) VALUES (
         gen_random_uuid(),
         :request_id,
@@ -65,7 +65,7 @@ _INSERT_USAGE_LOGS = text(
         :availability_fallback_from,
         :sso_subject,
         :bedrock_request_id,
-        :client, :context_tier
+        :client, :context_tier, :aws_account_id
     )
     ON CONFLICT (request_id) DO NOTHING
     """
@@ -326,6 +326,9 @@ class BatchFlusher:
                 "bedrock_request_id": e.bedrock_request_id,
                 "client": e.client,
                 "context_tier": e.context_tier,
+                # 서빙 계정 (0045). 정산이 bedrock_request_id 를 어느 계정의 invocation log 에서
+                # 찾을지 알려 준다. None = 게이트웨이 자신의 계정.
+                "aws_account_id": e.aws_account_id,
             }
             for e in entries
         ]

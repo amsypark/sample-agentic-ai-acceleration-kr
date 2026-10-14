@@ -287,15 +287,17 @@ jobs:
           uv run pytest -q -p no:cacheprovider \
             tests/regression/test_high_per_app_budget_rows.py \
             tests/regression/test_high_replay_and_orphan_pel.py \
-            tests/regression/test_medium_context_tier_persisted.py > /tmp/proof2.txt 2>&1
+            tests/regression/test_medium_context_tier_persisted.py \
+            tests/regression/test_medium_aws_account_persisted.py > /tmp/proof2.txt 2>&1
           status=$?
           tail -30 /tmp/proof2.txt
           if [ "$status" -ne 0 ]; then exit "$status"; fi
           passed=$(grep -oE "[0-9]+ passed" /tmp/proof2.txt | tail -1 | grep -oE "[0-9]+" || echo 0)
-          # 로컬 실측 기준선: 21 passed (per-app 9 + replay/PEL 9 + context_tier 3).
+          # 로컬 실측 기준선: 24 passed (per-app 9 + replay/PEL 9 + context_tier 3
+          #   + aws_account_id 3, 0045).
           # ⚠️ replay/PEL 파일은 PROOF_DSN **과** REDIS_PROOF_URL 을 모두 요구한다 —
           #    한쪽만 걸리면 통과 수가 떨어져 여기서 실패한다.
-          if [ "${passed:-0}" -lt 20 ]; then
+          if [ "${passed:-0}" -lt 23 ]; then
             echo "::error::통과 ${passed} 건 — PROOF_DSN 이 안 걸려 DB 테스트가 skip 됐다."
             exit 1
           fi
