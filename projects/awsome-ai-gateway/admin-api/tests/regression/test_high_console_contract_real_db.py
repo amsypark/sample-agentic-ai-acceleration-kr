@@ -31,7 +31,8 @@
      400 이고, 'all' 은 자기 팀으로만 좁혀진다(예전: 앞의 셋이 전사 범위로 떨어져 다른 팀 사용자
      이메일까지 화면·CSV 로 나갔다).
   9. 팀 예산 배정(PUT /admin/budgets/team/{id}/allocate)은 그 팀의 멤버에게만 쓴다 — 리더가 자기 팀
-     URL 로 다른 팀 사용자의 개인 예산을 덮어쓰지 못한다(예전: user_id 의 소속을 보지 않았다).
+     URL 로 다른 팀 사용자의 개인 예산을 덮어쓰지 못한다(예전: user_id 의 소속을 보지 않았다). 팀 없는
+     리더는 팀 없는 사용자의 예산도 다루지 못한다(예전: None != None 이 False 라 통과).
   10. /admin/my/budget 의 팀 예산 상태 — 미배정 / 예산 없음 / 있음, 그리고 예산이 있어도 게이트웨이가
      거부하는 **소진** 상태(이번 KST 월의 budget_usages TEAM 행으로, 지난달 행은 섞이지 않는다).
 
@@ -1007,6 +1008,48 @@ async def test_leader_cannot_overwrite_another_teams_user_budget(session):
     await svc.allocate_team_budget(session, team_id=SEED_TEAM_ID, data=ok, actor=leader)
     await session.commit()
     assert await _user_budget(session, U_A) == Decimal("10")
+
+
+async def test_teamless_leader_cannot_manage_a_teamless_users_budget(session):
+    """팀 없는 TEAM_LEADER 와 팀 없는 사용자(auth.users.team_id IS NULL) — 예전 가드
+    `user.team_id != actor.team_id` 는 None != None 이 False 라 통과했고, 리더가 그 사용자의 예산을 썼다.
+
+    리더 신원은 이 트랜잭션 안에서 만든 실제 사용자 행이다(budget_configs.allocated_by FK) — 그래야 예전
+    코드에서 쓰기가 FK 오류가 아니라 **성공**해 이 테스트가 정확한 이유로 실패한다. 끝에 되돌린다."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from sqlalchemy import text
+
+    from app.core.auth import CurrentUser
+    from app.core.exceptions import ForbiddenError
+    from app.models.auth import UserRole
+    from app.schemas.budgets import SetBudgetRequest
+    from app.services.budget_service import BudgetService
+
+    cache = MagicMock()
+    cache.invalidate = AsyncMock()
+    cache._redis = AsyncMock()
+    svc = BudgetService(cache_mgr=cache)
+    leader_id = uuid.uuid4()
+    leader = CurrentUser(user_id=leader_id, email="noteam-leader@example.com", role=UserRole.TEAM_LEADER, team_id=None)
+    before = await _user_budget(session, U_TEAMLESS)
+    try:
+        await session.execute(
+            text(
+                "INSERT INTO auth.users (id, team_id, email, display_name, role, sso_subject) "
+                "VALUES (:u, NULL, 'noteam-leader@example.com', 'noteam-leader', 'TEAM_LEADER', :sub)"
+            ),
+            {"u": leader_id, "sub": f"sub-{leader_id}"},
+        )
+        with pytest.raises(ForbiddenError):
+            await svc.set_user_budget(
+                session, user_id=U_TEAMLESS, data=SetBudgetRequest(max_budget_usd=Decimal("999")), actor=leader
+            )
+        with pytest.raises(ForbiddenError):
+            await svc.get_user_app_budgets(session, user_id=U_TEAMLESS, actor=leader)
+        assert await _user_budget(session, U_TEAMLESS) == before, "팀 없는 리더가 팀 없는 사용자의 예산을 바꿨다"
+    finally:
+        await session.rollback()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

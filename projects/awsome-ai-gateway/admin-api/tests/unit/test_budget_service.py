@@ -128,6 +128,79 @@ class TestSetUserBudget:
         repo.upsert_config.assert_called_once()
 
 
+# ── 팀 없는 TEAM_LEADER — `None != None` 은 False 라 팀 검사를 통과해 버렸다 ──────────────────────
+
+
+@pytest.fixture
+def teamless_leader() -> CurrentUser:
+    return CurrentUser(
+        user_id=uuid.UUID("00000000-0000-0000-0000-000000000003"),
+        email="leader-noteam@test.com",
+        role=UserRole.TEAM_LEADER,
+        team_id=None,
+    )
+
+
+def _user_in(team_id: uuid.UUID | None) -> MagicMock:
+    user = MagicMock(spec=User)
+    user.team_id = team_id
+    return user
+
+
+_GUARDED_CALLS = {
+    "set_user_budget": {"data": SetBudgetRequest(max_budget_usd=Decimal("100"))},
+    "set_user_client_budget": {"client": "claude-code", "data": SetBudgetRequest(max_budget_usd=Decimal("10"))},
+    "clear_user_client_budget": {"client": "claude-code"},
+    "get_user_app_budgets": {},
+}
+
+
+class TestTeamlessLeader:
+    """팀 없는 TEAM_LEADER 는 누구의 예산도 관리하지 못한다 — 특히 팀 없는 사용자의 것.
+
+    가드가 `user.team_id != actor.team_id` 뿐이었다. 둘 다 None 이면 False 라 검사를 통과해, 팀 없는
+    리더가 팀 없는 사용자의 개인·앱별 예산을 쓰고 지우고 읽을 수 있었다(게이트웨이는 팀 없는 사용자를
+    어차피 거부하지만, 예산 행·감사 로그·화면 값은 실제로 바뀐다)."""
+
+    @pytest.mark.parametrize("call", list(_GUARDED_CALLS))
+    async def test_teamless_leader_is_refused_for_a_teamless_user(
+        self, budget_service: BudgetService, mock_session: AsyncMock, teamless_leader: CurrentUser, call: str
+    ):
+        passed = AssertionError("passed the team guard")
+        with patch("app.services.budget_service.UserRepository") as MockUserRepo, \
+             patch("app.services.budget_service.BudgetRepository", side_effect=passed), \
+             patch("app.services.user_allowed_client_service.UserAllowedClientService", side_effect=passed):
+            MockUserRepo.return_value.get_user = AsyncMock(return_value=_user_in(None))
+            with pytest.raises(ForbiddenError):
+                await getattr(budget_service, call)(
+                    mock_session, user_id=uuid.uuid4(), actor=teamless_leader, **_GUARDED_CALLS[call]
+                )
+
+    async def test_leader_with_a_team_still_reads_own_members(
+        self, budget_service: BudgetService, mock_session: AsyncMock, team_leader_user: CurrentUser
+    ):
+        """대조군 — 팀이 있는 리더는 자기 팀 멤버를 그대로 다룬다."""
+        with patch("app.services.budget_service.UserRepository") as MockUserRepo, \
+             patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo:
+            MockUserRepo.return_value.get_user = AsyncMock(return_value=_user_in(team_leader_user.team_id))
+            MockBudgetRepo.return_value.get_first_active_app_config = AsyncMock(return_value=None)
+            out = await budget_service.get_user_app_budgets(
+                mock_session, user_id=uuid.uuid4(), actor=team_leader_user
+            )
+        assert out == []
+
+    async def test_admin_still_reads_a_teamless_user(
+        self, budget_service: BudgetService, mock_session: AsyncMock, admin_user: CurrentUser
+    ):
+        """대조군 — ADMIN 은 팀과 무관하다."""
+        with patch("app.services.budget_service.UserRepository") as MockUserRepo, \
+             patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo:
+            MockUserRepo.return_value.get_user = AsyncMock(return_value=_user_in(None))
+            MockBudgetRepo.return_value.get_first_active_app_config = AsyncMock(return_value=None)
+            out = await budget_service.get_user_app_budgets(mock_session, user_id=uuid.uuid4(), actor=admin_user)
+        assert out == []
+
+
 def _members(session: AsyncMock, *user_ids: str) -> None:
     """allocate 의 팀 멤버십 조회(UserRepository.team_member_ids)가 이 사용자들을 그 팀의 멤버로
     돌려주게 한다 — 실제 SELECT 는 이 리포지토리 메서드가 한다(실 PG 증명은 console 계약 파일)."""

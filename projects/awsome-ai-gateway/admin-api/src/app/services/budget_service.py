@@ -277,8 +277,10 @@ class BudgetService:
             raise NotFoundError("User", str(user_id))
 
         # BR-BUD-03: Team leader can only set budgets for own team
+        # ⚠️ 팀 없는 리더(actor.team_id None)는 누구의 예산도 다루지 못한다. `user.team_id != actor.team_id`
+        #    만 보면 팀 없는 사용자에게는 None != None → False 라 통과했다. 아래 앱별 예산 3곳도 같은 규칙이다.
         if actor.role == UserRole.TEAM_LEADER:
-            if user.team_id != actor.team_id:
+            if actor.team_id is None or user.team_id != actor.team_id:
                 raise ForbiddenError("Team leaders can only set budgets for their own team members")
 
         # BR-BUD-01: Validate member budget sum <= team budget
@@ -395,9 +397,9 @@ class BudgetService:
         if user is None:
             raise NotFoundError("User", str(user_id))
 
-        # BR-BUD-03: Team leaders can only set budgets for their own team members.
+        # BR-BUD-03: Team leaders can only set budgets for their own team members (팀 없는 리더는 불가 — set_user_budget).
         if actor.role == UserRole.TEAM_LEADER:
-            if user.team_id != actor.team_id:
+            if actor.team_id is None or user.team_id != actor.team_id:
                 raise ForbiddenError("Team leaders can only set budgets for their own team members")
 
         from app.services.user_allowed_client_service import UserAllowedClientService
@@ -497,7 +499,7 @@ class BudgetService:
         if user is None:
             raise NotFoundError("User", str(user_id))
         if actor.role == UserRole.TEAM_LEADER:
-            if user.team_id != actor.team_id:
+            if actor.team_id is None or user.team_id != actor.team_id:  # 팀 없는 리더는 불가 — set_user_budget
                 raise ForbiddenError("Team leaders can only set budgets for their own team members")
 
         repo = BudgetRepository(session)
@@ -548,7 +550,8 @@ class BudgetService:
         user = await user_repo.get_user(user_id)
         if user is None:
             raise NotFoundError("User", str(user_id))
-        if actor.role == UserRole.TEAM_LEADER and user.team_id != actor.team_id:
+        # 팀 없는 리더는 불가 — set_user_budget 의 ⚠️ 참조(None != None 은 False).
+        if actor.role == UserRole.TEAM_LEADER and (actor.team_id is None or user.team_id != actor.team_id):
             raise ForbiddenError("Team leaders can only read budgets for their own team members")
 
         repo = BudgetRepository(session)
