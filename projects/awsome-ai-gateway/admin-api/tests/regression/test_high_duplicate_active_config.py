@@ -19,8 +19,8 @@ Both regressions share one fix, one migration and one test rig, so they share on
 
 Since migration ``0046`` GLOBAL rate limits are per model: one active GLOBAL row per model alias
 (``uq_rate_limit_configs_global_active``), while USER/TEAM keep one active row per subject
-(``uq_rate_limit_configs_active``, now excluding GLOBAL). ``TestGlobalIndexIsPerModel`` races
-writers of different and of identical aliases on that schema.
+(``uq_rate_limit_configs_active``, now excluding GLOBAL). ``TestGlobalIndexIsPerModel`` and
+``TestGlobalSavesArePerModel`` race saves of different and of identical aliases on that schema.
 
 Two findings were measured on real PostgreSQL 16 while developing this fix and are asserted below,
 because each is easy to get wrong in a way that still looks correct:
@@ -116,9 +116,12 @@ def test_budget_lock_key_includes_client():
 
 @pytest.mark.unit
 def test_rate_limit_upsert_locks_on_a_key_without_model_alias():
-    """``RateLimitConfigRepository.upsert`` is deliberately alias-blind — it deactivates every
-    active row for the scope regardless of model_alias — so the lock key must mirror that.
-    Adding model_alias would let two concurrent writes for different aliases race and duplicate."""
+    """For USER/TEAM ``RateLimitConfigRepository.upsert`` is deliberately alias-blind — it
+    deactivates every active row of the subject regardless of model_alias — so the lock key must
+    mirror that: adding model_alias would let two concurrent writes for different aliases race and
+    duplicate. GLOBAL deactivates per alias since 0046 but keeps this coarser key on purpose: it
+    serializes the previous release's alias-blind GLOBAL upsert (same key) with this one during a
+    rolling deploy (see the comment in ``upsert``)."""
     src = inspect.getsource(RateLimitConfigRepository.upsert)
     assert "advisory_xact_lock" in src
     lock_call = src[src.index("advisory_xact_lock"):src.index("update(RateLimitConfig)")]
@@ -595,6 +598,32 @@ class _LockFreeRateLimitRepo(RateLimitConfigRepository):
         return config
 
 
+class _SingleSlotRateLimitRepo(RateLimitConfigRepository):
+    """The GLOBAL upsert as it was before 0046 (same lock, alias-blind deactivate) — the control
+    for the per-model proofs. With it a GLOBAL save releases every other model's limit."""
+
+    async def upsert(self, config):
+        from sqlalchemy import update
+
+        from app.models.model import RateLimitConfig
+
+        await advisory_xact_lock(
+            self._session, "rate_limit_configs", config.scope.value, config.scope_id
+        )
+        await self._session.execute(
+            update(RateLimitConfig)
+            .where(
+                RateLimitConfig.scope == config.scope,
+                RateLimitConfig.scope_id == config.scope_id,
+                RateLimitConfig.is_active.is_(True),
+            )
+            .values(is_active=False)
+        )
+        self._session.add(config)
+        await self._session.flush()
+        return config
+
+
 async def _budget_upsert(session, cfg, repo=BudgetRepository):
     return await repo(session).upsert_config(cfg)
 
@@ -984,3 +1013,54 @@ class TestGlobalIndexIsPerModel:
         assert len(errs) == 1 and "uq_rate_limit_configs_active" in str(errs[0]), f"{errs}"
         assert await _rows(sm_single_slot, _ACTIVE_GLOBAL_BY_ALIAS) == [("alias-a", 1000)]
 
+
+@_DB
+@pytest.mark.integration
+class TestGlobalSavesArePerModel:
+    """The shipped write path (advisory lock + per-alias GLOBAL upsert) on the 0046 schema: saving one
+    model never releases another, and two saves of the same model end with exactly one active row."""
+
+    async def test_two_aliases_saved_concurrently_both_stay_active(self, sm):
+        from app.models.model import RateLimitScope
+
+        errs = await _race(sm, _rl_upsert,
+                           _rate_limit(RateLimitScope.GLOBAL, None, 1000, "alias-a"),
+                           _rate_limit(RateLimitScope.GLOBAL, None, 2000, "alias-b"))
+        assert not errs, f"{errs}"
+        assert await _rows(sm, _ACTIVE_GLOBAL_BY_ALIAS) == [("alias-a", 1000), ("alias-b", 2000)]
+
+    async def test_control_the_single_slot_upsert_releases_the_other_alias(self, sm):
+        """The same race through the pre-0046 upsert keeps only the later save — what the test above
+        would see with the old code."""
+        from app.models.model import RateLimitScope
+
+        errs = await _race(sm, _rl_upsert,
+                           _rate_limit(RateLimitScope.GLOBAL, None, 1000, "alias-a"),
+                           _rate_limit(RateLimitScope.GLOBAL, None, 2000, "alias-b"),
+                           repo=_SingleSlotRateLimitRepo)
+        assert not errs, f"{errs}"
+        assert await _rows(sm, _ACTIVE_GLOBAL_BY_ALIAS) == [("alias-b", 2000)]
+
+    async def test_same_alias_saved_concurrently_leaves_one_active_row(self, sm):
+        """The lock serializes them: no error, the later save is the one in force. (Against a writer
+        that skips the lock it is the index that guarantees it — TestGlobalIndexIsPerModel.)"""
+        from app.models.model import RateLimitScope
+
+        errs = await _race(sm, _rl_upsert,
+                           _rate_limit(RateLimitScope.GLOBAL, None, 1000, "alias-a"),
+                           _rate_limit(RateLimitScope.GLOBAL, None, 2000, "alias-a"))
+        assert not errs, f"{errs}"
+        assert await _rows(sm, _ACTIVE_GLOBAL_BY_ALIAS) == [("alias-a", 2000)]
+
+    async def test_clearing_one_alias_leaves_the_other(self, sm):
+        """Clearing = saving that model with no limits (the console's 'empty and save'). Only that
+        model's row changes."""
+        from app.models.model import RateLimitScope
+
+        for cfg in (_rate_limit(RateLimitScope.GLOBAL, None, 1000, "alias-a"),
+                    _rate_limit(RateLimitScope.GLOBAL, None, 2000, "alias-b"),
+                    _rate_limit(RateLimitScope.GLOBAL, None, None, "alias-a")):
+            async with sm() as session:
+                await _rl_upsert(session, cfg)
+                await session.commit()
+        assert await _rows(sm, _ACTIVE_GLOBAL_BY_ALIAS) == [("alias-a", None), ("alias-b", 2000)]
