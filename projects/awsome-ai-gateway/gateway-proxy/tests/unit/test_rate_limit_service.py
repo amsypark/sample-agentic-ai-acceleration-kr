@@ -627,8 +627,28 @@ async def test_settle_tpm_noop_when_adjustment_zero(mock_redis):
     await svc.settle_tpm(
         mock_redis, descriptors, reserved_tokens=5000, actual_tokens=5000
     )
-    # adjustment==0 → 파이프라인 자체를 만들지 않음.
+    # 예약한 키가 없고(옛 모양의 상태) adjustment==0 → 파이프라인 자체를 만들지 않는다.
     mock_redis.pipeline.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_settle_tpm_with_zero_adjustment_still_sets_the_markers_in_one_pipeline(mock_redis):
+    """실제 == 예약이어도 예약한 스코프마다 정산 EVAL 을 보낸다(차액 "0") — 정산 표지를 세워, 나중에
+    같은 예약을 다시 정산하려는 호출을 막는다. 파이프라인은 한 번이다(흔한 경로와 같다)."""
+    from app.services.lua_loader import LuaScriptLoader
+    from app.services.rate_limit_scope import build_tpm_key_group
+
+    LuaScriptLoader._scripts["rate_limit_tpm_settle"] = "-- mock"
+    keys = ((*build_tpm_key_group(RateLimitScope.USER, "u1", "m1"), 29_000_000),)
+    await RateLimitService().settle_tpm(
+        mock_redis, [], reserved_tokens=5000, actual_tokens=5000, reserved_keys=keys,
+        reservation_id="rid-0",
+    )
+    pipe = mock_redis.pipeline.return_value
+    assert [c.args[4:7] for c in pipe.eval.call_args_list] == [
+        (keys[0][2], keys[0][0].replace(":tpm:cur", ":tpm-settled:rid-0"), "0")
+    ]
+    pipe.execute.assert_awaited_once()
 
 
 # ─── FR-4.6 CPM/CPH (USER + TEAM) ───
@@ -886,8 +906,28 @@ async def test_settle_cost_noop_when_no_difference(mock_redis):
         reserved_cost=Decimal("0.005"),
         team_id="t1",
     )
-    # 차액 0 → 파이프라인 미생성.
+    # 예약한 키가 없고 차액 0 → 파이프라인 미생성.
     mock_redis.pipeline.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_settle_cost_with_zero_difference_still_sets_the_markers_in_one_pipeline(mock_redis):
+    """실제 == 예약이어도 예약한 스코프마다 정산 EVAL(차액 "0")을 보내 정산 표지를 세운다.
+    파이프라인은 한 번이다."""
+    from app.services.lua_loader import LuaScriptLoader
+
+    LuaScriptLoader._scripts["cost_settle_scope"] = "-- mock"
+    await RateLimitService().settle_cost(
+        mock_redis, user_id="u1", actual_cost=Decimal("0.005"), reserved_cost=Decimal("0.005"),
+        team_id="t1", reserved_keys=(_USER_KEYS, _TEAM_KEYS), reservation_id="rid-0",
+    )
+    pipe = mock_redis.pipeline.return_value
+    calls = [c.args for c in pipe.eval.call_args_list]
+    assert [(c[4], c[7]) for c in calls] == [
+        ("rl:cost-settled:user:{u1}:rid-0", "0.000"),
+        ("rl:cost-settled:team:{t1}:rid-0", "0.000"),
+    ]
+    pipe.execute.assert_awaited_once()
 
 
 # ─── CROSSSLOT 회귀 가드 (deepdive Q50) ───

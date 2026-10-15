@@ -389,11 +389,13 @@ class RateLimitService:
         스크립트의 표지로 **한 번만** 정산된다 — 두 번째 호출은 아무것도 쓰지 않고 경고를 남긴다.
         """
         adjustment = int(actual_tokens) - int(reserved_tokens)
-        if adjustment == 0:
-            return
         if reserved_keys is None:
-            logger.warning("tpm_settle_skipped_no_reserved_keys", adjustment=adjustment)
+            if adjustment:
+                logger.warning("tpm_settle_skipped_no_reserved_keys", adjustment=adjustment)
             return
+        # 차액이 0 이어도 스크립트를 돌린다 — 쓰는 것은 정산 표지뿐이다(INCRBY 0). 그래야 그 예약을
+        # 다시 정산하려는 호출(결함)이 와도 표지가 막는다. 실제 == 예약일 때만이라 드물고, 흔한
+        # 경로(차액 ≠ 0)는 예전 그대로 파이프라인 한 번이다.
         await self._settle_tpm_keys(
             redis, reserved_keys, adjustment, reservation_id or uuid4().hex
         )
@@ -681,16 +683,16 @@ class RateLimitService:
         있으면 그것을 조용히 깎았고(실측 0.031337 → 0.019337), 음수도 로그도 남지 않았다.
         """
         adjustment = actual_cost - reserved_cost
-        if adjustment == Decimal("0"):
-            return
         if not reserved_keys:
-            logger.warning(
-                "cost_settle_skipped_no_reserved_keys",
-                user_id=user_id,
-                adjustment=str(adjustment),
-            )
+            if adjustment != Decimal("0"):
+                logger.warning(
+                    "cost_settle_skipped_no_reserved_keys",
+                    user_id=user_id,
+                    adjustment=str(adjustment),
+                )
             return
 
+        # 차액이 0 이어도 스크립트를 돌린다 — 쓰는 것은 정산 표지뿐이다(settle_tpm 의 같은 주석).
         await self._settle_cost_keys(
             redis, reserved_keys, adjustment, user_id, reservation_id or uuid4().hex
         )
