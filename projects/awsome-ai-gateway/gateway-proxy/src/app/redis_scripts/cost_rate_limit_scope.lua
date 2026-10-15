@@ -7,8 +7,9 @@
 -- 슬롯이 다르므로 한 eval 에 묶을 수 없다. 이 스크립트는 **한 스코프의 2키만**
 -- 받는다(cpm/cph, 동일 {scope_id} hash tag = 단일 슬롯). 호출자가 scope 별로
 -- 1회씩 호출하고 결과를 합친다(rate_limit_service.reserve_cost). 과거의
--- 4키(user+team) 단일 eval(cost_rate_limit.lua)은 cluster 에서 CROSSSLOT →
--- fail-open 으로 CPM/CPH 무음 미집행됐다.
+-- 4키(user+team) 단일 eval 스크립트는 cluster 에서 CROSSSLOT → fail-open 으로
+-- CPM/CPH 무음 미집행됐다. 그 스크립트는 이 스크립트로 바뀐 뒤 로드만 되고 불리지
+-- 않다가 삭제됐다(git 기록 참조).
 --
 -- KEYS[1] = rl:cost:<scope>:{<scope_id>}:cpm:<window_ts>
 -- KEYS[2] = rl:cost:<scope>:{<scope_id>}:cph:<window_ts>
