@@ -16,9 +16,9 @@ mock·standalone 으로는 클러스터 모드 동작(fail-open 으로 enforceme
   2) 수정된 check_multi_scope_rpm/tpm·reserve_cost 가 클러스터에서 실제 enforce.
   3) fail-open 카운터 0 — 클러스터에서 무음 미집행이 없음(핵심 증거).
   4) 응답이 늦게 와 운영 설정 클라이언트(socket_timeout 2초, redis_retries 1)가 같은 EVAL 을 다시
-     보내도 예약(TPM·비용)과 월 예산 차감(finalize 의 budget_deduct)은 한 번만 반영되고, RPM 은
-     받아들인 요청을 429 로 바꾸지 않는다 — TCP 프록시로 응답을 잡아 두어 재현한다
-     (단일 노드·클러스터).
+     보내도 예약(TPM·비용), 정산 파이프라인, 월 예산 차감(finalize 의 budget_deduct)은 한 번만
+     반영되고, RPM 은 받아들인 요청을 429 로 바꾸지 않는다 — TCP 프록시로 응답을 잡아 두어
+     재현한다(단일 노드·클러스터).
 """
 
 from __future__ import annotations
@@ -449,3 +449,66 @@ async def test_a_late_budget_deduct_reply_and_its_retry_charge_the_budget_once(l
         ]
         if own:
             await direct.xdel(COST_STREAM_KEY, *own)
+
+
+async def _settle_late(late, kind: str):
+    """예약은 프록시를 거치지 않는 클라이언트로, **정산**만 운영 설정 클라이언트로 — 정산
+    파이프라인의 EVAL 응답을 한 번 잡아 둔다. 예약 500·0.5 → 실제 200·0.2.
+
+    반환: (사용자 id, 정산 뒤 그 키의 값, (잡아 둔 응답 수, 본 요청 수)).
+    """
+    from app.services.rate_limit_scope import build_scope_descriptors
+    from app.services.rate_limit_service import RateLimitService
+
+    client, proxies, direct = late
+    svc = RateLimitService()
+    uid, rid = f"ls-{kind[0]}-{uuid.uuid4().hex[:8]}", uuid.uuid4().hex
+    if kind == "tpm":
+        desc = build_scope_descriptors(
+            user_id=uid, team_id=None, model_alias="m", user_rpm=None, user_tpm=100_000,
+            team_rpm=None, team_tpm=None, global_rpm=None, global_tpm=None,
+        )
+        res = await svc.check_multi_scope_tpm(direct, desc, 500, reservation_id=rid)
+        key = res.reserved_keys[0][0]
+        _arm(proxies, key.replace(":tpm:cur", ":tpm-settled:"))
+        await svc.settle_tpm(
+            client, desc, 500, 200, reserved_keys=res.reserved_keys, reservation_id=rid
+        )
+        value = int(await direct.get(key))
+    else:
+        res = await svc.reserve_cost(
+            direct, user_id=uid, estimated_cost=Decimal("0.5"),
+            user_cpm_limit=Decimal("100"), user_cph_limit=Decimal("1000"), reservation_id=rid,
+        )
+        key = res.reserved_keys[0][0]
+        _arm(proxies, f"rl:cost-settled:user:{{{uid}}}:")
+        await svc.settle_cost(
+            client, user_id=uid, actual_cost=Decimal("0.2"), reserved_cost=Decimal("0.5"),
+            reserved_keys=res.reserved_keys, reservation_id=rid,
+        )
+        value = float(await direct.get(key))
+    return uid, value, _retried(proxies)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["tpm", "cost"])
+async def test_a_late_settle_pipeline_reply_settles_once(late, kind):
+    """정산 파이프라인(``pipeline(transaction=False)``)의 EVAL 응답이 늦게 온다.
+
+    * 단일 노드: redis-py 의 ``Pipeline.execute`` 가 운영 설정의 재시도로 파이프라인을 **다시
+      보낸다**(잡아 둔 1, 본 2). 정산 표지가 두 번째를 막아 한 번만 반영된다 — 표지를 빼면 두 번
+      환불돼 0 하한에 걸린다(대조군).
+    * 클러스터: ``ClusterPipeline`` 은 ``raise_on_error=False`` 의 명령별 TimeoutError 를 결과로
+      돌려줄 뿐 다시 보내지 않는다(잡아 둔 1, 본 1, ``*_settle_failed`` 경고) — 서버는 한 번
+      실행했다. redis-py 가 이것을 바꾸면 이 단정이 먼저 알린다. 클러스터에서 표지가 막는 두 번째
+      정산은 test_medium_*_settle 의 "second settle" 테스트가 본다.
+    """
+    from redis.asyncio.cluster import RedisCluster
+
+    client, _proxies, direct = late
+    uid, value, retried = await _settle_late(late, kind)
+    try:
+        assert retried == ((1, 1) if isinstance(client, RedisCluster) else (1, 2)), retried
+        assert value == (200 if kind == "tpm" else pytest.approx(0.2)), "정산이 두 번 반영됐다"
+    finally:
+        await _drop(direct, f"{{USER:{uid}:*}}:*", f"rl:cost*:user:{{{uid}}}:*")

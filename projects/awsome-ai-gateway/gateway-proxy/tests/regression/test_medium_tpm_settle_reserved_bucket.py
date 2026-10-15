@@ -576,3 +576,54 @@ async def test_a_negative_counter_left_by_the_old_settlement_is_clamped_and_gets
     finally:
         rls.set_settle_metrics(clamped=None, duplicate=None)
         await _cleanup(r, case)
+
+
+@pytest.mark.parametrize("first", ["partial", "exact"], ids=["partial-refund", "zero-adjustment"])
+async def test_a_second_settle_of_the_same_reservation_is_a_reported_no_op(
+    real_redis, monkeypatch, first
+):
+    """같은 예약(같은 reservation_id)을 두 번 정산한다 — 결함이 보낼 두 번째 정산이다. 같은 버킷에
+    다른 요청(bystander)의 예약이 함께 있다.
+
+    두 번째 정산은 정산 표지에 막혀 아무것도 쓰지 않는다: 세 스코프의 cur = 다른 요청의 예약 + 이
+    요청의 실제 토큰, 정확히. ``tpm_settle_duplicate`` 경고와 ``gateway_rl_settle_duplicate_total
+    {kind=tpm}`` 가 스코프마다 한 번. ``zero-adjustment``: 첫 정산의 차액이 0 이어도 스크립트가 돌아
+    표지를 세우므로 뒤따른 전액 환불(결함)도 막힌다.
+    """
+    from app.services import rate_limit_service as rls
+    from app.services.rate_limit_service import RateLimitService
+
+    r, case, _clock = real_redis, _Case(), _Clock(monkeypatch)
+    clamped, duplicate = [], []
+
+    class _Spy:
+        def __init__(self, sink):
+            self.sink = sink
+
+        def add(self, n, attrs=None):
+            self.sink.extend([(attrs or {}).get("kind")] * n)
+
+    rls.set_settle_metrics(clamped=_Spy(clamped), duplicate=_Spy(duplicate))
+    try:
+        state_a, rejected = await _reserve(monkeypatch, r, case)
+        assert rejected is None
+        state_b, _ = await _reserve(monkeypatch, r, case)  # bystander, 같은 분
+        a, b = state_a["rate_limit_state"], state_b["rate_limit_state"]
+        reserved_a = int(a["tpm_reserved"])
+        actual_a = _ACTUAL if first == "partial" else reserved_a
+        settles = [actual_a, actual_a] if first == "partial" else [actual_a, 0]
+        with capture_logs() as logs:
+            for actual in settles:
+                await RateLimitService().settle_tpm(
+                    r, a["tpm_descriptors"], reserved_a, actual,
+                    reserved_keys=a["tpm_reserved_keys"], reservation_id=a["reservation_id"],
+                )
+        values = _values(await _tpm_keyspace(r, case), case)
+        expect = int(b["tpm_reserved"]) + actual_a
+        assert all(v["cur"] == expect for v in values.values()), (expect, values)
+        events = [e["event"] for e in logs if e["event"].startswith("tpm_settle_")]
+        assert events == ["tpm_settle_duplicate"] * 3, events
+        assert duplicate == ["tpm"] * 3 and clamped == []
+    finally:
+        rls.set_settle_metrics(clamped=None, duplicate=None)
+        await _cleanup(r, case)

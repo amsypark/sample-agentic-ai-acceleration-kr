@@ -700,3 +700,50 @@ async def test_a_negative_counter_left_by_the_old_settlement_is_clamped_and_coun
     finally:
         rls.set_settle_metrics(clamped=None, duplicate=None)
         await _cleanup(r, auth)
+
+
+@pytest.mark.parametrize("first", ["partial", "exact"], ids=["partial-refund", "zero-adjustment"])
+async def test_a_second_settle_of_the_same_reservation_is_a_reported_no_op(
+    real_redis, monkeypatch, first
+):
+    """같은 예약(같은 reservation_id)을 두 번 정산한다 — 결함이 보낼 두 번째 정산이다(정산 상태의
+    사본, 늦은 응답의 재시도). 같은 창 키에 다른 요청(bystander)의 예약이 함께 있다.
+
+    두 번째 정산은 스크립트의 정산 표지(SET NX)에 막혀 아무것도 쓰지 않는다: 키 = 다른 요청의 예약
+    + 이 요청의 실제 비용, 정확히. 그리고 조용하지 않다 — ``cost_settle_duplicate`` 경고와
+    ``gateway_rl_settle_duplicate_total{kind=cost}`` 가 한 번. ``zero-adjustment``: 첫 정산의 차액이
+    0(실제 == 예약)이어도 스크립트가 돌아 표지를 세운다 — 그래서 뒤따른 전액 환불(결함)도 막힌다.
+    """
+    from app.services import rate_limit_service as rls
+    from app.services.rate_limit_service import RateLimitService
+
+    r = real_redis
+    auth = _auth()
+    clamped, duplicate = _CounterSpy(), _CounterSpy()
+    rls.set_settle_metrics(clamped=clamped, duplicate=duplicate)
+    await _clear_of_window_edge()
+    try:
+        state_a, keys = await _reserve(monkeypatch, r, auth, user=True, team=False)
+        state_b, _ = await _reserve(monkeypatch, r, auth, user=True, team=False)  # bystander
+        a, b = state_a["rate_limit_state"], state_b["rate_limit_state"]
+        reserved_a = a["cost_reserved"]
+        actual_a = reserved_a / 2 if first == "partial" else reserved_a
+        settles = [actual_a, actual_a] if first == "partial" else [actual_a, Decimal("0")]
+        with capture_logs() as logs:
+            for actual in settles:
+                await RateLimitService().settle_cost(
+                    r, user_id=auth.user_id, actual_cost=actual, reserved_cost=reserved_a,
+                    team_id=auth.team_id, reserved_keys=a["cost_reserved_keys"],
+                    reservation_id=a["reservation_id"],
+                )
+        after = _of(await _cost_keyspace(r, auth), auth)
+        expect = float(b["cost_reserved"] + actual_a)
+        assert set(after) == keys
+        exact = [v[0] == pytest.approx(expect, abs=1e-12) for v in after.values()]
+        assert all(exact), (expect, after)
+        events = [e["event"] for e in logs if e["event"].startswith("cost_settle_")]
+        assert events == ["cost_settle_duplicate"], events
+        assert duplicate.kinds == ["cost"] and clamped.kinds == []
+    finally:
+        rls.set_settle_metrics(clamped=None, duplicate=None)
+        await _cleanup(r, auth)
