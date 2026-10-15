@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+#: 줄 단위로 주석을 지우면 뜻이 바뀌는 구성 — 하나라도 있으면 스크립트를 그대로 보낸다.
+#: 긴 괄호(``[[`` ``[=[`` ``[==[`` …와 짝인 ``]]`` ``]=]`` …: 긴 문자열·블록 주석)와 줄 끝
+#: 백슬래시(다음 줄로 이어지는 문자열). 그 안의 ``--`` 줄은 주석이 아니다.
+_UNSTRIPPABLE = re.compile(r"\[=*\[|\]=*\]|\\$", re.MULTILINE)
 
 
 class LuaScriptLoader:
@@ -33,11 +39,13 @@ class LuaScriptLoader:
     def strip_comments(text: str) -> str:
         """전체 줄 주석(``--`` 로 시작하는 줄)과 빈 줄을 뺀다. 나머지 줄은 순서·내용 그대로다.
 
-        줄 끝 주석은 그 줄의 코드와 함께 남는다. 긴 문자열·블록 주석(``[[ … ]]``)이 있으면 줄
-        단위로는 안전하게 지울 수 없으므로 아무것도 빼지 않는다(지금 스크립트에는 없다). 지운
-        뒤에는 Lua 오류 메시지의 줄 번호가 파일의 줄 번호와 다르다.
+        줄 끝 주석은 그 줄의 코드와 함께 남는다. 긴 괄호(``[[ … ]]``, ``[=[ … ]=]`` 등 단계가
+        있는 것까지 — 긴 문자열·블록 주석)나 줄 끝 백슬래시(다음 줄로 이어지는 문자열)가
+        있으면 줄 단위로는 안전하게 지울 수 없으므로 아무것도 빼지 않는다(:data:`_UNSTRIPPABLE`).
+        보수적이라 ``a[b[1]]`` 같은 중첩 인덱스도 그대로 보낸다 — 지금 스크립트에는 어느 것도
+        없다. 지운 뒤에는 Lua 오류 메시지의 줄 번호가 파일의 줄 번호와 다르다.
         """
-        if "[[" in text or "]]" in text:
+        if _UNSTRIPPABLE.search(text):
             return text
         return "".join(
             line + "\n"

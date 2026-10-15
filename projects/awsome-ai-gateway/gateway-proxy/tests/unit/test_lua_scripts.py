@@ -77,3 +77,49 @@ def test_the_circuit_breaker_sends_its_script_without_comments():
 
     raw = (_SCRIPT_DIR / "circuit_breaker.lua").read_text(encoding="utf-8")
     assert CircuitBreakerService()._lua.splitlines() == _code_lines(raw)
+
+
+def _compiles(text: str) -> bool:
+    """Redis 와 같은 Lua 5.1 로 컴파일만 해 본다(실행하지 않는다 — KEYS·redis 는 런타임 전역)."""
+    from lupa import lua51
+
+    try:
+        lua51.LuaRuntime().compile(text)
+    except lua51.LuaSyntaxError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "text,naive_breaks",
+    [
+        pytest.param(
+            "local s = [=[\n-- part of the string\n]=]\nreturn s\n", False, id="leveled-long-string"
+        ),
+        pytest.param("--[==[\nnot code\n]==]\nreturn 1\n", True, id="leveled-block-comment"),
+        pytest.param(
+            'local s = "first line\\\n-- the rest of the string"\nreturn s\n',
+            True,
+            id="string-continued-with-a-backslash",
+        ),
+    ],
+)
+def test_a_construct_that_line_stripping_would_break_is_sent_unchanged(text, naive_breaks):
+    """줄 단위로 지우면 뜻이 바뀌거나(문자열 안의 ``--`` 줄이 사라진다) 컴파일되지 않는 구성은
+    그대로 보낸다. 단계가 있는 긴 괄호(``[=[``, ``--[==[``)와 백슬래시로 이어지는 문자열 — 예전
+    가드는 ``[[``/``]]`` 만 봤다."""
+    naive = "".join(ln + "\n" for ln in _code_lines(text))
+    assert naive != text  # 지우면 실제로 달라진다 — 이 테스트가 공허하지 않다
+    assert _compiles(naive) is not naive_breaks
+    assert LuaScriptLoader.strip_comments(text) == text
+    assert _compiles(text)
+
+
+def test_every_current_script_is_stripped_and_still_compiles():
+    """지금 스크립트는 모두 가드에 걸리지 않고(주석이 실제로 빠진다) 지운 뒤에도 Lua 5.1 로
+    컴파일된다."""
+    for lua_file in sorted(_SCRIPT_DIR.glob("*.lua")):
+        raw = lua_file.read_text(encoding="utf-8")
+        sent = LuaScriptLoader.strip_comments(raw)
+        assert sent != raw, f"{lua_file.name} 의 주석이 빠지지 않았다(가드에 걸렸다)"
+        assert _compiles(sent), f"{lua_file.name} 가 지운 뒤 컴파일되지 않는다"
