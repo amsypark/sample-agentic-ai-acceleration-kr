@@ -181,7 +181,7 @@ install 하지 않는다.** install 의 pre-install 훅(마이그레이션 Job)�
 이전 차트의 alembic head 로 내린 뒤**(4.4 의 "다운그레이드 Job") 이 절차를 쓴다.
 
 ```bash
-# 현재 릴리즈 바로 삭제 + 재설치 — DB 가 <old-chart-version> 의 alembic head 에 있을 때만
+# 현재 릴리즈 바로 삭제 + 재설치
 helm uninstall llm-gateway -n llm-gateway
 # Secret/PVC 는 "helm.sh/resource-policy: keep" 때문에 보존됨
 helm install llm-gateway ./deployment/charts/llm-gateway \
@@ -233,9 +233,10 @@ no-op 이다. DB 가 앞서 있으면 위처럼 실패한다.
 끝나면 이전처럼 된다.
 
 **다운그레이드 대상 = 이전 차트의 alembic head.** 0045 가 아니다. 되돌릴 차트의 마이그레이션 이미지로 확인한다.
+`PREV_MIGRATION_IMAGE` 에 그 이미지를 넣고 실행한다. main 차트면 `0042 (head)` 가 나온다.
 
 ```bash
-docker run --rm <이전 차트의 마이그레이션 이미지> alembic heads   # 예: main 차트 → 0042 (head)
+docker run --rm "$PREV_MIGRATION_IMAGE" alembic heads
 ```
 
 prod 의 이전 차트(main)는 head 가 0042 다. 0045 까지만 내리고 그 차트로 돌아가면 그 차트의 Job 이
@@ -312,13 +313,16 @@ prod 의 이전 차트(main)는 head 가 0042 다. 0045 까지만 내리고 그 
 2. **다운그레이드 Job 을 렌더링해 둔다 — 롤백 전에.** 훅 Job 은 성공하면 지워지므로 `kubectl create job --from` 은
    쓸 수 없다. 지금 배포된(0046 이 있는) 차트 디렉터리에서, 지금 릴리스의 값으로 마이그레이션 Job 을 렌더링하고
    이름과 명령만 바꾼다. 이미지·env·Secret 은 훅 Job 과 같다. `helm template` 과 `kubectl kustomize` 는 클러스터에
-   쓰지 않는다. (롤백한 뒤에 렌더링하려면 `helm get values` 에 `--revision <이 차트의 리비전>` 을 붙인다.)
+   쓰지 않는다. `TARGET` 은 이전 차트의 alembic head 다. `helm get values` 는 롤백 전에 돌려 지금(0046) 릴리스의
+   값을 읽는다(롤백한 뒤라면 `--revision` 에 이 차트의 리비전을 준다). 마지막 `grep` 이 `alembic`·`downgrade`·`"0042"`
+   를 보여야 한다. 이 절의 셸 블록(2·4 와 위 `alembic heads`)에는 주석이 없다 — bash·zsh 대화형 셸에 그대로 붙여
+   넣는다. zsh 는 대화형에서 기본으로 `#` 를 주석으로 읽지 않는다(`interactive_comments` 꺼짐).
 
    ```bash
    NS=llm-gateway
-   TARGET=0042                       # 이전 차트의 alembic head
+   TARGET=0042
    mkdir downgrade-job && cd downgrade-job
-   helm get values llm-gateway -n "$NS" -o yaml > deployed-values.yaml   # 롤백 전: 지금(0046) 릴리스
+   helm get values llm-gateway -n "$NS" -o yaml > deployed-values.yaml
    helm template llm-gateway ../deployment/charts/llm-gateway -n "$NS" -f deployed-values.yaml \
      --show-only templates/jobs/migration.yaml > migration.yaml
    cat > kustomization.yaml <<EOF
@@ -341,15 +345,16 @@ prod 의 이전 차트(main)는 head 가 0042 다. 0045 까지만 내리고 그 
            value: ["alembic", "downgrade", "$TARGET"]
    EOF
    kubectl kustomize . > downgrade-job.yaml
-   grep -A3 'command:' downgrade-job.yaml        # alembic downgrade <TARGET> 인지 확인
+   grep -A3 'command:' downgrade-job.yaml
    ```
 
 3. **차트를 되돌린다.** `helm rollback llm-gateway <이전 리비전> -n llm-gateway --wait --timeout 10m`. 롤백은 Job 을
    돌리지 않는다. 이때부터 4 가 끝날 때까지 이전 admin-api 의 GLOBAL 저장은 500 이다(위 "이미지만 되돌릴 때").
 
-4. **렌더링한 Job 을 적용한다.** 끝나거나(`Complete`) 실패할(`Failed`) 때까지 본다 — 거부된 다운그레이드는
-   `backoffLimit` 만큼 재시도한 뒤 `Failed` 가 된다. `kubectl wait --for=condition=complete` 만 쓰면 실패해도 시간
-   초과까지 기다린다.
+4. **렌더링한 Job 을 적용한다.** 2 와 같은 셸(`NS`, 디렉터리 `downgrade-job`)에서 한다. 끝나거나(`Complete`)
+   실패할(`Failed`) 때까지 본다 — 거부된 다운그레이드는 `backoffLimit` 만큼 재시도한 뒤 `Failed` 가 된다.
+   `kubectl wait --for=condition=complete` 만 쓰면 실패해도 시간 초과까지 기다린다. Job 은 끝나고 10분 뒤
+   사라지므로 로그는 바로 본다.
 
    ```bash
    kubectl apply -n "$NS" -f downgrade-job.yaml
@@ -359,7 +364,7 @@ prod 의 이전 차트(main)는 head 가 0042 다. 0045 까지만 내리고 그 
      sleep 5
    done
    echo "downgrade Job: ${state:-not found}"
-   kubectl logs -n "$NS" job/llm-gateway-migration-downgrade   # Job 은 끝나고 10분 뒤 사라진다
+   kubectl logs -n "$NS" job/llm-gateway-migration-downgrade
    kubectl delete -n "$NS" -f downgrade-job.yaml
    ```
 
