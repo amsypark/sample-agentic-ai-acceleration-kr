@@ -309,7 +309,7 @@ TEAM 미설정 = deny, USER 미설정 = pass. **per-app(client) 예산:** `PER_A
 ```
 INLINE (gateway-proxy, CostRecorder.finalize, ~1–2ms, fail-soft, DB I/O 없음):
   zero-usage guard(release TPM) → calculate_cost(input+output+cache_write[5m|1h]+cache_read)
-  → budget_deduct Lua (user + team, returns threshold_triggered)
+  → budget_deduct Lua (user + team, returns threshold_triggered. 차감 EVAL 마다 표지 — 늦은 응답의 재시도도 한 번만 차감)
   → settle_cost(CPM/CPH — 예약한 스코프만, 스코프별 EVAL. 환불은 예약한 창의 키에서만, 예약한 창이 지난 추가 청구는 지금 창에. 예약마다 한 번만(정산 표지). TTL 없는 키를 만들지 않음)
   → settle_tpm(예약한 스코프만. 환불은 예약한 버킷에서만 — 한 번 회전했으면 prev, 그보다 오래면 쓰지 않음. 예약한 버킷이 지난 추가분은 지금 버킷의 cur 에. 예약마다 한 번만)
   (거부된 요청은 정산 상태가 없다 — 뒤 스코프·비용 단계가 거부하면 enforce 가 그 요청의 TPM·비용 예약을

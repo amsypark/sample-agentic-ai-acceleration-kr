@@ -16,8 +16,9 @@ mock·standalone 으로는 클러스터 모드 동작(fail-open 으로 enforceme
   2) 수정된 check_multi_scope_rpm/tpm·reserve_cost 가 클러스터에서 실제 enforce.
   3) fail-open 카운터 0 — 클러스터에서 무음 미집행이 없음(핵심 증거).
   4) 응답이 늦게 와 운영 설정 클라이언트(socket_timeout 2초, redis_retries 1)가 같은 EVAL 을 다시
-     보내도 예약(TPM·비용)은 한 번만 반영되고, RPM 은 받아들인 요청을 429 로 바꾸지 않는다 — TCP
-     프록시로 응답을 잡아 두어 재현한다(단일 노드·클러스터).
+     보내도 예약(TPM·비용)과 월 예산 차감(finalize 의 budget_deduct)은 한 번만 반영되고, RPM 은
+     받아들인 요청을 429 로 바꾸지 않는다 — TCP 프록시로 응답을 잡아 두어 재현한다
+     (단일 노드·클러스터).
 """
 
 from __future__ import annotations
@@ -391,3 +392,60 @@ async def test_a_late_rpm_reply_and_its_retry_do_not_turn_the_request_into_a_429
         assert res.allowed, "받아들여 한 칸을 쓴 요청이 다시 보낸 EVAL 때문에 429 가 됐다"
     finally:
         await direct.delete(key)
+
+
+@pytest.mark.asyncio
+async def test_a_late_budget_deduct_reply_and_its_retry_charge_the_budget_once(late):
+    """finalize 의 사용자 예산 차감 EVAL(budget_deduct) 응답이 늦게 와 클라이언트가 다시 보낸다 →
+    월 예산 카운터에는 그 요청의 비용이 한 번 들어간다. 예전에는 두 번 들어가 집행이 예산을 일찍
+    소진했다(DB 원장은 원장대로 맞다). 같은 요청의 팀 차감(재시도 없음)도 한 번이다."""
+    from app.periods import current_kst_period
+    from app.schemas.domain import (
+        ApiFormat,
+        AuthContext,
+        AuthType,
+        ModelConfigSchema,
+        ModelPricingSchema,
+        ModelStatus,
+        ProviderType,
+        Role,
+        TokenUsage,
+    )
+    from app.services.cost_recorder import COST_STREAM_KEY, CostRecorder, calculate_cost
+
+    client, proxies, direct = late
+    run = uuid.uuid4().hex[:8]
+    auth = AuthContext(
+        user_id=f"lr-b-{run}", team_id=f"lr-bt-{run}", dept_id=str(uuid.uuid4()),
+        roles=[Role.USER], auth_type=AuthType.VIRTUAL_KEY,
+    )
+    model = ModelConfigSchema(
+        provider_model_id="anthropic.claude-sonnet-4-6", alias=f"lr-bm-{run}",
+        provider=ProviderType.BEDROCK, api_format=ApiFormat.ANTHROPIC_MESSAGES,
+        pricing=ModelPricingSchema(input_per_1k=Decimal("0.003"), output_per_1k=Decimal("0.015")),
+        status=ModelStatus.ACTIVE,
+    )
+    usage = TokenUsage(input_tokens=1000, output_tokens=500, total_tokens=1500)
+    cost = float(calculate_cost(usage, model))
+    period = current_kst_period()
+    user_key = f"budget:user:{{{auth.user_id}}}:{period}"
+    team_key = f"budget:team:{{{auth.team_id}}}:{period}"
+    _arm(proxies, user_key)
+    try:
+        await CostRecorder().finalize(client, auth, model, usage, f"req-{run}", False, 5)
+        assert _retried(proxies) == (1, 2), "응답을 잡아 두고 redis-py 가 다시 보냈어야 한다"
+        charged = (float(await direct.get(user_key)), float(await direct.get(team_key)))
+        assert charged == pytest.approx((cost, cost)), f"예산이 두 번 차감됐다: {charged}"
+    finally:
+        await _drop(
+            direct,
+            f"budget:*{{{auth.user_id}}}*", f"budget:*{{{auth.team_id}}}*",
+            f"budget-deducted:*{{{auth.user_id}}}*", f"budget-deducted:*{{{auth.team_id}}}*",
+        )
+        own = [
+            entry_id
+            for entry_id, fields in await direct.xrange(COST_STREAM_KEY, "-", "+")
+            if auth.user_id.encode() in fields.get(b"payload", b"")
+        ]
+        if own:
+            await direct.xdel(COST_STREAM_KEY, *own)

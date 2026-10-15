@@ -415,7 +415,7 @@ jobs:
           tail -30 /tmp/proof3.txt
           if [ "$status" -ne 0 ]; then exit "$status"; fi
           passed=$(grep -oE "[0-9]+ passed" /tmp/proof3.txt | tail -1 | grep -oE "[0-9]+" || echo 0)
-          # 로컬 실측 기준선: 213 passed, 0 skipped (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
+          # 로컬 실측 기준선: 215 passed, 0 skipped (실 DB 3 + 예약 해제 14 + 예산 정책 16 + 임계값 영속 18
           #   + long-context 티어 27: calculate_cost/tier/감사 16 + 웹서치 턴별 티어 9
           #     + 실 PG 마이그레이션 2
           #   + 스트림 끊김 원장 공백 10: 실 uvicorn 8 + 실 Redis 대사 2
@@ -437,10 +437,10 @@ jobs:
           #     스트리밍) + 파드 폴백 없는 native 2 + alias 계정 500 1 + 상류 502 는 연다(대조) 1
           #     + 열림·half-open 시험 하나·성공하면 닫힘 1 + 배포 중 옛 이름 키와 독립·전부 TTL 1,
           #     각각 단일 노드·클러스터
-          #   + 클러스터 rate-limit 9: 합친 EVAL 의 CROSSSLOT 재현 + RPM 분리 집행 + TPM·비용 분리 집행
-          #     + 늦은 응답과 클라이언트 재시도에도 한 번만(TPM·비용 예약, RPM 은 429 로 바뀌지 않음) 3,
-          #     각각 단일 노드·클러스터 = 6 — 운영 설정 클라이언트가 TCP 프록시를 거친다.
-          #   클러스터 변형 50건은 위 Valkey 클러스터 스텝(REDIS_CLUSTER_URL)이 있어야 돈다 — 그 스텝이
+          #   + 클러스터 rate-limit 11: 합친 EVAL 의 CROSSSLOT 재현 + RPM 분리 집행 + TPM·비용 분리 집행
+          #     + 늦은 응답과 클라이언트 재시도에도 한 번만(TPM·비용 예약, 월 예산 차감, RPM 은 429 로
+          #     바뀌지 않음) 4, 각각 단일 노드·클러스터 = 8 — 운영 설정 클라이언트가 TCP 프록시를 거친다.
+          #   클러스터 변형 51건은 위 Valkey 클러스터 스텝(REDIS_CLUSTER_URL)이 있어야 돈다 — 그 스텝이
           #   빠지거나 실패하면 skip 으로 바뀌어 통과 수가 떨어지고 여기서 실패한다.
           #   예약 해제 14 중 4건(비-2xx 스트림 이중 환불: 메커니즘 1 + 라우터 2 + /v1/messages 1)이
           #   실 Redis 를 요구한다.
@@ -449,11 +449,11 @@ jobs:
           #    원장 공백 파일의 대사 2건도 REDIS_PROOF_URL 이 없으면 skip 된다 — "카운터는 맞고
           #    원장만 짧다" 는 같은 실 Redis 에서 차감과 XADD 를 대사해야만 드러난다.
           #    웹서치 예약 정산 20건, 비용 정산·TPM 정산·거부 되돌리기의 단일 노드 변형 35건, 브레이커의
-          #    단일 노드 변형 8건, 늦은 응답 재시도의 단일 노드 변형 3건도 전부 REDIS_PROOF_URL 이 없으면
+          #    단일 노드 변형 8건, 늦은 응답 재시도의 단일 노드 변형 4건도 전부 REDIS_PROOF_URL 이 없으면
           #    skip 된다.
           #    세 env 중 하나라도 안 걸리면 통과 수가 떨어져 여기서 실패한다.
-          if [ "${passed:-0}" -lt 213 ]; then
-            echo "::error::통과 ${passed} 건(기대 213) — PROOF_DSN/REDIS_PROOF_URL/REDIS_CLUSTER_URL 이 안 걸려 skip 됐다."
+          if [ "${passed:-0}" -lt 215 ]; then
+            echo "::error::통과 ${passed} 건(기대 215) — PROOF_DSN/REDIS_PROOF_URL/REDIS_CLUSTER_URL 이 안 걸려 skip 됐다."
             exit 1
           fi
 
