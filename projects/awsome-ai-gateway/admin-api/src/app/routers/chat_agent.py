@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from typing import Any, AsyncIterator, Literal
 
@@ -491,6 +492,15 @@ async def _agentcore_producer(
     if screen_context:
         payload["screen_context"] = screen_context
 
+    # 지연시간의 정본은 **여기**다. 이 producer 는 클라이언트 SSE 와 독립이라 분석 1건의 실제 벽시계
+    # 시간을 아는 유일한 지점이고, agent 가 무엇을 보고하든 이 값은 항상 있다(monotonic: 시계 조정
+    # 무관). ⚠️ done 프레임의 durationMs 와 messages.duration_ms 는 **같은 값**이어야 한다 — 라이브
+    # 화면과 새로고침 후 복원 화면이 다른 숫자를 보이지 않게, 한 번 재서 둘 다에 쓴다.
+    t_start = time.monotonic()
+
+    def _elapsed_ms() -> int:
+        return int((time.monotonic() - t_start) * 1000)
+
     accumulated: list[str] = []
     # 영속화 누적: 스트림 종료 후 chat_agent.messages 에 저장해 새로고침/재조회
     # 시에도 SQL/차트/검증이 보이도록. UI applyEvent 와 **같은 형태**로 재구성:
@@ -516,7 +526,7 @@ async def _agentcore_producer(
     streamed = False
     persisted = False
 
-    async def _persist(error_note: str | None = None) -> None:
+    async def _persist(error_note: str | None = None, duration_ms: int | None = None) -> None:
         """스트림 누적분을 chat_agent.messages 에 저장. 성공·실패 **양쪽**에서 호출.
 
         ⚠️ 예전엔 이 저장이 try 안, 스트림 루프 **뒤**에만 있었다 — AgentCore 예외가
@@ -550,18 +560,21 @@ async def _agentcore_producer(
         # jsonb 컬럼은 None 이면 SQL NULL, 있으면 JSON 문자열을 ::jsonb 캐스팅.
         # 빈 리스트는 저장 안 함(NULL) → read 경로가 undefined 로 매핑(UI 와 일관).
         async with AsyncSessionLocal() as own_db:
+            # duration_ms: 컬럼(0005)은 처음부터 있었고 /history 도 읽었는데 여기서 쓰지 않아 영구히
+            # NULL 이었다 — admin-ui 의 지연 footer 가 새로고침 후 아무 오류 없이 사라졌다.
             await own_db.execute(
                 text(
                     "INSERT INTO chat_agent.messages "
-                    "(session_id, role, content, tool_calls, charts, validator) "
+                    "(session_id, role, content, tool_calls, charts, validator, duration_ms) "
                     "VALUES (CAST(:sid AS uuid), 'assistant', :c, "
-                    "CAST(:tc AS jsonb), CAST(:ch AS jsonb), CAST(:vd AS jsonb))"
+                    "CAST(:tc AS jsonb), CAST(:ch AS jsonb), CAST(:vd AS jsonb), :dur)"
                 ).bindparams(
                     sid=session_id,
                     c=full_reply[:8000],
                     tc=json.dumps(acc_tool_calls) if acc_tool_calls else None,
                     ch=json.dumps(acc_charts) if acc_charts else None,
                     vd=json.dumps(acc_validator) if acc_validator else None,
+                    dur=duration_ms,
                 )
             )
             await own_db.commit()
@@ -787,9 +800,17 @@ async def _agentcore_producer(
         # done 은 "성공"이 아니라 "스트림 종료" 신호다(실패 사실은 위 error 프레임이
         # 전달). 클라이언트가 pending 스피너를 정리하고 [SUGGESTIONS] 를 추출하려면
         # 절단·에러 종료에서도 필요하다.
-        await relay.publish(_sse("done", {}))
+        #
+        # ⚠️ 본문 키는 **camelCase** 다. admin-ui useChatStream 은 파싱한 JSON 을 그대로 spread
+        #    한다(snake→camel 변환 없음) — 그래서 키가 클라이언트 필드명(`durationMs`)과 글자
+        #    그대로 같아야 한다. `/history` 의 snake_case(duration_ms)는 매퍼가 바꾸므로 의도적으로
+        #    다르다. 이 프레임은 오랫동안 리터럴 `{}` 였고, 클라이언트 필드가 optional 이라 오류 없이
+        #    footer 만 영구히 사라져 있었다. costUsd 는 싣지 않는다 — agent 가 토큰 사용량을 보내지
+        #    않으므로 산출할 근거가 없다(0 을 보내면 '무료' 라는 틀린 숫자를 권위 있게 보여준다).
+        duration_ms = _elapsed_ms()
+        await relay.publish(_sse("done", {"durationMs": duration_ms}))
 
-        await _persist(error_note=truncation_note)
+        await _persist(error_note=truncation_note, duration_ms=duration_ms)
 
     except Exception as exc:
         await _publish_error(relay, str(exc), type(exc).__name__)
@@ -798,7 +819,7 @@ async def _agentcore_producer(
         # 사라진다(질문만 남는다). 저장 자체가 또 실패해도 원래 예외 보고를 덮지
         # 않도록 따로 감싼다.
         try:
-            await _persist(error_note=f"{type(exc).__name__}: {exc}")
+            await _persist(error_note=f"{type(exc).__name__}: {exc}", duration_ms=_elapsed_ms())
         except Exception:  # noqa: BLE001 — 영속화 실패가 에러 보고를 가리지 않게
             # stdlib logging — structlog 식 kwargs 를 넘기면 TypeError 다(%s 포맷).
             logger.exception("chat partial persist failed session_id=%s", session_id)
@@ -825,6 +846,52 @@ class SqlExecuteRequest(BaseModel):
     session_id: str
 
 
+def normalize_lambda_result(resp: dict) -> dict:
+    """Lambda ``invoke`` 응답을 **항상** 이 라우트의 계약(`ok` 를 가진 dict)으로 정규화한다.
+
+    고치는 결함 — 크래시가 "0행" 으로 보였다:
+    ``resp["FunctionError"]`` 를 보지 않고 Payload 를 그대로 돌려주면, 핸들러가 처리하지 못한
+    예외/타임아웃/OOM 의 payload — ``{"errorMessage", "errorType", "stackTrace"}`` — 가 HTTP 200
+    으로 나간다. 거기엔 ``ok`` 가 없으므로 admin-ui 의 유일한 에러 게이트(``result.ok === false``)가
+    통과하고, SQL 에디터는 **성공 분기**를 그린다: 행 없음 · 행 수 없음 · 에러 문구 없음 = "0행".
+    분석가는 "이 데이터는 존재하지 않는다" 로 읽는다.
+    ⚠️ Lambda 의 wall timeout 은 boto3 의 read_timeout(기본 60s)보다 짧아서 타임아웃은 호출
+       **성공**으로 돌아온다 — 아래 ``except`` 의 502 경로로는 잡히지 않는다.
+
+    ``ok: False`` + 200 을 유지하는 것은 의도된 UX 다(에디터가 사유를 보여주고 분석가가 SQL 을
+    고친다). Lambda 가 정상 반환한 dict 는 손대지 않는다.
+    """
+    raw = resp["Payload"].read()
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        payload = None
+
+    function_error = resp.get("FunctionError")
+    if function_error:
+        message = None
+        if isinstance(payload, dict):
+            message = payload.get("errorMessage") or payload.get("error")
+        # stdlib logging (structlog 아님) — kwargs 를 받지 않으므로 %-포맷이어야 한다.
+        logger.error(
+            "chat_sql_execute lambda FunctionError=%s errorType=%s errorMessage=%s",
+            function_error,
+            payload.get("errorType") if isinstance(payload, dict) else None,
+            message,
+        )
+        return {
+            "ok": False,
+            "error": message or f"Lambda {function_error}",
+            "hint": "쿼리가 중단됐습니다(크래시 또는 시간 초과). 범위를 좁혀 다시 실행하세요.",
+        }
+
+    if not isinstance(payload, dict):
+        # 정상 반환인데 dict 가 아니면 계약 위반이다 — 성공으로 그리는 것보다 시끄럽게.
+        logger.error("chat_sql_execute unexpected payload type=%s", type(payload).__name__)
+        return {"ok": False, "error": "query execution returned an unexpected payload"}
+    return payload
+
+
 @router.post("/sql/execute")
 async def execute_sql(
     req: SqlExecuteRequest,
@@ -834,7 +901,8 @@ async def execute_sql(
     """편집된 SQL 을 LLM 없이 직접 실행(검증은 query_db Lambda 가 수행).
 
     Lambda 의 ValidationError(화이트리스트 위반/DML 등)는 ok:false + error 로
-    그대로 반환 — 에디터 UX 의 핵심(분석가가 에러를 보고 고침).
+    그대로 반환 — 에디터 UX 의 핵심(분석가가 에러를 보고 고침). 핸들러가 죽은 경우
+    (FunctionError)도 같은 모양으로 정규화한다 — :func:`normalize_lambda_result`.
     """
     # 세션 소유 검증(임의 세션 키로 호출 방지)
     sess_row = (
@@ -863,7 +931,7 @@ async def execute_sql(
                 }
             ).encode(),
         )
-        return json.loads(resp["Payload"].read())
+        return normalize_lambda_result(resp)
 
     try:
         result = await asyncio.to_thread(_invoke)

@@ -16,6 +16,22 @@ interface RateLimitTreeProps {
   depth?: number;
 }
 
+/**
+ * 트리 행 우측의 한 줄 요약.
+ *
+ * 예전에는 언제나 `${rpm ?? '∞'}rpm` 이었다. GLOBAL(Bedrock 쿼터) 한도는 TPM 만 걸리는 경우가
+ * 흔해서, 200K TPM 캡이 걸린 모델이 트리에서 "∞rpm" 으로 — 즉 무제한처럼 — 보였다. 설정된
+ * 축을 그대로 보여준다. cpm/cph 는 와이어에서 문자열(Decimal)이다.
+ */
+function summarizeLimit(config: RateLimitTreeNode['config']): string {
+  if (!config) return '-';
+  if (config.rpm != null) return `${config.rpm}rpm`;
+  if (config.tpm != null) return `${config.tpm}tpm`;
+  if (config.cpm != null) return `$${config.cpm}/m`;
+  if (config.cph != null) return `$${config.cph}/h`;
+  return '∞';
+}
+
 function NodeIcon({ scope }: { scope: RateLimitScope }) {
   if (scope === 'GLOBAL') return <Globe size={14} className="flex-shrink-0" aria-hidden="true" />;
   if (scope === 'TEAM') return <Users size={14} className="flex-shrink-0" aria-hidden="true" />;
@@ -42,7 +58,7 @@ function TreeNode({
   const t = useTranslations('rateLimits');
   const isSelected = selectedNodeId === node.id;
   const hasChildren = Boolean(node.children && node.children.length > 0);
-  // USER 는 leaf. GLOBAL/TEAM 만 expandable.
+  // USER 와 GLOBAL 은 leaf. 자식을 가지는 것은 TEAM(멤버) 뿐이다.
   const isExpandable = node.scope !== 'USER' && hasChildren;
   const isExpanded = expandedNodes.has(node.id);
 
@@ -78,11 +94,7 @@ function TreeNode({
         <NodeIcon scope={node.scope} />
         <span className="flex-1 truncate">{node.label}</span>
         <span className="text-xs text-muted-foreground flex-shrink-0">
-          {node.inherited_from
-            ? t('inherited')
-            : node.config
-            ? `${node.config.rpm ?? '∞'}rpm`
-            : '-'}
+          {node.inherited_from ? t('inherited') : summarizeLimit(node.config)}
         </span>
       </button>
 

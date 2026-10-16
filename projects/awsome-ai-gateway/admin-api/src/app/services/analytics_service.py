@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import datetime as _dt
 import io
 import re
 import uuid
@@ -13,6 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser
 from app.core.exceptions import ForbiddenError, ValidationError
+from app.core.usage_filters import (
+    cost_day_range_filter,
+    cost_period_filter,
+    day_range_to_utc,
+    period_to_utc_range,
+)
 from app.models.auth import UserRole
 from app.models.usage import ROIScope
 from app.repositories.analytics_repository import AnalyticsRepository
@@ -34,6 +41,24 @@ logger = structlog.get_logger()
 _PERIOD_RE = re.compile(r"^\d{4}-\d{2}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+#: 직접 입력 범위의 최대 길이(일, 양끝 포함). 캐시되지 않는 요청 하나가 usage_logs 전체 집계를
+#: 6~9번 돌리므로(요약·모델·팀·사용자·추이·seed), 상한이 없으면 2000-01-01~2100-12-31 같은 범위가
+#: 그대로 전 테이블 스캔이 된다. 93일 = 연속한 석 달(분기)을 담는 가장 짧은 길이.
+#: admin-ui lib/utils/analyticsQuery.ts 의 MAX_ANALYTICS_RANGE_DAYS 와 같아야 한다.
+MAX_ANALYTICS_RANGE_DAYS = 93
+
+#: CSV 셀이 이 문자로 시작하면 스프레드시트가 **수식**으로 해석한다(=HYPERLINK, +cmd, @SUM …).
+#: 표시 이름·이메일·팀 이름은 사용자가 정할 수 있는 값이라, 내보낸 파일을 연 관리자 PC 에서
+#: 수식이 실행될 수 있다(CSV/formula injection). OWASP 권고대로 앞에 작은따옴표를 붙여 텍스트로 만든다.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_text(value: str | None) -> str | None:
+    """사용자 유래 텍스트 셀을 수식으로 해석되지 않게 만든다(숫자 셀에는 쓰지 않는다)."""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
 
 def _validate_period_date(period: str, date: str) -> None:
     """period=YYYY-MM, date=YYYY-MM-DD, and date must be within period's month."""
@@ -52,6 +77,29 @@ def _validate_period_date(period: str, date: str) -> None:
         raise ValidationError(f"date {date} must fall within period {period}")
 
 
+def _resolve_date_range(start_date: str | None, end_date: str | None) -> tuple[str, str] | None:
+    """(start_date, end_date) 를 검증해 반환. 둘 다 없으면 None(= period 월 전체).
+
+    왜 "조용히 무시" 가 아니라 예외(400)인가: `직접 입력` 날짜 선택기는 이 두 값을 계속
+    보내왔지만 라우트가 선언하지 않아 FastAPI 가 422 없이 버렸다 — 5일 범위를 고른 운영자가
+    한 달 전체 비용을 5일치로 읽었다. 이제 범위를 실제로 반영하고, 반영할 수 없는 입력
+    (한쪽만 / 역순 / 형식·달력 오류)은 **소리 내어** 거절한다. 그럴듯한 오답보다 에러가 낫다.
+    형식·달력·순서·연도 검증은 `day_range_to_utc` 가 이미 하므로 그것을 그대로 쓴다.
+    """
+    if not start_date and not end_date:
+        return None
+    if not start_date or not end_date:
+        raise ValidationError("start_date and end_date must be provided together")
+    day_range_to_utc(start_date, end_date)  # 형식 / 달력 / 역순 / 연도 범위 → ValidationError
+    # ⚠️ 상한이 없으면 2000-01-01~2100-12-31 한 번이 캐시 없이 usage_logs 전체 집계를 6~9번 돈다.
+    span_days = (_dt.date.fromisoformat(end_date) - _dt.date.fromisoformat(start_date)).days + 1
+    if span_days > MAX_ANALYTICS_RANGE_DAYS:
+        raise ValidationError(
+            f"date range is {span_days} days; at most {MAX_ANALYTICS_RANGE_DAYS} days per request"
+        )
+    return start_date, end_date
+
+
 class AnalyticsService:
     async def get_analytics(
         self,
@@ -60,22 +108,53 @@ class AnalyticsService:
         period: str,
         group_by: str = "model",
         scope: str = "all",
+        start_date: str | None = None,
+        end_date: str | None = None,
         actor: CurrentUser,
     ) -> AnalyticsResponse:
         repo = AnalyticsRepository(session)
 
+        # 일자 범위(옵션). 주어지면 **모든** 집계 — 요약/모델/팀/사용자/추이 — 가 이 범위로
+        # 좁혀진다. 하나라도 월 필터로 남으면 같은 화면에서 카드 합계와 분해 합계가 어긋난다.
+        date_range = _resolve_date_range(start_date, end_date)
+        # ⚠️ 범위 모드에서도 period 형식은 검증한다. 월 필터를 타지 않는 경로라 검증이
+        #    빠지면 period='garbage' 가 200 + 응답 라벨로 그대로 나간다(캐시 키에도 들어간다).
+        period_to_utc_range(period)
+        # ⚠️ 범위 모드의 period 는 **start_date 의 달**이어야 한다(admin-ui 는 그렇게 보낸다).
+        #    period 는 응답 라벨·캐시 키·seed(월 상수) 판정에 쓰이므로, 범위와 다른 달이 오면 seed 를
+        #    엉뚱한 달에서 더하거나 같은 범위가 period 별로 다른 캐시 키를 갖는다.
+        if date_range and date_range[0][:7] != period:
+            raise ValidationError(
+                f"period {period} must be the month of start_date ({date_range[0][:7]})"
+            )
+        period_filter = cost_day_range_filter(*date_range) if date_range else cost_period_filter(period)
+
         # Determine scope filter
+        #
+        # ⚠️ scope 는 **닫힌 집합**('all' | 'team:<uuid>')으로만 해석한다 — 나머지는 전부 400.
+        #    예전엔 `startswith("team:")` 와 `== "all"` 두 분기만 있었고 그 밖의 값('xyz',
+        #    'ALL', ' all')은 어느 분기도 타지 않아 roi_scope=None(=GLOBAL)로 떨어졌다. 아래
+        #    격리 불변식은 비-GLOBAL 일 때만 검사하므로 그대로 통과 → TEAM_LEADER 가 **전사**
+        #    비용·사용자 이메일·팀을 받았고, export 는 그것을 CSV 로 내려줬다(실 PG 재현:
+        #    다른 팀 사용자 $500 포함 $501). 'team:<uuid 아님>' 은 uuid.UUID 의 ValueError 가
+        #    잡히지 않아 500 이었다. 라우트도 같은 집합을 pattern 으로 강제하지만(422), 서비스를
+        #    직접 부르는 경로가 있으므로(export_analytics) 여기서도 스스로 닫는다.
         roi_scope: ROIScope | None = None
         scope_id: uuid.UUID | None = None
 
         if scope.startswith("team:"):
-            team_id = uuid.UUID(scope.split(":")[1])
+            try:
+                team_id = uuid.UUID(scope[len("team:"):])
+            except ValueError:
+                raise ValidationError(f"scope must be 'all' or 'team:<uuid>' (got {scope!r})") from None
             # TEAM_LEADER can only see own team
             if actor.role == UserRole.TEAM_LEADER and actor.team_id != team_id:
                 raise ForbiddenError("Team leaders can only view analytics for their own team")
             roi_scope = ROIScope.TEAM
             scope_id = team_id
-        elif scope == "all":
+        elif scope != "all":
+            raise ValidationError(f"scope must be 'all' or 'team:<uuid>' (got {scope!r})")
+        else:
             # TEAM_LEADER restricted to own team
             if actor.role == UserRole.TEAM_LEADER:
                 # ⚠️ 팀이 없는 TEAM_LEADER 를 통과시키면 안 된다. 예전엔 scope_id 가
@@ -95,6 +174,11 @@ class AnalyticsService:
                 scope_id = actor.team_id
         # ADMIN: no restriction
 
+        # 불변식(방어 심층): TEAM_LEADER 는 어떤 경로로 와도 TEAM 범위로 끝나야 한다. 위 분기에
+        # 새 값이 추가되면서 이 성질이 다시 깨지면, 데이터를 읽기 전에 여기서 닫는다.
+        if actor.role == UserRole.TEAM_LEADER and roi_scope != ROIScope.TEAM:
+            raise ForbiddenError("Team leaders can only view analytics for their own team")
+
         # 불변식: 비-GLOBAL scope 라면 scope_id 가 반드시 있다. 아래의 by_user/trends 는
         # `scope_id is not None` 로 격리를 걸기 때문에, 이 둘이 어긋나면 그 두 질의만
         # 조용히 전사로 넓어진다(repo 쪽은 이제 터진다). 한곳에서 못 박는다.
@@ -108,14 +192,24 @@ class AnalyticsService:
         # Real-time aggregation from usage_logs (not pre-aggregated roi_aggregations)
         query_scope = roi_scope or ROIScope.GLOBAL
 
-        cost_by_model = await repo.sum_usage_by_model(period, query_scope, scope_id)
+        cost_by_model = await repo.sum_usage_by_model(
+            period, query_scope, scope_id, date_range=date_range
+        )
         # ⚠️ 같은 scope 필터(_apply_scope_filter)를 재사용하는 repo 메서드로 뽑는다 —
         #    WHERE 를 손으로 다시 쓰면 TEAM_LEADER 격리가 갈라진다.
-        requests_by_model = await repo.count_requests_by_model(period, query_scope, scope_id)
+        requests_by_model = await repo.count_requests_by_model(
+            period, query_scope, scope_id, date_range=date_range
+        )
         total_cost = sum(cost_by_model.values(), Decimal("0"))
-        active_users_count = await repo.count_active_users(period, query_scope, scope_id)
-        total_requests_count = await repo.total_requests(period, query_scope, scope_id)
-        total_tokens_count = await repo.total_tokens(period, query_scope, scope_id)
+        active_users_count = await repo.count_active_users(
+            period, query_scope, scope_id, date_range=date_range
+        )
+        total_requests_count = await repo.total_requests(
+            period, query_scope, scope_id, date_range=date_range
+        )
+        total_tokens_count = await repo.total_tokens(
+            period, query_scope, scope_id, date_range=date_range
+        )
 
         avg_cost = total_cost / active_users_count if active_users_count > 0 else Decimal("0")
 
@@ -146,7 +240,6 @@ class AnalyticsService:
             from sqlalchemy import distinct, func, select
             from app.models.auth import Team
             from app.models.usage import UsageLog
-            from app.core.usage_filters import cost_period_filter
             # ⚠️ team 라벨에 UUID 를 넣지 말 것 — 차트 x축에 그대로 노출된다.
             #    INNER JOIN 이 안전한 근거: usage_logs.team_id 는 NOT NULL + auth.teams.id
             #    FK (app/models/usage.py) 이므로 조인으로 사라지는 행이 없다(합계 불변).
@@ -158,7 +251,7 @@ class AnalyticsService:
             ).join(
                 Team, Team.id == UsageLog.team_id
             ).where(
-                cost_period_filter(period),  # §59 SUCCESS + KST (team 귀속은 usage_logs.team_id 직접)
+                period_filter,  # §59 SUCCESS + KST (team 귀속은 usage_logs.team_id 직접)
             ).group_by(UsageLog.team_id, Team.name)
             result = await session.execute(stmt)
             for row in result:
@@ -179,9 +272,8 @@ class AnalyticsService:
             from sqlalchemy import func, select
             from app.models.usage import UsageLog
             from app.models.auth import User
-            from app.core.usage_filters import cost_period_filter
 
-            user_where = [cost_period_filter(period)]
+            user_where = [period_filter]
             if scope_id is not None:  # TEAM_LEADER/team scope 격리
                 user_where.append(UsageLog.team_id == scope_id)
             ustmt = (
@@ -212,54 +304,63 @@ class AnalyticsService:
             # ⚠️ 팀 격리를 여기서도 지켜야 한다. budget_usages 에는 team_id 가 없으므로
             #    auth.users 로 조인해 걸러야 한다 — 안 하면 TEAM_LEADER 가 다른 팀 사용자의
             #    이관 금액을 받아 가는 권한 누출이 된다(위 user_where 격리와 같은 이유).
-            from app.core.usage_filters import period_to_utc_range
+            #
+            # ⚠️ 일자 범위 질의에는 **월 초 시작 범위(period 1일 ~ 같은 달)일 때만** seed 를
+            #    더한다. seed 에는 일자 축이 없다(budget_usages 는 월 누적 한 행) — 그래서
+            #    `/usage/by-user` 와 같은 규약("period 1일 ~ date" 누적에만 월 상수로 더한다)을
+            #    따른다. 9/10~9/15 같은 중간 범위에 월 seed 를 더하면 이관 이전(= 월 초)의
+            #    금액이 그 5일에 귀속되는 거짓 숫자가 된다. 그 범위는 usage_logs 사실만 보인다.
             from app.models.budget import BudgetScope, BudgetUsage
 
-            m_start, m_end = period_to_utc_range(period)
-
-            # 월 실사용(전 status) — 잔차의 뺄 값.
-            actual_where = [
-                UsageLog.requested_at >= m_start,
-                UsageLog.requested_at < m_end,
-            ]
-            if scope_id is not None:
-                actual_where.append(UsageLog.team_id == scope_id)
-            actual_stmt = (
-                select(
-                    UsageLog.user_id.label("user_id"),
-                    func.coalesce(func.sum(UsageLog.cost_usd), 0).label("actual"),
-                )
-                .where(*actual_where)
-                .group_by(UsageLog.user_id)
+            seed_applies = date_range is None or (
+                date_range[0] == f"{period}-01" and date_range[1][:7] == period
             )
-            month_actual = {
-                r.user_id: Decimal(str(r.actual))
-                for r in (await session.execute(actual_stmt)).all()
-            }
-
-            recorded_stmt = (
-                select(
-                    User.id.label("user_id"),
-                    User.display_name.label("name"),
-                    User.email.label("email"),
-                    func.coalesce(func.sum(BudgetUsage.used_usd), 0).label("used"),
-                )
-                .select_from(BudgetUsage)
-                .join(User, User.id == BudgetUsage.scope_id)
-                .where(
-                    BudgetUsage.scope == BudgetScope.USER,
-                    BudgetUsage.period == period,
-                )
-                .group_by(User.id, User.display_name, User.email)
-            )
-            if scope_id is not None:
-                recorded_stmt = recorded_stmt.where(User.team_id == scope_id)
-
             seeded: dict[uuid.UUID, tuple[str | None, str | None, Decimal]] = {}
-            for r in (await session.execute(recorded_stmt)).all():
-                residual = Decimal(str(r.used)) - month_actual.get(r.user_id, Decimal("0"))
-                if residual > 0:
-                    seeded[r.user_id] = (r.name, r.email, residual)
+            if seed_applies:
+                m_start, m_end = period_to_utc_range(period)
+
+                # 월 실사용(전 status) — 잔차의 뺄 값.
+                actual_where = [
+                    UsageLog.requested_at >= m_start,
+                    UsageLog.requested_at < m_end,
+                ]
+                if scope_id is not None:
+                    actual_where.append(UsageLog.team_id == scope_id)
+                actual_stmt = (
+                    select(
+                        UsageLog.user_id.label("user_id"),
+                        func.coalesce(func.sum(UsageLog.cost_usd), 0).label("actual"),
+                    )
+                    .where(*actual_where)
+                    .group_by(UsageLog.user_id)
+                )
+                month_actual = {
+                    r.user_id: Decimal(str(r.actual))
+                    for r in (await session.execute(actual_stmt)).all()
+                }
+
+                recorded_stmt = (
+                    select(
+                        User.id.label("user_id"),
+                        User.display_name.label("name"),
+                        User.email.label("email"),
+                        func.coalesce(func.sum(BudgetUsage.used_usd), 0).label("used"),
+                    )
+                    .select_from(BudgetUsage)
+                    .join(User, User.id == BudgetUsage.scope_id)
+                    .where(
+                        BudgetUsage.scope == BudgetScope.USER,
+                        BudgetUsage.period == period,
+                    )
+                    .group_by(User.id, User.display_name, User.email)
+                )
+                if scope_id is not None:
+                    recorded_stmt = recorded_stmt.where(User.team_id == scope_id)
+
+                for r in (await session.execute(recorded_stmt)).all():
+                    residual = Decimal(str(r.used)) - month_actual.get(r.user_id, Decimal("0"))
+                    if residual > 0:
+                        seeded[r.user_id] = (r.name, r.email, residual)
 
             rows = (await session.execute(ustmt)).all()
             for row in rows:
@@ -289,11 +390,12 @@ class AnalyticsService:
         #    전사 일별 비용을 받아 가는 권한 누출이 된다.
         from sqlalchemy import func, select
 
-        from app.core.usage_filters import cost_period_filter
         from app.models.usage import UsageLog
 
         _kst_day = func.date(func.timezone("Asia/Seoul", UsageLog.requested_at))
-        trend_where = [cost_period_filter(period)]
+        # 범위가 주어지면 그 범위만 — 월로 남겨 두면 5일 범위 화면의 추이 차트에 end_date
+        # 이후 날짜가 계속 그려진다.
+        trend_where = [period_filter]
         if scope_id is not None:
             trend_where.append(UsageLog.team_id == scope_id)
         trend_stmt = (
@@ -317,6 +419,8 @@ class AnalyticsService:
 
         return AnalyticsResponse(
             period=period,
+            start_date=date_range[0] if date_range else None,
+            end_date=date_range[1] if date_range else None,
             cost_summary=cost_summary,
             by_model=by_model,
             by_team=by_team,
@@ -331,15 +435,31 @@ class AnalyticsService:
         format: str,
         period: str,
         group_by: str,
+        scope: str = "all",
+        start_date: str | None = None,
+        end_date: str | None = None,
         actor: CurrentUser,
     ) -> tuple[str, str]:
-        """Returns (content, content_type)."""
+        """Returns (content, content_type).
+
+        내보내기는 **화면과 같은 질의**여야 한다. 예전에는 scope 를 ``"all"`` 로 하드코딩하고
+        (라우트는 scope/start_date/end_date 를 선언조차 하지 않았다) CSV 직렬화가 group_by 를
+        무시했다 → ``scope=team:X`` 화면이나 범위 화면에서 내보내면 전사·월 전체·모델별 CSV 가
+        내려갔다. 권한은 get_analytics 가 그대로 검사한다(TEAM_LEADER 는 scope='all' 이어도
+        자기 팀으로 좁혀지고, 다른 팀 scope 는 ForbiddenError).
+        """
         response = await self.get_analytics(
-            session, period=period, group_by=group_by, scope="all", actor=actor
+            session,
+            period=period,
+            group_by=group_by,
+            scope=scope,
+            start_date=start_date,
+            end_date=end_date,
+            actor=actor,
         )
 
         if format == "csv":
-            return self._to_csv(response), "text/csv"
+            return self._to_csv(response, group_by), "text/csv"
         else:
             return response.model_dump_json(indent=2), "application/json"
 
@@ -629,10 +749,39 @@ class AnalyticsService:
         return UsageByUserResponse(period=period, date=date, items=items)
 
     @staticmethod
-    def _to_csv(data: AnalyticsResponse) -> str:
+    def _to_csv(data: AnalyticsResponse, group_by: str = "model") -> str:
+        """group_by 축과 같은 표를 낸다 — 헤더도 축을 따른다.
+
+        예전에는 group_by 를 받지도 않고 늘 ``period,model,cost_usd`` 에 by_model 만 썼다.
+        서비스는 by_team/by_user 를 계산해 놓고 바로 여기서 버렸다 — '팀별' 화면의 CSV 가
+        모델 표였다. by_team 은 GLOBAL 스코프에서만 채워지므로(get_analytics), TEAM_LEADER 의
+        group_by=team 내보내기는 헤더만 있는 CSV 다. fail-closed 로 **의도된** 결과다.
+        """
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["period", "model", "cost_usd"])
-        for item in data.by_model:
-            writer.writerow([data.period, item.model, str(item.cost_usd)])
+        # period 열은 실제 집계 구간을 적는다 — 범위 내보내기가 '2026-09' 로만 적히면 그 파일이
+        # 5일치인지 한 달치인지 나중에 구분할 수 없다.
+        period_label = (
+            f"{data.start_date}~{data.end_date}" if data.start_date and data.end_date else data.period
+        )
+        # 이름·이메일·팀·모델 셀은 _csv_text 로 감싼다(수식 주입 방지) — 숫자 셀은 우리가 만든 값이다.
+        if group_by == "team":
+            writer.writerow(["period", "team", "team_id", "cost_usd", "active_users"])
+            for team_item in data.by_team:
+                writer.writerow([
+                    period_label, _csv_text(team_item.team), _csv_text(team_item.team_id),
+                    str(team_item.cost_usd), team_item.active_users,
+                ])
+        elif group_by == "user":
+            writer.writerow(["period", "user", "email", "cost_usd", "requests"])
+            for user_item in data.by_user:
+                writer.writerow([
+                    period_label, _csv_text(user_item.user), _csv_text(user_item.email),
+                    str(user_item.cost_usd), user_item.requests,
+                ])
+        else:
+            # 모델 축의 헤더는 예전 그대로 둔다(기존 소비자가 이 3열을 읽는다).
+            writer.writerow(["period", "model", "cost_usd"])
+            for model_item in data.by_model:
+                writer.writerow([period_label, _csv_text(model_item.model), str(model_item.cost_usd)])
         return output.getvalue()

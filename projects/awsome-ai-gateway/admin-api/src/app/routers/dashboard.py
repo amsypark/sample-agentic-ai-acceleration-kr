@@ -333,6 +333,11 @@ async def top_teams(
 
     stmt = (
         select(
+            # ⚠️ team_id 를 내보낸다. 콘솔은 이 목록을 /admin/budgets/summary 의 소진율과 조인하는데,
+            #    id 가 없던 동안 **팀 이름**으로 조인했다. 팀 이름은 전역 유일이 아니라(부서마다 같은
+            #    이름이 있을 수 있다) 동명 팀의 소진율이 서로 뒤바뀌어 표시됐다. Team.id 는 이미
+            #    GROUP BY 에 있어 질의 비용은 그대로다.
+            Team.id.label("team_id"),
             Team.name.label("name"),
             func.coalesce(func.sum(UsageLog.cost_usd), 0).label("cost_usd"),
             func.count().label("call_count"),
@@ -343,7 +348,8 @@ async def top_teams(
             *([cf] if (cf := client_filter(client)) is not None else []),
         )
         .group_by(Team.id, Team.name)
-        .order_by(func.sum(UsageLog.cost_usd).desc())
+        # 동점(같은 비용)일 때 순서를 고정 — LIMIT 경계에서 어느 팀이 잘리는지가 요청마다 바뀌지 않게.
+        .order_by(func.sum(UsageLog.cost_usd).desc(), Team.id)
         .limit(limit)
     )
     rows = (await session.execute(stmt)).all()
@@ -352,6 +358,7 @@ async def top_teams(
         "period": period,
         "teams": [
             {
+                "team_id": str(r.team_id),
                 "name": r.name,
                 "cost_usd": round(float(r.cost_usd or 0), 4),
                 "call_count": int(r.call_count or 0),

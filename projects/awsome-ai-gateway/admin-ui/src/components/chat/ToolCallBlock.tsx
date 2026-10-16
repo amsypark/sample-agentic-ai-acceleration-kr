@@ -30,17 +30,48 @@ interface Props {
  * AST+화이트리스트+SELECT-only+LIMIT+read-only role)을 그대로 통과하므로 안전.
  * 결과는 블록 안에 인라인 테이블 — 대화 이력을 오염시키지 않는다.
  */
+type SqlRunResult =
+  | { ok: true; rows?: Array<Record<string, unknown>>; row_count?: number }
+  | { ok: false; error?: string; hint?: string };
+
+/** 실패 응답 본문에서 사람이 읽을 사유를 뽑는다. 실제로 도착하는 모양이 넷이다:
+ *  Lambda 검증 실패 `{ok:false, error}` / 크래시 `{errorMessage}`(구버전 admin-api) /
+ *  HTTPException `{detail: string}` / 이 앱의 봉투 `{error:{message}}`. */
+function extractSqlError(body: unknown): string | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const b = body as { error?: unknown; errorMessage?: unknown; detail?: unknown };
+  if (typeof b.error === 'string') return b.error;
+  if (b.error && typeof b.error === 'object') {
+    const m = (b.error as { message?: unknown }).message;
+    if (typeof m === 'string') return m;
+  }
+  if (typeof b.errorMessage === 'string') return b.errorMessage;
+  if (typeof b.detail === 'string') return b.detail;
+  return undefined;
+}
+
+/** admin-api 가 Lambda 크래시/타임아웃을 정규화할 때 붙이는 복구 안내(`hint`) — 무엇을 하면 되는지. */
+function extractSqlHint(body: unknown): string | undefined {
+  const hint = (body as { hint?: unknown } | null)?.hint;
+  return typeof hint === 'string' && hint ? hint : undefined;
+}
+
 function SqlEditor({ sql, sessionId }: { sql: string; sessionId: string }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(sql);
   const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<{
-    ok?: boolean;
-    rows?: Array<Record<string, unknown>>;
-    row_count?: number;
-    error?: string;
-  } | null>(null);
+  const [result, setResult] = useState<SqlRunResult | null>(null);
 
+  /**
+   * ★ 성공은 **긍정적으로 증명**해야 한다(`ok === true`). 부정으로 추정하면 안 된다.
+   *
+   * 예전 코드는 `setResult(await r.json())` + `result.ok === false` 게이트였다. Lambda 가
+   * 크래시/타임아웃하면 admin-api 가 `{"errorMessage","errorType","stackTrace"}` 를 200 으로
+   * 돌려줬는데(FunctionError 미검사) 거기엔 `ok` 가 없어 **성공 분기**가 그려졌다: 행 0개, 행 수
+   * 없음, 에러 문구 없음 = "0행". `r.ok` 도 보지 않아 502/403/404 의 `{detail}` 도 똑같이 "0행" 이었다.
+   * admin-api 도 이제 크래시를 `{ok:false,...}` 로 정규화하지만, 알아보지 못한 봉투를 **조용히
+   * 성공으로 그리지 않는 것**이 이 방어의 핵심이다.
+   */
   const run = async (q: string) => {
     setRunning(true);
     setResult(null);
@@ -51,7 +82,13 @@ function SqlEditor({ sql, sessionId }: { sql: string; sessionId: string }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sql: q, session_id: sessionId }),
       });
-      setResult(await r.json());
+      const body: unknown = await r.json().catch(() => null);
+      const okFlag = (body as { ok?: unknown } | null)?.ok;
+      if (!r.ok || okFlag !== true) {
+        setResult({ ok: false, error: extractSqlError(body) ?? '실행 실패', hint: extractSqlHint(body) });
+      } else {
+        setResult(body as SqlRunResult);
+      }
     } catch (e) {
       setResult({ ok: false, error: String(e) });
     } finally {
@@ -107,10 +144,13 @@ function SqlEditor({ sql, sessionId }: { sql: string; sessionId: string }) {
       )}
       {result && (
         <div className="mt-2">
-          {result.ok === false ? (
+          {/* `!== true` — 알아보지 못한 봉투는 성공이 아니다(위 run() 주석 참조). */}
+          {result.ok !== true ? (
             // Lambda 검증/실행 에러를 그대로 노출 — 분석가가 보고 수정(에디터 UX 핵심)
             <div className="rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive whitespace-pre-wrap">
               {result.error || '실행 실패'}
+              {/* 예전엔 hint 를 버렸다 — 크래시/타임아웃이면 "범위를 좁혀 다시 실행" 이 다음 행동이다. */}
+              {result.hint && <p className="mt-1 text-muted-foreground">{result.hint}</p>}
             </div>
           ) : (
             <div>

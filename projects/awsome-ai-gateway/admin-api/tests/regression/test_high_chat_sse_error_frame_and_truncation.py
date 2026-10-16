@@ -450,3 +450,36 @@ def test_all_error_frames_go_through_the_single_helper():
         f"error 프레임을 만드는 함수가 {error_sse_owners} 다 — _publish_error 만이어야 "
         f"한다(본문 키를 type 으로 되돌린 지점이 생기면 UI 가 다시 조용히 버린다)"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4) done 프레임은 durationMs 를 싣고, 영속화는 같은 값을 duration_ms 로 남긴다
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# done 프레임은 오랫동안 리터럴 `{}` 였고 INSERT 는 duration_ms 컬럼을 쓰지 않았다. admin-ui 의
+# MessageBubble footer 는 `durationMs`(done 프레임, camelCase — useChatStream 이 JSON 을 그대로
+# spread 한다)와 `duration_ms`(/history, 매퍼가 변환)를 읽는데, 둘 다 영구히 비어 footer 가 아무
+# 오류 없이 사라져 있었다. 실 PG 의 컬럼 왕복은 test_high_console_contract_real_db.py 가 증명한다.
+
+
+async def test_done_frame_carries_duration_ms_in_camel_case(monkeypatch):
+    relay, inserted = await _run(monkeypatch, lines=[_text_frame("답"), DONE_FRAME])
+
+    done = [body for name, body in _events(relay) if name == "done"]
+    assert len(done) == 1
+    assert isinstance(done[0].get("durationMs"), int) and done[0]["durationMs"] >= 0, done[0]
+    assert "duration_ms" not in done[0], "snake_case 는 클라이언트가 spread 해도 못 읽는다"
+    # costUsd 는 근거(토큰 사용량)가 없으므로 싣지 않는다 — 0 은 '무료' 라는 틀린 숫자다.
+    assert "costUsd" not in done[0]
+
+    assert len(inserted) == 1
+    assert _bound(inserted[0])["dur"] == done[0]["durationMs"], (
+        "라이브 footer 와 새로고침 후 footer 가 다른 숫자를 보인다"
+    )
+
+
+async def test_failed_stream_still_persists_a_duration(monkeypatch):
+    relay, inserted = await _run(monkeypatch, invoke_exc=RuntimeError("agentcore down"))
+    assert len(inserted) == 1
+    dur = _bound(inserted[0])["dur"]
+    assert isinstance(dur, int) and dur >= 0

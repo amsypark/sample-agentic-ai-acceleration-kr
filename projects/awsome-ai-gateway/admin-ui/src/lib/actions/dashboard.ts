@@ -247,6 +247,9 @@ export async function fetchTopUsers(period?: string, limit = 5, client?: string)
 // 실제 비용 기준 상위 팀(§60.9) — usage_logs.team_id 직접 집계(SUCCESS+KST). top-users 와
 // 동형으로, 예산 미설정 팀도 포함(기존 budgets/summary 소스는 예산설정 팀만 누락 위험).
 export interface TopTeamItem {
+  // 팀 UUID — /admin/budgets/summary 의 target_id 와 매칭하는 조인키. 팀 이름은 전역 유일이 아니라
+  // 이름으로 조인하면 동명 팀의 소진율이 오귀속된다(lib/utils/teamBudgetJoin.ts).
+  team_id: string;
   name: string;
   cost_usd: number;
   call_count: number;

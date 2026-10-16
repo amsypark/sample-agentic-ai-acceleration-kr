@@ -257,7 +257,8 @@ def require_team_leader_of(team_id: uuid.UUID):
     async def _check(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
         if user.role == UserRole.ADMIN:
             return user
-        if user.role == UserRole.TEAM_LEADER and user.team_id == team_id:
+        # ⚠️ `is not None` 이 먼저다 — 팀 없는 리더를 None 팀에 대해 물으면 None == None 으로 통과했다.
+        if user.role == UserRole.TEAM_LEADER and user.team_id is not None and user.team_id == team_id:
             return user
         raise HTTPException(status_code=403, detail="Not authorized for this team")
 

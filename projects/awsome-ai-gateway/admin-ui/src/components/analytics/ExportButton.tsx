@@ -7,7 +7,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Download, ChevronDown } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import type { AnalyticsFilterForm } from '@/types/api';
-import { resolveMonth } from '@/lib/utils/period';
+import { buildAnalyticsQuery } from '@/lib/utils/analyticsQuery';
 import { redirectToLoginIfUnauthorized } from '@/lib/utils/unauthorized';
 
 interface ExportButtonProps {
@@ -40,20 +40,16 @@ export function ExportButton({ filter, latestMonth }: ExportButtonProps) {
     setIsLoading(true);
 
     try {
-      // 화면 차트와 동일한 월(resolveMonth)을 보냄 — 상대기간/잘못된 period 가
-      // 빈 CSV 를 만들지 않도록. custom 이면 start/end 도 함께 전달.
-      const month = resolveMonth(filter, latestMonth);
-      const exportParams: Record<string, string> = {
-        period: month,
-        group_by: filter.group_by,
-        format,
-      };
-      if (filter.scope) exportParams.scope = filter.scope;
-      if (filter.period === 'custom') {
-        if (filter.start_date) exportParams.start_date = filter.start_date;
-        if (filter.end_date) exportParams.end_date = filter.end_date;
-      }
-      const params = new URLSearchParams(exportParams).toString();
+      // 내보내기 질의는 **화면 질의와 같은 빌더**로 만든다(buildAnalyticsQuery). 예전에는 여기서
+      // 손으로 조립했고 두 질의가 갈렸다 — 한쪽 날짜만 고른 상태에서 start_date 하나만 보내
+      // (서버 400) 내보내기가 실패했고, 서버는 scope/범위를 선언조차 안 해 범위 화면에서 월 전체
+      // CSV 가 내려갔다. 파일은 "화면에 보이는 것" 이어야 하므로 질의 출처가 하나여야 한다.
+      const params = new URLSearchParams(
+        Object.entries(buildAnalyticsQuery(filter, latestMonth))
+          .filter(([, v]) => v !== undefined && v !== null && v !== '')
+          .map(([k, v]) => [k, String(v)] as [string, string])
+          .concat([['format', format]]),
+      ).toString();
 
       const response = await fetch(`/api/analytics-export?${params}`);
       // ⚠️ 401 을 아래 throw 로 흘리면 console.error 만 남고 화면엔 아무 변화가 없다 —
@@ -70,7 +66,10 @@ export function ExportButton({ filter, latestMonth }: ExportButtonProps) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `analytics.${format}`;
+      // 파일명은 서버가 붙인 Content-Disposition 을 따른다(월 또는 시작일_종료일). blob 다운로드는
+      // `a.download` 가 이기므로 고정 `analytics.csv` 를 쓰면 그 기간 정보가 파일에서 사라진다.
+      const disposition = response.headers.get('content-disposition') ?? '';
+      a.download = /filename="?([^";]+)"?/.exec(disposition)?.[1] ?? `analytics.${format}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);

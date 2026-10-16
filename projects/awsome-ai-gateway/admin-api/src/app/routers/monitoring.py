@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import func, select
+from sqlalchemy import Text, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, require_admin
@@ -59,15 +59,34 @@ async def monitoring_overview(
     }
 
 
+#: ``GET /admin/monitoring/models`` 의 세 번째 상태. 등록부(``model.model_aliases``)에 없는 alias 가
+#: 최근 1시간 트래픽에 나타났다는 뜻이다 — ``usage.usage_logs.model_alias`` 는 FK 가 없는 free-text
+#: 컬럼이라 alias 를 지우거나 이름을 바꾸면 로그 행만 남는다. ACTIVE/INACTIVE 로 접으면 그 행이
+#: "정상" 으로 보고되므로 별도 값이어야 한다.
+UNREGISTERED_MODEL_STATUS = "UNREGISTERED"
+
+
 @router.get("/models")
 async def monitoring_models(
     request: Request,
     admin: CurrentUser = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
 ):
+    """최근 1시간 alias 별 트래픽 + **등록부의 실제 status**.
+
+    예전에는 ``"status": "ACTIVE"`` 리터럴이었다. 그래서 콘솔의 상태 열은 항상 초록 ACTIVE 였고,
+    방금 INACTIVE 로 내린(= gateway-proxy 가 전면 거부하는) alias 조차 healthy 로 보였다 — 정보량이
+    0 인 열은 없는 열보다 나쁘다.
+
+    LEFT OUTER JOIN 이어야 한다. INNER JOIN 이면 등록부에 없는 alias 의 트래픽 행이 조용히 사라져,
+    표시가 틀리는 결함이 **트래픽이 안 보이는** 결함으로 승격된다. ``cast(status, Text)``: 이 이미지의
+    enum 이 DB 에 새로 생긴 값을 모를 수 있다(마이그레이션 선행 배포) — ORM enum 으로 읽으면 결과
+    처리 중 ``LookupError`` 로 상태를 보고하는 엔드포인트가 상태값 때문에 죽는다.
+    """
     now = datetime.now(timezone.utc)
     one_hour_ago = now - timedelta(hours=1)
 
+    registry_status = cast(ModelAlias.status, Text)
     stmt = (
         select(
             UsageLog.model_alias,
@@ -75,9 +94,11 @@ async def monitoring_models(
             func.avg(UsageLog.latency_ms).label("avg_latency_ms"),
             func.count().filter(UsageLog.status == UsageStatus.ERROR).label("error_count"),
             func.max(UsageLog.requested_at).label("last_request_at"),
+            registry_status.label("registry_status"),
         )
+        .outerjoin(ModelAlias, ModelAlias.alias == UsageLog.model_alias)
         .where(UsageLog.requested_at >= one_hour_ago)
-        .group_by(UsageLog.model_alias)
+        .group_by(UsageLog.model_alias, registry_status)
         .order_by(func.count().desc())
     )
     result = await session.execute(stmt)
@@ -89,7 +110,8 @@ async def monitoring_models(
         error_rate = (errors / total * 100) if total > 0 else 0
         models.append({
             "alias": row.model_alias,
-            "status": "ACTIVE",
+            # NULL = JOIN 이 매칭하지 못함 = 등록부에 없는 alias. ACTIVE 로 접지 않는다.
+            "status": row.registry_status or UNREGISTERED_MODEL_STATUS,
             "last_1h_requests": total,
             "avg_latency_ms": round(float(row.avg_latency_ms or 0)),
             "error_rate_pct": round(error_rate, 2),

@@ -128,6 +128,87 @@ class TestSetUserBudget:
         repo.upsert_config.assert_called_once()
 
 
+# ── 팀 없는 TEAM_LEADER — `None != None` 은 False 라 팀 검사를 통과해 버렸다 ──────────────────────
+
+
+@pytest.fixture
+def teamless_leader() -> CurrentUser:
+    return CurrentUser(
+        user_id=uuid.UUID("00000000-0000-0000-0000-000000000003"),
+        email="leader-noteam@test.com",
+        role=UserRole.TEAM_LEADER,
+        team_id=None,
+    )
+
+
+def _user_in(team_id: uuid.UUID | None) -> MagicMock:
+    user = MagicMock(spec=User)
+    user.team_id = team_id
+    return user
+
+
+_GUARDED_CALLS = {
+    "set_user_budget": {"data": SetBudgetRequest(max_budget_usd=Decimal("100"))},
+    "set_user_client_budget": {"client": "claude-code", "data": SetBudgetRequest(max_budget_usd=Decimal("10"))},
+    "clear_user_client_budget": {"client": "claude-code"},
+    "get_user_app_budgets": {},
+}
+
+
+class TestTeamlessLeader:
+    """팀 없는 TEAM_LEADER 는 누구의 예산도 관리하지 못한다 — 특히 팀 없는 사용자의 것.
+
+    가드가 `user.team_id != actor.team_id` 뿐이었다. 둘 다 None 이면 False 라 검사를 통과해, 팀 없는
+    리더가 팀 없는 사용자의 개인·앱별 예산을 쓰고 지우고 읽을 수 있었다(게이트웨이는 팀 없는 사용자를
+    어차피 거부하지만, 예산 행·감사 로그·화면 값은 실제로 바뀐다)."""
+
+    @pytest.mark.parametrize("call", list(_GUARDED_CALLS))
+    async def test_teamless_leader_is_refused_for_a_teamless_user(
+        self, budget_service: BudgetService, mock_session: AsyncMock, teamless_leader: CurrentUser, call: str
+    ):
+        passed = AssertionError("passed the team guard")
+        with patch("app.services.budget_service.UserRepository") as MockUserRepo, \
+             patch("app.services.budget_service.BudgetRepository", side_effect=passed), \
+             patch("app.services.user_allowed_client_service.UserAllowedClientService", side_effect=passed):
+            MockUserRepo.return_value.get_user = AsyncMock(return_value=_user_in(None))
+            with pytest.raises(ForbiddenError):
+                await getattr(budget_service, call)(
+                    mock_session, user_id=uuid.uuid4(), actor=teamless_leader, **_GUARDED_CALLS[call]
+                )
+
+    async def test_leader_with_a_team_still_reads_own_members(
+        self, budget_service: BudgetService, mock_session: AsyncMock, team_leader_user: CurrentUser
+    ):
+        """대조군 — 팀이 있는 리더는 자기 팀 멤버를 그대로 다룬다."""
+        with patch("app.services.budget_service.UserRepository") as MockUserRepo, \
+             patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo:
+            MockUserRepo.return_value.get_user = AsyncMock(return_value=_user_in(team_leader_user.team_id))
+            MockBudgetRepo.return_value.get_first_active_app_config = AsyncMock(return_value=None)
+            out = await budget_service.get_user_app_budgets(
+                mock_session, user_id=uuid.uuid4(), actor=team_leader_user
+            )
+        assert out == []
+
+    async def test_admin_still_reads_a_teamless_user(
+        self, budget_service: BudgetService, mock_session: AsyncMock, admin_user: CurrentUser
+    ):
+        """대조군 — ADMIN 은 팀과 무관하다."""
+        with patch("app.services.budget_service.UserRepository") as MockUserRepo, \
+             patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo:
+            MockUserRepo.return_value.get_user = AsyncMock(return_value=_user_in(None))
+            MockBudgetRepo.return_value.get_first_active_app_config = AsyncMock(return_value=None)
+            out = await budget_service.get_user_app_budgets(mock_session, user_id=uuid.uuid4(), actor=admin_user)
+        assert out == []
+
+
+def _members(session: AsyncMock, *user_ids: str) -> None:
+    """allocate 의 팀 멤버십 조회(UserRepository.team_member_ids)가 이 사용자들을 그 팀의 멤버로
+    돌려주게 한다 — 실제 SELECT 는 이 리포지토리 메서드가 한다(실 PG 증명은 console 계약 파일)."""
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [uuid.UUID(u) for u in user_ids]
+    session.execute = AsyncMock(return_value=result)
+
+
 class TestAllocateTeamBudget:
     async def test_team_leader_cannot_allocate_other_team(
         self, budget_service: BudgetService, mock_session: AsyncMock, team_leader_user: CurrentUser
@@ -150,6 +231,7 @@ class TestAllocateTeamBudget:
             AllocateBudgetItem(user_id=str(uuid.uuid4()), allocated_usd=Decimal("600.00")),
             AllocateBudgetItem(user_id=str(uuid.uuid4()), allocated_usd=Decimal("600.00")),
         ])
+        _members(mock_session, *(a.user_id for a in data.allocations))
 
         team_config = MagicMock(spec=BudgetConfig)
         team_config.max_budget_usd = Decimal("1000.00")
@@ -169,6 +251,7 @@ class TestAllocateTeamBudget:
         data = AllocateBudgetRequest(allocations=[
             AllocateBudgetItem(user_id=str(uuid.uuid4()), allocated_usd=Decimal("100.00")),
         ])
+        _members(mock_session, data.allocations[0].user_id)
 
         with patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo:
             MockBudgetRepo.return_value.get_active_config = AsyncMock(return_value=None)
@@ -179,10 +262,56 @@ class TestAllocateTeamBudget:
                 )
 
 
+class TestAllocateMembership:
+    """배정 대상은 **그 팀의 멤버**여야 한다 — URL 의 team_id 검사만으로는 본문의 user_id 를 못 막는다."""
+
+    async def test_leader_cannot_allocate_to_a_user_outside_the_team(
+        self, budget_service: BudgetService, mock_session: AsyncMock, team_leader_user: CurrentUser
+    ):
+        member, outsider = str(uuid.uuid4()), str(uuid.uuid4())
+        data = AllocateBudgetRequest(allocations=[
+            AllocateBudgetItem(user_id=member, allocated_usd=Decimal("10.00")),
+            AllocateBudgetItem(user_id=outsider, allocated_usd=Decimal("0.00")),
+        ])
+        _members(mock_session, member)  # outsider 는 이 팀 멤버가 아니다
+
+        with patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo:
+            repo = MockBudgetRepo.return_value
+            repo.upsert_config = AsyncMock()
+            with pytest.raises(ForbiddenError, match=outsider):
+                await budget_service.allocate_team_budget(
+                    mock_session, team_id=team_leader_user.team_id, data=data, actor=team_leader_user
+                )
+        repo.upsert_config.assert_not_awaited()  # 팀 멤버 것도 쓰지 않는다 — 요청 전체가 거부다
+
+    async def test_admin_allocating_an_outsider_is_a_bad_request(
+        self, budget_service: BudgetService, mock_session: AsyncMock, admin_user: CurrentUser
+    ):
+        data = AllocateBudgetRequest(allocations=[
+            AllocateBudgetItem(user_id=str(uuid.uuid4()), allocated_usd=Decimal("1.00")),
+        ])
+        _members(mock_session)  # 아무도 멤버가 아니다
+        with pytest.raises(ValidationError, match="not members"):
+            await budget_service.allocate_team_budget(
+                mock_session, team_id=uuid.uuid4(), data=data, actor=admin_user
+            )
+
+    async def test_non_uuid_user_id_is_a_400_not_a_500(
+        self, budget_service: BudgetService, mock_session: AsyncMock, admin_user: CurrentUser
+    ):
+        data = AllocateBudgetRequest(allocations=[
+            AllocateBudgetItem(user_id="not-a-uuid", allocated_usd=Decimal("1.00")),
+        ])
+        with pytest.raises(ValidationError, match="Invalid user_id"):
+            await budget_service.allocate_team_budget(
+                mock_session, team_id=uuid.uuid4(), data=data, actor=admin_user
+            )
+
+
 class TestGetBudgetSummary:
     @pytest.mark.asyncio
     async def test_budget_summary_returns_user_and_team_rows(
-        self, budget_service: BudgetService, mock_session: AsyncMock
+        self, budget_service: BudgetService, mock_session: AsyncMock, admin_user: CurrentUser
     ):
         team_id = uuid.uuid4()
         user_id = uuid.uuid4()
@@ -217,7 +346,7 @@ class TestGetBudgetSummary:
             URepo.return_value.list_all_teams = AsyncMock(return_value=[team_obj])
 
             result = await budget_service.get_budget_summary(
-                mock_session, scope=None, target_id=None, period="2026-04"
+                mock_session, scope=None, target_id=None, period="2026-04", actor=admin_user
             )
 
         target_types = sorted({i.target_type for i in result.summary})

@@ -8,6 +8,8 @@ import { useTranslations } from 'next-intl';
 import { X } from 'lucide-react';
 import type { ModelListItem } from '@/types/entities';
 import { createModelAction, updateModelAction } from '@/lib/actions/models';
+// 단가 칸의 `max` — 브라우저가 제출 자체를 막는다(초과 값은 admin-api 에서도 422).
+import { MAX_PRICE_PER_1K } from '@/types/api';
 import { FormError } from '@/components/common/FormError';
 import { SpinnerButton } from '@/components/common/SpinnerButton';
 import { useToast } from '@/components/common/ToastProvider';
@@ -171,6 +173,8 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
               id="alias"
               name="alias"
               type="text"
+              // 128 = `model_aliases.alias VARCHAR(128)` (= admin-api max_length).
+              maxLength={128}
               value={form.alias}
               onChange={handleChange}
               required
@@ -238,6 +242,8 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
               id="model_id"
               name="model_id"
               type="text"
+              // 512 = `model_aliases.provider_model_id VARCHAR(512)`.
+              maxLength={512}
               value={form.model_id}
               onChange={handleChange}
               required
@@ -275,6 +281,7 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
                 name="input_price_per_1k"
                 type="number"
                 min={0}
+                max={MAX_PRICE_PER_1K}
                 step={0.00000001}
                 value={form.input_price_per_1k}
                 onChange={handleChange}
@@ -292,6 +299,7 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
                 name="output_price_per_1k"
                 type="number"
                 min={0}
+                max={MAX_PRICE_PER_1K}
                 step={0.00000001}
                 value={form.output_price_per_1k}
                 onChange={handleChange}
@@ -309,6 +317,7 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
                 name="cache_creation_5m_price_per_1k"
                 type="number"
                 min={0}
+                max={MAX_PRICE_PER_1K}
                 step={0.00000001}
                 value={form.cache_creation_5m_price_per_1k}
                 onChange={handleChange}
@@ -325,6 +334,7 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
                 name="cache_creation_1h_price_per_1k"
                 type="number"
                 min={0}
+                max={MAX_PRICE_PER_1K}
                 step={0.00000001}
                 value={form.cache_creation_1h_price_per_1k}
                 onChange={handleChange}
@@ -341,6 +351,7 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
                 name="cache_read_price_per_1k"
                 type="number"
                 min={0}
+                max={MAX_PRICE_PER_1K}
                 step={0.00000001}
                 value={form.cache_read_price_per_1k}
                 onChange={handleChange}

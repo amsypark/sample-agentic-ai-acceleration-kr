@@ -3,10 +3,11 @@
 // Copyright 2026 © Amazon.com and Affiliates: This deliverable is considered Developed Content as defined in the AWS Service Terms.
 
 import { useRouter, usePathname } from 'next/navigation';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import type { AnalyticsFilterForm } from '@/types/api';
 import type { GroupByType } from '@/types/enums';
-import { currentCalendarMonth, monthsAgo, toKoreanMonthLabel } from '@/lib/utils/period';
+import { currentCalendarMonth, formatMonthLabel, monthsAgo } from '@/lib/utils/period';
+import { MAX_ANALYTICS_RANGE_DAYS, customRangeDays } from '@/lib/utils/analyticsQuery';
 
 interface AnalyticsFilterProps {
   defaultValue: AnalyticsFilterForm;
@@ -18,6 +19,7 @@ interface AnalyticsFilterProps {
 
 export function AnalyticsFilter({ defaultValue, periods, currentMonth }: AnalyticsFilterProps) {
   const t = useTranslations('analytics');
+  const locale = useLocale();
   const router = useRouter();
   const pathname = usePathname();
 
@@ -27,6 +29,10 @@ export function AnalyticsFilter({ defaultValue, periods, currentMonth }: Analyti
     { value: 'user', label: t('groupByOptions.user') },
   ];
   const isCustom = defaultValue.period === 'custom';
+  // ⚠️ 상한을 넘는 범위는 서버가 400 으로 거절한다 → 카드/차트가 "불러오지 못했습니다" 만 보인다.
+  //    이유를 선택기 옆에 적는다(조용히 그 달 숫자로 바꿔 보여주면 범위 라벨과 숫자가 어긋난다).
+  const rangeDays = isCustom ? customRangeDays(defaultValue.start_date, defaultValue.end_date) : null;
+  const rangeTooLong = rangeDays !== null && rangeDays > MAX_ANALYTICS_RANGE_DAYS;
   const thisMonth = currentCalendarMonth();
   const lastMonth = monthsAgo(1);
 
@@ -89,7 +95,7 @@ export function AnalyticsFilter({ defaultValue, periods, currentMonth }: Analyti
             aria-pressed={!isCustom && currentMonth === thisMonth}
             className={btn(!isCustom && currentMonth === thisMonth)}
           >
-            이번 달
+            {t('thisMonth')}
           </button>
           <button
             type="button"
@@ -97,11 +103,11 @@ export function AnalyticsFilter({ defaultValue, periods, currentMonth }: Analyti
             aria-pressed={!isCustom && currentMonth === lastMonth}
             className={btn(!isCustom && currentMonth === lastMonth)}
           >
-            지난 달
+            {t('lastMonth')}
           </button>
           {dropdownMonths.length > 0 && (
             <select
-              aria-label="기간 선택 (월)"
+              aria-label={t('monthPicker')}
               value={dropdownActive ? currentMonth : ''}
               onChange={(e) => {
                 if (e.target.value) handleMonthChange(e.target.value);
@@ -113,11 +119,11 @@ export function AnalyticsFilter({ defaultValue, periods, currentMonth }: Analyti
               }}
             >
               <option value="" disabled>
-                기간 선택
+                {t('monthPickerPlaceholder')}
               </option>
               {dropdownMonths.map((p) => (
                 <option key={p} value={p}>
-                  {toKoreanMonthLabel(p)}
+                  {formatMonthLabel(p, locale)}
                 </option>
               ))}
             </select>
@@ -128,7 +134,7 @@ export function AnalyticsFilter({ defaultValue, periods, currentMonth }: Analyti
             aria-pressed={isCustom}
             className={btn(isCustom)}
           >
-            직접 입력
+            {t('customRange')}
           </button>
         </div>
       </div>
@@ -161,6 +167,11 @@ export function AnalyticsFilter({ defaultValue, periods, currentMonth }: Analyti
               className="rounded-apple-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
             />
           </div>
+          {rangeTooLong && (
+            <p role="alert" className="mb-2 text-xs text-destructive">
+              {t('rangeTooLong', { max: MAX_ANALYTICS_RANGE_DAYS, days: rangeDays })}
+            </p>
+          )}
         </div>
       )}
 

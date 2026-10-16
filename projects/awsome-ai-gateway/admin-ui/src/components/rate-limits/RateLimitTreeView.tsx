@@ -15,25 +15,40 @@ interface RateLimitTreeViewProps {
 
 const EXPANDED_NODES_STORAGE_KEY = 'rate-limits:tree:expandedNodes';
 
-function collectDefaultExpanded(nodes: RateLimitTreeNode[]): Set<string> {
-  // 기본적으로 GLOBAL 만 펼침. TEAM 은 접혀 있어서 USER 리스트 숨김.
-  const ids = new Set<string>();
+/** id 로 노드를 찾는다 — 루트와 자식(팀 멤버) 모두. */
+function findNode(nodes: RateLimitTreeNode[], id: string | null): RateLimitTreeNode | null {
+  if (id == null) return null;
   for (const n of nodes) {
-    if (n.scope === 'GLOBAL') ids.add(n.id);
+    if (n.id === id) return n;
+    const hit = findNode(n.children, id);
+    if (hit) return hit;
   }
-  return ids;
+  return null;
 }
 
 export function RateLimitTreeView({ nodes }: RateLimitTreeViewProps) {
   const t = useTranslations('rateLimits');
-  const [selectedNode, setSelectedNode] = useState<RateLimitTreeNode | null>(null);
-  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(() =>
-    collectDefaultExpanded(nodes)
-  );
+  // ⚠️ 선택은 **id** 로만 들고, 노드는 매 렌더 새 `nodes` 에서 찾는다. 예전엔 클릭한 노드 객체를
+  //    state 에 붙잡아 두었다 — '개인 한도 제거'/저장 후 서버가 새 트리를 내려도 패널은 옛 객체를
+  //    계속 보여줘(지운 오버라이드 값과 '제거' 버튼이 그대로) 이미 지운 행을 다시 지우거나 옛 값을
+  //    입력칸에서 다시 저장하게 만들었다.
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selectedNode = findNode(nodes, selectedId);
+  // 최초 진입은 모두 접힌 상태다. 루트는 GLOBAL(모델별, children=[]) · TEAM(멤버를 자식으로) ·
+  // 팀 미배정 USER(children=[]) 세 부류가 **형제로** 온다 — GLOBAL 은 모델 축이라 TEAM/USER 의
+  // 부모가 아니다(admin-api get_rate_limit_tree). 예전의 "GLOBAL 만 펼침" 기본값은 GLOBAL 노드가
+  // 트리에 없던 시절의 것이라 아무것도 펼치지 않았다. 펼침 상태는 아래 effect 가 복원한다.
+  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(() => new Set<string>());
   const [showInactive, setShowInactive] = useState(false);
   const hasMountedRef = useRef(false);
 
   const hasInactive = nodes.some(n => n.is_active === false);
+  // GLOBAL 은 한 번에 한 모델만 활성 한도를 가진다 — 패널이 저장 전에 확인받을 수 있게 그 노드를 넘긴다.
+  // ⚠️ 전부 비어 있는 행(값을 비우고 저장)은 아무것도 집행하지 않으므로 주인이 아니다. 주인으로 세면
+  //    해제할 것이 없는데도 확인을 요구한다(admin-api 의 409 판정도 같은 기준 — rpm/tpm 중 하나라도).
+  const globalSlotHolder =
+    nodes.find(n => n.scope === 'GLOBAL' && n.config && (n.config.rpm != null || n.config.tpm != null)) ??
+    null;
   const filteredNodes = showInactive
     ? nodes
     : nodes.filter(n => n.is_active !== false).map(n => ({
@@ -98,12 +113,12 @@ export function RateLimitTreeView({ nodes }: RateLimitTreeViewProps) {
           nodes={filteredNodes}
           selectedNodeId={selectedNode?.id ?? null}
           expandedNodes={expandedNodes}
-          onSelect={setSelectedNode}
+          onSelect={(n) => setSelectedId(n.id)}
           onToggle={handleToggle}
         />
       </div>
       <div className="flex-1 p-6">
-        <RateLimitConfigPanel node={selectedNode} />
+        <RateLimitConfigPanel node={selectedNode} globalSlotHolder={globalSlotHolder} />
       </div>
       </div>
     </div>

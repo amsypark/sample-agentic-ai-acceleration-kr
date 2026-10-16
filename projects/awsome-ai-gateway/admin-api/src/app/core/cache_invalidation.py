@@ -13,6 +13,9 @@ from app.models.audit import CacheInvalidationFailure
 
 logger = structlog.get_logger()
 
+#: ``invalidate_pattern`` 실패 기록의 접두사 — ``retry_failed`` 가 이것을 보고 패턴으로 다시 지운다.
+_PATTERN_PREFIX = "pattern:"
+
 
 class CacheInvalidationManager:
     """Best-effort Redis DEL with failure logging and manual retry support."""
@@ -62,7 +65,7 @@ class CacheInvalidationManager:
         except Exception:
             logger.warning("cache.invalidation_pattern_failed", pattern=pattern, exc_info=True)
             if session is not None:
-                await self._record_failure(session, f"pattern:{pattern}")
+                await self._record_failure(session, f"{_PATTERN_PREFIX}{pattern}")
             return 0
 
     async def retry_failed(self, session: AsyncSession) -> int:
@@ -78,7 +81,16 @@ class CacheInvalidationManager:
         resolved_count = 0
         for failure in failures:
             try:
-                await self._redis.delete(failure.cache_key)
+                if failure.cache_key.startswith(_PATTERN_PREFIX):
+                    # ⚠️ invalidate_pattern 의 실패 기록이다 — 그 **패턴**을 다시 SCAN+DEL 한다. 예전엔
+                    #    리터럴 "pattern:<glob>" 키를 DEL 했다(그런 키는 없다): 아무것도 지우지 않고
+                    #    resolved 로 표시해, 옛 정책 캐시는 TTL 까지 남고 실패 기록은 다시 보지 않았다.
+                    #    invalidate_pattern 을 부르지 않는다 — 그건 실패를 삼키고 새 행을 기록한다.
+                    pattern = failure.cache_key[len(_PATTERN_PREFIX):]
+                    async for key in self._redis.scan_iter(match=pattern, count=200):
+                        await self._redis.delete(key)
+                else:
+                    await self._redis.delete(failure.cache_key)
                 failure.resolved_at = datetime.now(timezone.utc)
                 resolved_count += 1
                 logger.info("cache.retry_resolved", key=failure.cache_key)

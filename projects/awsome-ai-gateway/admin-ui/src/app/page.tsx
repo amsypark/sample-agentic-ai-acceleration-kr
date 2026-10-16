@@ -34,6 +34,7 @@ import { TopSpendTable, type TopSpendRow } from '@/components/dashboard/TopSpend
 import { PeriodSelector } from '@/components/dashboard/PeriodSelector';
 import { ClientFilter } from '@/components/dashboard/ClientFilter';
 import { kstNowParts } from '@/lib/utils/period';
+import { joinTeamBudgetPct } from '@/lib/utils/teamBudgetJoin';
 
 
 
@@ -218,19 +219,9 @@ async function TeamUserRanking({ period, client }: { period: string; client: str
   const topUsers = topUsersResult.status === 'fulfilled' ? topUsersResult.value : [];
   const budgetItems = budgetResult.status === 'fulfilled' ? budgetResult.value : [];
 
-  // 팀명 → 예산 소진율 룩업(예산 설정된 팀만 존재; 없으면 null).
-  const teamPctByName = new Map<string, number | null>(
-    budgetItems
-      .filter((i) => i.target_type === 'team')
-      .map((i) => [i.target_name || '', i.usage_pct != null ? parseFloat(i.usage_pct) : null]),
-  );
-
-  const teamRows: TopSpendRow[] = topTeams.map((t) => ({
-    id: t.name,
-    name: t.name,
-    usedUsd: t.cost_usd,
-    usagePct: teamPctByName.get(t.name) ?? null,
-  }));
+  // 팀 UUID(team_id ↔ budgets/summary target_id)로 예산 소진율을 조인한다 — 이름으로 이으면 동명
+  // 팀의 소진율이 오귀속된다. 순수 helper 로 빼서 테스트로 못박는다(lib/utils/teamBudgetJoin).
+  const teamRows: TopSpendRow[] = joinTeamBudgetPct(topTeams, budgetItems);
 
   // 실제 비용 기준 — usagePct 는 예산 미설정자가 많아 의미 없어 미표시(null).
   const userRows: TopSpendRow[] = topUsers.map((u) => ({
