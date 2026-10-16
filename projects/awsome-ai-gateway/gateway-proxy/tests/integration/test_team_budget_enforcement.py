@@ -193,6 +193,10 @@ def _build_redis(budget_eval_resps) -> AsyncMock:
             "status": "ACTIVE",
             "created_at": None,
             "description": None,
+            # 지금 이미지가 쓰는 payload 모양 — 계정 칸이 없는 것은 0043 이전 파드의 payload 로
+            # 보고 캐시 미스로 처리한다(router_service._parse_cached_model).
+            "account_role_arn": None,
+            "account_external_id": None,
         }
     ).encode()
 

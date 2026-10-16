@@ -57,6 +57,15 @@ class ModelInactiveError(LookupError):
     """
 
 
+class AmbiguousModelAccountError(LookupError):
+    """provider_model_id 로 지목했는데 그 id 의 ACTIVE alias 들이 서로 다른 AWS 계정을 부른다.
+
+    :class:`ModelInactiveError` 와 같은 이유로 따로 둔다: 대체(fallback)하는 호출자에게 이것은
+    "모르는 모델" 이 아니다. /v1/responses 가 이것을 default_model 로 바꾸면 요청이 다른 모델·다른
+    계정으로 200 을 받는다 — 거절해야 하고(404), 고치는 법은 "alias 로 지목하라" 다.
+    """
+
+
 class ClientModelScopeError(PermissionError):
     """모델 × 앱 축의 거부(:func:`check_client_model_scope`).
 
@@ -145,6 +154,11 @@ def _orm_to_schema(alias_row: ModelAlias, pricing_row: Optional[ModelPricing]) -
         # getattr 로 읽는다 — 0035 를 적용하지 않은 DB(구 배포와의 롤링 창)에서도
         # 부팅이 죽지 않아야 하고, 그때는 None(제한 없음) = 오늘 동작이다.
         allowed_clients=getattr(alias_row, "allowed_clients", None),
+        # alias 별 대상 계정(0043). **명시 매핑**이다 — 빠지면 스키마 기본값 None 이 되어
+        # "alias 계정 없음" 으로 조용히 돌아간다. 그건 500 이 아니라 다른 계정에 청구되는
+        # 성공 응답이라 상태 코드도 모니터링도 잡지 못한다.
+        account_role_arn=alias_row.account_role_arn,
+        account_external_id=alias_row.account_external_id,
     )
 
 
@@ -180,10 +194,96 @@ def _parse_cached_model(cached: str, model_ref: str) -> Optional[ModelConfigSche
     treat it as a cache miss and rebuild from the DB with the correct shape+TTL.
     """
     try:
-        return ModelConfigSchema(**json.loads(cached))
+        data = json.loads(cached)
+        # 롤링 배포: 0043 이전 이미지가 쓴 payload 에는 계정 칸이 아예 없다. 스키마 기본값 None
+        # 으로 받으면 "alias 계정 없음" 이 되어 TTL 동안 그 alias 를 파드/프로필 계정으로 서명한다
+        # — 다른 계정에 청구되는 200 이다. 키가 없으면 미스로 본다(명시적 null 은 정상 값이다).
+        if "account_role_arn" not in data:
+            logger.info("model_cache_predates_alias_accounts_treating_as_miss", model_ref=model_ref)
+            return None
+        return ModelConfigSchema(**data)
     except Exception:
         logger.warning("model_cache_parse_failed_treating_as_miss", model_ref=model_ref)
         return None
+
+
+#: 계정 일치 검사를 위해 읽는 같은 provider_model_id 의 alias 수 상한. 실제 수(시드는 모델 id
+#: 하나에 최대 2개)보다 훨씬 크다 — 비정상 레지스트리가 조회 한 번을 무한 읽기로 만들지 못하게.
+_PMID_SIBLING_SCAN = 64
+
+
+async def _pmid_fallback_row(db: AsyncSession, provider_values: list[str], model_ref: str):
+    """alias 가 아니라 **provider_model_id** 로 지목한 요청을 해석한다 — 결정적으로, 그리고
+    AWS 계정을 가로지르지 않게.
+
+    여러 alias 가 한 provider_model_id 를 공유하는 것은 정상이다(시드: claude-sonnet-4-6 /
+    claude-sonnet-4-6[1m]). alias 별 계정 이전에는 그 경우 단가 행만 임의였지만, 이제는 **계정**이
+    임의가 된다 — 예전의 순서 없는 ``.limit(1)`` 은 Postgres 가 돌려주는 행을 골랐으므로 모델 id
+    로 지목한 요청이 캐시가 채워질 때마다 이 sibling 의 계정 또는 저 sibling 의 계정으로 청구될 수
+    있었다(매번 200). 그래서:
+
+      * **ACTIVE** sibling 만 본다 — 비활성 alias 는 서빙되지 않으므로 계정이 달라도 모호하지 않다;
+      * 그 중 (account_role_arn, account_external_id) 가 다른 것이 있으면
+        :class:`AmbiguousModelAccountError` 로 거절한다(시끄럽게 — 고치는 법은 "alias 로 지목하라").
+        alias 이름은 **로그에만** 남긴다: 404 본문은 그 키를 가진 누구에게나 가고, 이름은 다른
+        팀의 모델 구성이다;
+      * 아니면 ``ORDER BY alias`` 의 첫 ACTIVE 행 — 계정이 같으니 결정적으로 고르면 단가 행도
+        안정된다;
+      * ACTIVE 가 하나도 없으면 첫 행(비활성)을 돌려 호출자가 :class:`ModelInactiveError` 로
+        거절하게 한다 — 모든 alias 를 끈 운영자의 kill switch 가 "없는 모델" 로 대체되면 안 된다.
+
+    계정이 없는 alias 들은 모두 (None, None) 으로 일치하므로 거절되지 않는다 — 오늘 동작에서
+    바뀌는 것은 "임의의 sibling" 이 "이름순 첫 ACTIVE sibling" 이 된 것뿐이다.
+    """
+    rows = (
+        await db.execute(
+            select(ModelAlias)
+            .where(
+                and_(
+                    ModelAlias.provider.in_(provider_values),
+                    ModelAlias.provider_model_id == model_ref,
+                )
+            )
+            .order_by(ModelAlias.alias)
+            .limit(_PMID_SIBLING_SCAN)
+        )
+    ).scalars().all()
+    if not rows:
+        return None
+    active = [r for r in rows if r.status == "ACTIVE"]
+    if not active:
+        return rows[0]  # 호출자가 ModelInactiveError 로 거절한다(kill switch)
+    accounts = {
+        (getattr(r, "account_role_arn", None), getattr(r, "account_external_id", None))
+        for r in active
+    }
+    if len(accounts) > 1:
+        logger.error(
+            "provider_model_id_siblings_disagree_on_account",
+            provider_model_id=model_ref[:128],
+            aliases=[str(r.alias) for r in active[:8]],
+        )
+        raise AmbiguousModelAccountError(
+            f"Model '{model_ref[:128]}' is registered under several aliases that call different "
+            "AWS accounts; ask for a specific alias instead."
+        )
+    return active[0]
+
+
+async def _cache_resolved(redis, schema: ModelConfigSchema, model_ref: str) -> None:
+    """해석 결과를 **그 결과가 맞는 키에만** 캐시한다.
+
+    alias 키는 항상. provider_model_id 키는 요청이 provider_model_id 로 지목했을 때**만**.
+    alias 로 지목한 조회에서 ``model:{provider_model_id}`` 를 쓰면(예전 동작), 그 provider_model_id
+    와 **이름이 같은 다른 alias** 의 캐시 칸을 덮어쓴다 — 시드 예: ``claude-opus-4-8`` (모델 id
+    ``global.anthropic.claude-opus-4-8``) 을 해석하면 이름이 ``global.anthropic.claude-opus-4-8``
+    인 alias 의 칸이 덮였다. 그 alias 의 요청은 TTL 동안 claude-opus-4-8 의 설정 — 단가, 허용
+    앱, status, 그리고 이제 AWS 계정 — 으로 서빙됐다.
+    """
+    payload = schema.model_dump_json()
+    await redis.setex(f"model:{schema.alias}", MODEL_CACHE_TTL, payload)
+    if model_ref != schema.alias and model_ref == schema.provider_model_id:
+        await redis.setex(f"model:{model_ref}", MODEL_CACHE_TTL, payload)
 
 
 async def _fetch_latest_pricing(db: AsyncSession, alias: str) -> Optional[ModelPricing]:
@@ -259,8 +359,9 @@ class RouterService:
         if db is None:
             raise LookupError(f"Model alias '{model_ref}' not found (DB unavailable)")
 
-        # alias 정확 매칭 우선, 없으면 provider_model_id fallback (동일 provider_model_id가
-        # 여러 alias에 매핑될 수 있으므로 limit(1) 사용).
+        # alias 정확 매칭 우선, 없으면 provider_model_id fallback — 같은 provider_model_id 의
+        # alias 가 여럿이면 이름순으로 고르고, 서로 다른 AWS 계정을 부르면 거절한다
+        # (_pmid_fallback_row).
         result = await db.execute(
             select(ModelAlias).where(
                 and_(
@@ -272,15 +373,7 @@ class RouterService:
         alias_row = result.scalar_one_or_none()
 
         if alias_row is None:
-            result = await db.execute(
-                select(ModelAlias).where(
-                    and_(
-                        ModelAlias.provider.in_(provider_values),
-                        ModelAlias.provider_model_id == model_ref,
-                    )
-                ).limit(1)
-            )
-            alias_row = result.scalar_one_or_none()
+            alias_row = await _pmid_fallback_row(db, provider_values, model_ref)
         if alias_row is None:
             raise LookupError(f"Model alias '{model_ref}' not found")
 
@@ -291,9 +384,7 @@ class RouterService:
         schema = _orm_to_schema(alias_row, pricing_row)
 
         if redis is not None:
-            payload = schema.model_dump_json()
-            await redis.setex(f"model:{schema.alias}", MODEL_CACHE_TTL, payload)
-            await redis.setex(f"model:{schema.provider_model_id}", MODEL_CACHE_TTL, payload)
+            await _cache_resolved(redis, schema, model_ref)
 
         return schema
 

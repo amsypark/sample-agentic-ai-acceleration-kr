@@ -140,7 +140,7 @@ async def init_only_schema() -> dict[tuple[str, str], set[str]]:
     for r in rows:
         schema.setdefault((r["table_schema"], r["table_name"]), set()).add(r["column_name"])
 
-    yield {"schema": schema, "failures": failures}
+    yield {"schema": schema, "failures": failures, "url": url}
 
     admin = create_async_engine(f"{prefix}/postgres", isolation_level="AUTOCOMMIT")
     try:
@@ -201,3 +201,52 @@ async def test_the_comparison_can_actually_fail(init_only_schema):
     live = init_only_schema["schema"]
     assert ("auth", "users") in live, "auth.users 조차 못 찾았다 — 조회가 깨졌다"
     assert "column_that_does_not_exist" not in live[("auth", "users")]
+
+
+#: 이 백엔드가 ``usage.usage_logs`` 에 쥔 테이블 락 모드(트랜잭션이 끝날 때까지 남는다).
+_USAGE_LOGS_LOCKS = (
+    "SELECT DISTINCT mode FROM pg_locks WHERE pid = pg_backend_pid() "
+    "AND locktype = 'relation' AND relation = 'usage.usage_logs'::regclass"
+)
+
+
+async def test_rerunning_init_sql_takes_no_access_exclusive_on_usage_logs(init_only_schema):
+    """``db/init`` 은 모든 마이그레이션 Job 에서 alembic 앞에 다시 돈다 — 그때 원장 테이블을 세우면 안 된다.
+
+    컬럼이 이미 있어 no-op 인 ``ADD COLUMN IF NOT EXISTS`` 도 ACCESS EXCLUSIVE 를 잡는다(실 PG16
+    측정). 그 락은 읽기까지 막고, 열린 트랜잭션 뒤에서 기다리는 동안 그 테이블의 모든 읽기·쓰기를
+    뒤에 줄 세운다. 그래서 usage_logs 의 컬럼 추가는 information_schema 로 존재를 먼저 본다.
+    파일마다 한 트랜잭션에서 돌려 쥔 락을 읽고 되돌린다(스크래치 DB, 이미 한 번 적용된 상태 =
+    두 번째 Job).
+    """
+    asyncpg = pytest.importorskip("asyncpg")
+    conn = await asyncpg.connect(_asyncpg(init_only_schema["url"]))
+    try:
+        held: dict[str, list[str]] = {}
+        for f in sorted(_INIT_DIR.glob("*.sql")):
+            if f.name.startswith(_TOLERATED_INIT_FAILURES):
+                continue
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                await conn.execute(f.read_text(encoding="utf-8"))
+                held[f.name] = sorted(r["mode"] for r in await conn.fetch(_USAGE_LOGS_LOCKS))
+            finally:
+                await tx.rollback()
+        assert held, "init SQL 을 하나도 다시 돌리지 않았다 — 이 검사가 공허하다"
+        offenders = {name: modes for name, modes in held.items() if "AccessExclusiveLock" in modes}
+        assert offenders == {}, f"init SQL 재실행이 usage.usage_logs 를 ACCESS EXCLUSIVE 로 잠근다: {offenders}"
+
+        # 대조군 — 같은 조회가 가드 없는 문장의 락은 실제로 잡는다(조회가 공허하지 않다).
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await conn.execute(
+                "ALTER TABLE usage.usage_logs ADD COLUMN IF NOT EXISTS context_tier VARCHAR(8)"
+            )
+            control = {r["mode"] for r in await conn.fetch(_USAGE_LOGS_LOCKS)}
+        finally:
+            await tx.rollback()
+        assert "AccessExclusiveLock" in control, control
+    finally:
+        await conn.close()

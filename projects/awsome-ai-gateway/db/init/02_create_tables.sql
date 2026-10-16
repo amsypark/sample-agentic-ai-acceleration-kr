@@ -594,7 +594,16 @@ CREATE INDEX IF NOT EXISTS idx_service_tokens_hash ON auth.service_tokens (token
 -- 새 마이그레이션을 넣고 여기를 빠뜨리면 그 테스트가 잡는다.
 
 -- migration 0007: 요청을 발생시킨 앱 태그(claude-code | cowork | codex | other | NULL).
-ALTER TABLE usage.usage_logs ADD COLUMN IF NOT EXISTS client TEXT;
+-- 존재를 먼저 본다: no-op 인 ADD COLUMN IF NOT EXISTS 도 원장 테이블에 ACCESS EXCLUSIVE 를 잡아,
+-- 매 Job 마다 그 테이블의 읽기·쓰기를 전부 세운다(아래 0039·0045 와 같은 가드).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'usage' AND table_name = 'usage_logs'
+                      AND column_name = 'client') THEN
+        ALTER TABLE usage.usage_logs ADD COLUMN client TEXT;
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS ix_usage_logs_client ON usage.usage_logs (client);
 
 -- migration 0034: 생산성 이벤트 멱등키. 부분 유니크 인덱스라 NULL 은 중복을 허용한다
@@ -686,4 +695,188 @@ WHERE a.alias = p.model_alias
 
 -- migration 0039: 요청별 청구 티어 감사. 게이트웨이 resolve_context_tier 가 청구와 이 값을
 -- 같은 판정으로 채운다(청구=long/기록=short 불일치 방지). 'short'|'long'|NULL(티어없는 모델).
-ALTER TABLE usage.usage_logs ADD COLUMN IF NOT EXISTS context_tier VARCHAR(8);
+-- 존재를 먼저 본다(아래 0045 와 같다): 컬럼이 있어 no-op 인 ADD COLUMN IF NOT EXISTS 도 원장
+-- 테이블에 ACCESS EXCLUSIVE 를 잡고, 이 파일은 모든 마이그레이션 Job 에서 다시 돈다.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'usage' AND table_name = 'usage_logs'
+                      AND column_name = 'context_tier') THEN
+        ALTER TABLE usage.usage_logs ADD COLUMN context_tier VARCHAR(8);
+    END IF;
+END $$;
+
+-- migration 0043: alias 별 대상 AWS 계정. NULL = alias 계정 없음 = 오늘 동작(라우팅 프로필
+-- 계정 → 파드 IRSA). 두 ORM 이 이 컬럼을 명시 열거하므로, 컬럼 없는 DB 에 새 이미지가 붙으면
+-- 모델 조회마다 42703 = 게이트웨이 전면 장애다. 클라우드 모드는 init SQL 을 alembic 보다
+-- 먼저 돌리므로 이 블록이 이미지 교체 전에 컬럼을 만든다.
+-- ADD COLUMN IF NOT EXISTS 는 컬럼이 있어 no-op 이어도 ACCESS EXCLUSIVE 를 잡는다(0043 docstring,
+-- 실 PG16 측정). 이 파일은 모든 Job 에서 다시 돌므로 있으면 ALTER 자체를 건너뛴다.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'model' AND table_name = 'model_aliases'
+                      AND column_name = 'account_role_arn') THEN
+        ALTER TABLE model.model_aliases ADD COLUMN account_role_arn VARCHAR(2048);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'model' AND table_name = 'model_aliases'
+                      AND column_name = 'account_external_id') THEN
+        ALTER TABLE model.model_aliases ADD COLUMN account_external_id VARCHAR(1224);
+    END IF;
+END $$;
+-- CHECK 두 개 미러. ADD CONSTRAINT 에는 IF NOT EXISTS 가 없어 존재 여부를 먼저 본다(멱등).
+-- 정규식은 0043 과 글자까지 같다(콜론이 [:] 인 이유는 0043 docstring).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conname = 'ck_model_aliases_account_role_arn'
+                      AND conrelid = 'model.model_aliases'::regclass) THEN
+        ALTER TABLE model.model_aliases
+            ADD CONSTRAINT ck_model_aliases_account_role_arn
+            CHECK (account_role_arn IS NULL
+                   OR account_role_arn ~ '^arn[:]aws(-[a-z]+)*[:]iam[:][:][0-9]{12}[:]role/[A-Za-z0-9+=,.@_/-]+$');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conname = 'ck_model_aliases_account_external_id_needs_role'
+                      AND conrelid = 'model.model_aliases'::regclass) THEN
+        ALTER TABLE model.model_aliases
+            ADD CONSTRAINT ck_model_aliases_account_external_id_needs_role
+            CHECK (account_external_id IS NULL OR account_role_arn IS NOT NULL);
+    END IF;
+END $$;
+
+-- migration 0044: AWS 계정 레지스트리 + alias 선택(account_name) + 사본 유지 트리거.
+-- ★ 여기에는 **파괴적 DDL 도 데이터 이동도 없다.** init SQL 은 모든 마이그레이션 Job 에서
+--   alembic 보다 먼저 돌므로, 되돌릴 수 없는 일을 여기 두면 핀이나 롤백과 무관하게 실행된다.
+--   0043 인라인 값 → 레지스트리 백필은 alembic 0044 에만 있다.
+CREATE TABLE IF NOT EXISTS model.aws_accounts (
+    name          VARCHAR(64)   PRIMARY KEY,
+    display_name  VARCHAR(128)  NOT NULL,
+    role_arn      VARCHAR(2048) NOT NULL,
+    external_id   VARCHAR(1224),
+    description   TEXT,
+    created_by    UUID          NOT NULL REFERENCES auth.users(id),
+    created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+-- 제약은 이름으로 하나씩 확인해 붙인다 — CREATE TABLE IF NOT EXISTS 는 기존 테이블에서 통째로
+-- 건너뛰므로 인라인 제약은 생기지 않는다. 정규식은 0044 와 글자까지 같다.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_aws_accounts_name'
+                      AND conrelid = 'model.aws_accounts'::regclass) THEN
+        ALTER TABLE model.aws_accounts ADD CONSTRAINT ck_aws_accounts_name
+            CHECK (name ~ '^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$'
+                   AND name NOT IN ('default', 'gateway', 'inherit', 'none'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_aws_accounts_role_arn'
+                      AND conrelid = 'model.aws_accounts'::regclass) THEN
+        ALTER TABLE model.aws_accounts ADD CONSTRAINT ck_aws_accounts_role_arn
+            CHECK (role_arn ~ '^arn[:]aws(-[a-z]+)*[:]iam[:][:][0-9]{12}[:]role/[A-Za-z0-9+=,.@_/-]+$');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_aws_accounts_external_id'
+                      AND conrelid = 'model.aws_accounts'::regclass) THEN
+        ALTER TABLE model.aws_accounts ADD CONSTRAINT ck_aws_accounts_external_id
+            CHECK (external_id IS NULL OR (char_length(external_id) BETWEEN 2 AND 1224
+                                           AND external_id ~ '^[A-Za-z0-9_+=,.@:/-]+$'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_aws_accounts_role_arn'
+                      AND conrelid = 'model.aws_accounts'::regclass) THEN
+        ALTER TABLE model.aws_accounts ADD CONSTRAINT uq_aws_accounts_role_arn UNIQUE (role_arn);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'model' AND table_name = 'model_aliases'
+                      AND column_name = 'account_name') THEN
+        ALTER TABLE model.model_aliases ADD COLUMN account_name VARCHAR(64);
+    END IF;
+END $$;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_model_aliases_account_name'
+                      AND conrelid = 'model.model_aliases'::regclass) THEN
+        ALTER TABLE model.model_aliases
+            ADD CONSTRAINT fk_model_aliases_account_name
+            FOREIGN KEY (account_name) REFERENCES model.aws_accounts(name) ON DELETE RESTRICT;
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_model_aliases_account_name
+    ON model.model_aliases (account_name) WHERE account_name IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION model.alias_account_materialize() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    r model.aws_accounts%ROWTYPE;
+BEGIN
+    IF NEW.account_name IS NOT NULL THEN
+        -- FOR SHARE: 겹친 레지스트리 수정과 직렬화한다 — 락 없이 읽으면 사본이 옛 값으로 남는다
+        -- (0044 의 같은 함수 주석, 실 PG16 두 연결 테스트).
+        SELECT * INTO r FROM model.aws_accounts WHERE name = NEW.account_name FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'aws account "%" does not exist', NEW.account_name
+                USING ERRCODE = 'foreign_key_violation';
+        END IF;
+        NEW.account_role_arn := r.role_arn;
+        NEW.account_external_id := r.external_id;
+    ELSIF TG_OP = 'UPDATE' AND OLD.account_name IS NOT NULL THEN
+        -- 선택 해제 → 사본도 비운다(기본 계정 복귀). 선택 없이 사본만 쓰는 쓰기는 아래 CHECK
+        -- 가 거부하게 둔다.
+        NEW.account_role_arn := NULL;
+        NEW.account_external_id := NULL;
+    END IF;
+    RETURN NEW;
+END $$;
+-- CREATE OR REPLACE TRIGGER (PG14+): DROP→CREATE 사이에 들어온 레지스트리 수정이 전파되지
+-- 않는 창을 만들지 않는다. 이 파일은 문장마다 autocommit 으로 실행된다.
+CREATE OR REPLACE TRIGGER trg_alias_account_materialize
+    BEFORE INSERT OR UPDATE ON model.model_aliases
+    FOR EACH ROW EXECUTE FUNCTION model.alias_account_materialize();
+
+CREATE OR REPLACE FUNCTION model.aws_account_propagate() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- updated_at 도 올린다: 이 alias 의 청구 계정이 바뀐 시각이다.
+    UPDATE model.model_aliases
+       SET account_role_arn = NEW.role_arn,
+           account_external_id = NEW.external_id,
+           updated_at = now()
+     WHERE account_name = NEW.name;
+    RETURN NEW;
+END $$;
+CREATE OR REPLACE TRIGGER trg_aws_account_propagate
+    AFTER UPDATE OF role_arn, external_id ON model.aws_accounts
+    FOR EACH ROW
+    WHEN (OLD.role_arn IS DISTINCT FROM NEW.role_arn
+          OR OLD.external_id IS DISTINCT FROM NEW.external_id)
+    EXECUTE FUNCTION model.aws_account_propagate();
+
+-- 선택과 사본은 함께 있거나 함께 없다. 여기서는 NOT VALID 로만 만든다: 기존 DB 의 0043 인라인
+-- 값은 alembic 0044 의 백필 전이라 검증하면 실패한다. 0044 가 백필 후 VALIDATE 한다.
+-- (NOT VALID 여도 새 INSERT/UPDATE 에는 적용된다.)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conname = 'ck_model_aliases_account_materialized'
+                      AND conrelid = 'model.model_aliases'::regclass) THEN
+        ALTER TABLE model.model_aliases
+            ADD CONSTRAINT ck_model_aliases_account_materialized
+            CHECK ((account_name IS NULL) = (account_role_arn IS NULL)) NOT VALID;
+    END IF;
+END $$;
+
+-- migration 0045: 요청을 실제로 서빙한 AWS 계정 12자리(NULL = 게이트웨이 자신의 계정 /
+-- OPENMODEL / 0045 이전 행). cost-recorder-worker 의 INSERT 가 이 컬럼을 명시하므로 0039 와
+-- 같은 이유로 미러링한다. 원장 테이블이라 CHECK 는 걸지 않는다(0045 docstring).
+-- 존재를 먼저 본다: no-op ADD COLUMN IF NOT EXISTS 도 원장 테이블에 ACCESS EXCLUSIVE 를 잡는다.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'usage' AND table_name = 'usage_logs'
+                      AND column_name = 'aws_account_id') THEN
+        ALTER TABLE usage.usage_logs ADD COLUMN aws_account_id VARCHAR(12);
+    END IF;
+END $$;

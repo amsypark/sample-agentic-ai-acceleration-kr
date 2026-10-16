@@ -61,6 +61,10 @@ export async function createModelAction(formData: unknown): Promise<ActionResult
       cache_creation_5m_price_per_1k_tokens: d.cache_creation_5m_price_per_1k,
       cache_creation_1h_price_per_1k_tokens: d.cache_creation_1h_price_per_1k,
       cache_read_price_per_1k_tokens: d.cache_read_price_per_1k,
+      // 대상 AWS 계정(0044). null = 기본값(앱 라우팅 프로필 계정, 없으면 게이트웨이 계정).
+      account_name: d.account_name || null,
+      // 같은 모델 id 의 다른 alias 에도 같은 계정을(운영자가 고른 경우에만 키를 보낸다).
+      ...(d.apply_to_siblings ? { apply_to_siblings: true } : {}),
     }));
     revalidatePath('/models');
     return { success: true, data: undefined };
@@ -98,6 +102,10 @@ export async function updateModelAction(
       endpoint_url: d.endpoint_url || null,
       description: d.description || null,
       display_name: d.display_name || null,
+      // 대상 AWS 계정(0044). 다이얼로그는 현재 선택으로 prefill 하므로 항상 보낸다 —
+      // null 은 **해제**(기본 계정 복귀)다. 키를 빼면 "유지" 가 되어 해제할 방법이 없다.
+      account_name: d.account_name || null,
+      ...(d.apply_to_siblings ? { apply_to_siblings: true } : {}),
     }));
     // Update pricing
     await withRetry(() => adminAPI.put(`/admin/models/${alias}/pricing`, {
@@ -171,6 +179,8 @@ interface AdminModelItem {
   status: string;
   description: string | null;
   display_name: string | null;
+  account_name?: string | null;
+  account_role_arn?: string | null;
   current_pricing: {
     input_price_per_1k_tokens: string;
     output_price_per_1k_tokens: string;
@@ -210,6 +220,8 @@ export async function listActiveModelsAction(): Promise<ActionResult<ModelListIt
           context_window: 0,
           description: item.description,
           display_name: item.display_name,
+          account_name: item.account_name ?? null,
+          account_role_arn: item.account_role_arn ?? null,
         };
       });
     return { success: true, data: models };

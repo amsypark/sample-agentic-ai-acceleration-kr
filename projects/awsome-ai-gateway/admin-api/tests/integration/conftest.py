@@ -49,6 +49,7 @@ def _build_test_app() -> FastAPI:
     from app.routers import (
         analytics,
         audit_reconcile,
+        aws_accounts,
         budgets,
         cli,
         dashboard,
@@ -73,6 +74,7 @@ def _build_test_app() -> FastAPI:
     app.include_router(keys.router)
     app.include_router(budgets.router)
     app.include_router(models.router)
+    app.include_router(aws_accounts.router)  # 0044, app/main.py 와 같은 배선
     app.include_router(rate_limits.router)
     app.include_router(users.router)
     app.include_router(analytics.router)

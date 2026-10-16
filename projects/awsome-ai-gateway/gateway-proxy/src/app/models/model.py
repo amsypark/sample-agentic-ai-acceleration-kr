@@ -91,6 +91,21 @@ class ModelAlias(Base):
     allowed_clients: Mapped[list[str] | None] = mapped_column(
         ARRAY(String), nullable=True, default=None
     )
+    #: 이 alias 를 서명할 **대상 AWS 계정**의 역할 ARN과 ExternalId (마이그레이션 0043).
+    #: NULL = alias 계정 없음 → 오늘 규칙 그대로(라우팅 프로필 계정 → 파드 IRSA).
+    #:
+    #: 계정은 **서명한 자격증명**으로만 정해진다. bedrock-runtime 엔드포인트는 리전 공용
+    #: 호스트이고 SigV4 scope 에도 foundation-model ARN 에도 계정 칸이 없다. 그래서 다른
+    #: 계정의 호출 = 그 계정 역할로 assume 해서 그 계정으로서 호출이다.
+    #:
+    #: 0044 부터 두 값은 레지스트리(model.aws_accounts) 선택을 DB 트리거가 복사한 사본이다.
+    #: 게이트웨이는 사본만 읽는다 — 레지스트리를 조인하지 않으므로 0044 는 이 서비스를 바꾸지
+    #: 않는다. 판정은 ``services/account_credentials.resolve_account_target`` 한 곳이다.
+    #:
+    #: ⚠️ ``allowed_clients`` 와 같은 이유로 init SQL 에도 ALTER 가 있어야 한다(모든 SELECT 에
+    #:    들어가므로 컬럼 없는 DB 에서는 모든 모델 조회가 42703).
+    account_role_arn: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    account_external_id: Mapped[str | None] = mapped_column(String(1224), nullable=True)
     created_by: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

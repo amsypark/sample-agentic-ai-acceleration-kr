@@ -6,7 +6,7 @@
 import { useState, useTransition, useEffect } from 'react';
 import { useTranslations } from 'next-intl';
 import { X } from 'lucide-react';
-import type { ModelListItem } from '@/types/entities';
+import type { AwsAccount, ModelListItem } from '@/types/entities';
 import { createModelAction, updateModelAction } from '@/lib/actions/models';
 // 단가 칸의 `max` — 브라우저가 제출 자체를 막는다(초과 값은 admin-api 에서도 422).
 import { MAX_PRICE_PER_1K } from '@/types/api';
@@ -18,6 +18,10 @@ interface CreateModelDialogProps {
   isOpen: boolean;
   onClose: () => void;
   editModel?: ModelListItem;
+  /** 등록된 AWS 계정(0044) — 계정 선택 칸의 선택지. */
+  accounts?: AwsAccount[];
+  /** 모델 목록 — 같은 모델 id 의 다른 alias(형제)를 찾는다(아래 siblings). */
+  models?: ModelListItem[];
 }
 
 interface FormState {
@@ -32,6 +36,8 @@ interface FormState {
   cache_read_price_per_1k: string;
   description: string;
   display_name: string;
+  /** 레지스트리 이름. '' = 기본값. */
+  account_name: string;
 }
 
 function getInitialState(editModel?: ModelListItem): FormState {
@@ -48,6 +54,8 @@ function getInitialState(editModel?: ModelListItem): FormState {
       cache_read_price_per_1k: editModel.cache_read_price_per_1k.toString(),
       description: editModel.description ?? '',
       display_name: editModel.display_name ?? '',
+      // 현재 선택으로 prefill — 아니면 계정 칸을 건드리지 않은 저장이 선택을 지운다.
+      account_name: editModel.account_name ?? '',
     };
   }
   return {
@@ -62,10 +70,17 @@ function getInitialState(editModel?: ModelListItem): FormState {
     cache_read_price_per_1k: '0',
     description: '',
     display_name: '',
+    account_name: '',
   };
 }
 
-export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDialogProps) {
+export function CreateModelDialog({
+  isOpen,
+  onClose,
+  editModel,
+  accounts = [],
+  models = [],
+}: CreateModelDialogProps) {
   const t = useTranslations('models');
   const tCommon = useTranslations('common');
   const { toast } = useToast();
@@ -73,12 +88,38 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [form, setForm] = useState<FormState>(() => getInitialState(editModel));
+  const [applyToSiblings, setApplyToSiblings] = useState(false);
 
   const isEditMode = !!editModel;
+  // OPENMODEL 은 AWS 가 서빙하지 않는다 — 계정을 고를 수 없다(admin-api 도 400 으로 거부한다).
+  const isOpenModel = form.provider.toUpperCase() === 'OPENMODEL';
+  // 선택지에 현재 값이 없으면(목록 조회 실패 등) 그 값을 그대로 한 줄 넣는다 — 안 그러면 select 가
+  // 첫 선택지(기본값)를 보여 주고, 저장하면 운영자가 고르지 않은 해제가 일어난다.
+  const accountOptions =
+    form.account_name && !accounts.some((a) => a.name === form.account_name)
+      ? [...accounts, { name: form.account_name, display_name: form.account_name, account_id: '' } as AwsAccount]
+      : accounts;
+  // 같은 모델 id 의 다른 ACTIVE alias 중 다른 계정을 부르는 것. 게이트웨이는 요청의 모델 이름을
+  // alias 정확 매칭으로 먼저 찾으므로(시드는 모델 id 와 이름이 같은 alias 를 둔다), 여기서 고른 계정은
+  // 모델 id 나 그 alias 로 부른 요청에는 쓰이지 않는다. admin-api 는 그런 저장을 409 로 막고
+  // apply_to_siblings 로 함께 옮기게 한다(services/model_service._align_account_siblings).
+  const selfAlias = editModel?.alias ?? form.alias;
+  const siblings =
+    isOpenModel || !form.model_id
+      ? []
+      : models.filter(
+          (m) =>
+            m.alias !== selfAlias &&
+            m.model_id === form.model_id &&
+            m.is_active &&
+            m.provider.toUpperCase() !== 'OPENMODEL' &&
+            (m.account_name ?? '') !== form.account_name,
+        );
 
   useEffect(() => {
     if (editModel) {
       setForm(getInitialState(editModel));
+      setApplyToSiblings(false);
     }
   }, [editModel]);
 
@@ -113,6 +154,10 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
       cache_read_price_per_1k: parseFloat(form.cache_read_price_per_1k || '0'),
       description: form.description || undefined,
       display_name: form.display_name || undefined,
+      // '' = 기본값 → null. OPENMODEL 이면 언제나 기본값이다.
+      account_name: isOpenModel ? null : form.account_name || null,
+      // 운영자가 고른 경우에만 보낸다 — 구 admin-api 는 모르는 키를 422 로 거부한다.
+      ...(siblings.length > 0 && applyToSiblings ? { apply_to_siblings: true } : {}),
     };
 
     startTransition(async () => {
@@ -396,6 +441,62 @@ export function CreateModelDialog({ isOpen, onClose, editModel }: CreateModelDia
               className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             />
             {fieldErrors.display_name && <FormError error={fieldErrors.display_name} />}
+          </div>
+
+          {/* 대상 AWS 계정 (0044) — 레지스트리에서 이름으로 고른다. 역할 ARN·ExternalId 는
+              아래 'AWS 계정' 패널이 관리한다. */}
+          <div className="space-y-1 rounded-md border border-border p-3">
+            <span className="text-sm font-medium">{t('accountSectionTitle')}</span>
+            <p className="text-xs text-muted-foreground">{t('accountSectionNote')}</p>
+            <label htmlFor="account_name" className="text-xs text-muted-foreground">
+              {t('accountSelectLabel')}
+            </label>
+            <select
+              id="account_name"
+              name="account_name"
+              value={isOpenModel ? '' : form.account_name}
+              onChange={handleChange}
+              disabled={isOpenModel}
+              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              <option value="">{t('accountDefaultOption')}</option>
+              {accountOptions.map((a) => (
+                <option key={a.name} value={a.name}>
+                  {a.account_id ? `${a.display_name} (${a.account_id}) — ${a.name}` : a.name}
+                </option>
+              ))}
+            </select>
+            {isOpenModel ? (
+              <p className="text-xs text-muted-foreground">{t('accountOpenmodelNote')}</p>
+            ) : (
+              accounts.length === 0 && (
+                <p className="text-xs text-muted-foreground">{t('accountNoneRegistered')}</p>
+              )
+            )}
+            {siblings.length > 0 && (
+              <div
+                role="alert"
+                className="mt-2 space-y-1 rounded-md border border-amber-500/50 bg-amber-500/10 p-2"
+              >
+                <p className="text-xs">{t('accountSiblingsWarning', { count: siblings.length })}</p>
+                <ul className="list-disc pl-4 text-xs">
+                  {siblings.map((m) => (
+                    <li key={m.alias}>
+                      {m.alias} ({m.account_name || t('accountColumnDefault')})
+                    </li>
+                  ))}
+                </ul>
+                <label className="flex items-center gap-2 text-xs font-medium">
+                  <input
+                    type="checkbox"
+                    checked={applyToSiblings}
+                    onChange={(e) => setApplyToSiblings(e.target.checked)}
+                  />
+                  {t('accountApplyToSiblings', { count: siblings.length })}
+                </label>
+              </div>
+            )}
+            {fieldErrors.account_name && <FormError error={fieldErrors.account_name} />}
           </div>
 
           <FormError error={error} />

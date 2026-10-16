@@ -12,6 +12,7 @@ from sqlalchemy.exc import DBAPIError
 
 from app.schemas.domain import ProviderType, TokenUsage
 from app.schemas.responses import ModelObject, ModelPricingObject, ModelsListResponse
+from app.services.account_credentials import profile_account_target, resolve_account_target
 from app.services.body_log_records import (
     build_body_record_for_nonstream,
     build_body_record_for_stream,
@@ -20,7 +21,11 @@ from app.services.body_log_records import (
     resolve_body_logger,
 )
 from app.services.fallback_loop import release_reservations
-from app.services.router_service import ModelInactiveError, RouterService
+from app.services.router_service import (
+    AmbiguousModelAccountError,
+    ModelInactiveError,
+    RouterService,
+)
 from app.services.service_tier_gate import reject_unpriced_service_tier
 from app.services.streaming import openai_sse_stream
 from app.services.tokenizer import estimate_prompt_usage
@@ -258,6 +263,9 @@ async def _handle_openai(request: Request, path: str):
     # URL, the Bedrock one by the alias's own endpoint + a wire selector — so the call
     # kwargs are built here once and reused by both the streaming and non-streaming call.
     is_bedrock_runtime = model_config.provider == ProviderType.BEDROCK_RUNTIME_OPENAI
+    # 이 요청을 서명한 프로필 계정(0045 기록용). runtime plane 만 프로필 역할로 서명한다 —
+    # vLLM(OPENMODEL)은 AWS 호출이 아니다.
+    served_profile_account = None
     if is_bedrock_runtime:
         if path != "/v1/chat/completions":
             # The runtime plane serves /openai/v1/chat/completions and
@@ -287,6 +295,11 @@ async def _handle_openai(request: Request, path: str):
                 # servable in-account request into a 500.
                 logger.warning("chat_routing_profile_load_failed", client=client)
         invoke_kwargs = {"profile": profile, "endpoint": model_config.endpoint, "wire": "chat"}
+        # alias 별 대상 계정(0043) — 프로필 역할보다 우선한다. 없으면 kwargs 가 오늘과 같다.
+        _target = resolve_account_target(model_config)
+        if _target is not None:
+            invoke_kwargs["account"] = _target
+        served_profile_account = profile_account_target(profile)
         # Rewrite the outgoing model id to the CRIS inference-profile id. Unlike the vLLM
         # adapter (which rewrites `model` itself), this adapter must send the body bytes
         # verbatim — the SigV4 signature covers them — so the substitution happens here,
@@ -346,6 +359,7 @@ async def _handle_openai(request: Request, path: str):
                 downgraded_from=state.get("downgraded_from"),
                 bedrock_request_id=aws_request_id,
                 client=client,
+                profile_account=served_profile_account,  # 실제 서빙 계정 기록(0045)
             )
 
         # ⚠️ 상류가 비-2xx 면 스트림을 클라이언트에게 넘기기 **전에** 예약을 되돌린다.
@@ -429,6 +443,7 @@ async def _handle_openai(request: Request, path: str):
                 # vLLM returns {} here → None → column stays NULL (nothing to join to).
                 bedrock_request_id=(resp_headers or {}).get("x-amzn-requestid"),
                 client=client,
+                profile_account=served_profile_account,  # 실제 서빙 계정 기록(0045)
             )
         else:
             # ⚠️ finalize 를 타지 않는 경로다(상류 4xx/5xx, 또는 usage 가 비어 온 응답).
@@ -585,10 +600,13 @@ async def _handle_responses(request: Request):
         if _is_usable_model_ref(requested_alias) and requested_alias != profile.default_model:
             try:
                 return await _router_service.resolve_codex_model(redis, db, requested_alias)
-            except ModelInactiveError:
+            except (ModelInactiveError, AmbiguousModelAccountError):
                 # Do NOT fall back. status=INACTIVE is an operator kill switch: an alias
                 # that exists but was deliberately disabled must be refused, not quietly
                 # served as some other model (which would also bill the wrong alias).
+                # A model id whose active aliases call different AWS accounts is the same
+                # kind of answer: the model exists, we refuse to guess the account — serving
+                # default_model instead would be a 200 from another model and account.
                 # Propagates as a 404 via the LookupError handler below.
                 raise
             except (LookupError, DBAPIError):
@@ -703,6 +721,16 @@ async def _handle_responses(request: Request):
         "endpoint": model_config.endpoint,
         "wire": "responses",
     }
+    # alias 별 대상 계정(0043). 두 plane 모두 받는다 — runtime 은 SigV4 서명 주체, Mantle 은
+    # bearer 를 mint 할 자격증명. 프로필 계정보다 우선하고, 없으면 kwargs 가 오늘과 같다(두 plane
+    # 모두 프로필 역할 → 파드). 여기서 **한 번** 해석해 아래 모든 호출 지점(웹서치 두 클로저 +
+    # stream/non-stream)이 같은 dict 를 쓴다 — 지점마다 해석하면 하나가 빠져도 예외가 아니라
+    # 다른 계정으로 조용히 호출된다.
+    _target = resolve_account_target(model_config)
+    if _target is not None:
+        invoke_kwargs["account"] = _target
+    # 실제 서빙 계정 기록(0045): 두 plane 모두 alias 계정이 없으면 프로필 역할로 서명한다.
+    served_profile_account = profile_account_target(profile)
     rate_limit_state = state.get("rate_limit_state")
 
     # Rewrite the outgoing model id to the resolved provider_model_id (e.g. openai.gpt-5.5,
@@ -780,6 +808,7 @@ async def _handle_responses(request: Request):
                 redis, auth_context, model_config, usage, request_id, is_stream, duration_ms,
                 rate_limit_state=rate_limit_state,
                 downgraded_from=state.get("downgraded_from"), client=client,
+                profile_account=served_profile_account,
             )
 
         # 본문 로깅 — 웹서치 경로 전용 훅. 이 경로는 아래 `if is_stream:` 블록보다 먼저
@@ -886,6 +915,7 @@ async def _handle_responses(request: Request):
                 downgraded_from=state.get("downgraded_from"),
                 bedrock_request_id=aws_request_id,
                 client=client,
+                profile_account=served_profile_account,
             )
 
         async def _log_body_stream(sse_text: str, log_status: str) -> None:
@@ -949,6 +979,7 @@ async def _handle_responses(request: Request):
                 downgraded_from=state.get("downgraded_from"),
                 bedrock_request_id=(resp_headers or {}).get("x-amzn-requestid"),
                 client=client,
+                profile_account=served_profile_account,
             )
         else:
             # 예약 되돌리기 — 근거는 _handle_openai 의 같은 블록 주석 참조.

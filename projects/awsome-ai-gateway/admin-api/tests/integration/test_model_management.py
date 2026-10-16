@@ -24,6 +24,9 @@ def _make_model(alias: str = "claude-sonnet") -> ModelAlias:
     m.status = ModelStatus.ACTIVE
     m.description = "Test model"
     m.display_name = "Claude Sonnet"  # ModelResponse.display_name (str | None)
+    m.account_name = None  # 0044 — ModelResponse 가 읽는다(str | None)
+    m.account_role_arn = None
+    m.account_external_id = None
     m.created_at = datetime.now(timezone.utc)
     m.updated_at = datetime.now(timezone.utc)
     return m

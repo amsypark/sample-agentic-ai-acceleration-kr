@@ -33,6 +33,10 @@ def _make_model(alias: str = "claude-sonnet") -> ModelAlias:
     m.status = ModelStatus.ACTIVE
     m.description = "test model"
     m.display_name = None  # _to_response reads display_name; MagicMock would yield a non-str → pydantic error
+    # 대상 AWS 계정(0043/0044) — 같은 이유로 실제 값이어야 한다. None = 기본 계정.
+    m.account_name = None
+    m.account_role_arn = None
+    m.account_external_id = None
     m.created_at = datetime.now(timezone.utc)
     m.updated_at = datetime.now(timezone.utc)
     return m
@@ -86,16 +90,23 @@ class TestCreateModel:
             repo.create_model = AsyncMock(side_effect=_set_timestamps)
             repo.create_pricing = AsyncMock()
             mock_audit.log = AsyncMock()
+            # 같은 모델 id 의 형제 alias 조회(계정 일치) — 결과 객체는 동기 API 다. 빈 결과.
+            mock_session.execute = AsyncMock(return_value=MagicMock())
 
-            result = await model_service.create_model(mock_session, data=data, actor=admin_user)
+            outcome = await model_service.create_model(mock_session, data=data, actor=admin_user)
 
-        assert result.alias == "claude-sonnet"
-        assert result.provider == Provider.BEDROCK
-        # P0-④: create_model is now invalidate-only (DEL model:{alias} + model:list);
-        # it must NOT pre-seed a (previously flat, TTL-less) model cache entry.
-        # The gateway populates model:{alias} with the correct nested shape + TTL
-        # on first cache-miss. So we assert DEL happened and SET did not.
-        assert mock_redis.delete.call_count >= 1
+        assert outcome.response.alias == "claude-sonnet"
+        assert outcome.response.provider == Provider.BEDROCK
+        # P0-④: create_model is invalidate-only (DEL model:{alias} + model:list); it must NOT
+        # pre-seed a (previously flat, TTL-less) model cache entry. The gateway populates
+        # model:{alias} with the correct nested shape + TTL on first cache-miss.
+        # 지우는 것은 라우터가 **커밋한 뒤**다(ModelMutation) — 서비스는 키만 돌려준다.
+        assert outcome.cache_keys == [
+            "model:claude-sonnet",
+            "model:anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "model:list",
+        ]
+        mock_redis.delete.assert_not_called()
         mock_redis.set.assert_not_called()
 
     async def test_create_model_duplicate_alias_raises(
@@ -124,6 +135,8 @@ class TestUpdateModel:
         data = ModelUpdateRequest(description="new desc")
 
         with patch("app.services.model_service.ModelRepository") as MockRepo:
+            # update_model 은 바꾸기 전에 행을 읽는다(계정 선택을 실효값으로 검증 — 0044).
+            MockRepo.return_value.get_by_alias = AsyncMock(return_value=None)
             MockRepo.return_value.update_model = AsyncMock(return_value=None)
 
             with pytest.raises(NotFoundError):
@@ -139,14 +152,22 @@ class TestUpdateModel:
         with patch("app.services.model_service.ModelRepository") as MockRepo, \
              patch("app.services.model_service.audit_logger") as mock_audit:
             repo = MockRepo.return_value
+            repo.get_by_alias = AsyncMock(return_value=model)
             repo.update_model = AsyncMock(return_value=model)
             repo.get_current_pricing = AsyncMock(return_value=pricing)
             mock_audit.log = AsyncMock()
 
-            await model_service.update_model(mock_session, alias="claude-sonnet", data=data, actor=admin_user)
+            outcome = await model_service.update_model(
+                mock_session, alias="claude-sonnet", data=data, actor=admin_user
+            )
 
-        # Cache invalidation called
-        assert mock_redis.delete.call_count >= 1
+        # 지울 키를 돌려주고, 커밋 전인 서비스 안에서는 지우지 않는다(라우터가 커밋 뒤에 지운다).
+        assert outcome.cache_keys == [
+            "model:claude-sonnet",
+            "model:anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "model:list",
+        ]
+        mock_redis.delete.assert_not_called()
 
 
 class TestSetPricing:
@@ -207,10 +228,42 @@ class TestSetPricing:
         assert created.cache_creation_5m_price_per_1k_tokens == Decimal("0.00375")
         assert created.cache_creation_1h_price_per_1k_tokens == Decimal("0.006")
         assert created.cache_read_price_per_1k_tokens == Decimal("0.0003")
-        assert result.current_pricing is not None
-        assert result.current_pricing.cache_creation_5m_price_per_1k_tokens == Decimal("0.00375")
-        assert result.current_pricing.cache_creation_1h_price_per_1k_tokens == Decimal("0.006")
-        assert result.current_pricing.cache_read_price_per_1k_tokens == Decimal("0.0003")
+        current = result.response.current_pricing
+        assert current is not None
+        assert current.cache_creation_5m_price_per_1k_tokens == Decimal("0.00375")
+        assert current.cache_creation_1h_price_per_1k_tokens == Decimal("0.006")
+        assert current.cache_read_price_per_1k_tokens == Decimal("0.0003")
+
+    async def test_set_pricing_returns_the_keys_and_leaves_them_until_after_commit(
+        self, model_service: ModelService, mock_session: AsyncMock, admin_user: CurrentUser,
+        mock_redis: AsyncMock,
+    ):
+        """먼저 지우면 그 창의 게이트웨이 캐시 미스가 옛 단가를 300초 다시 캐시한다(ModelMutation)."""
+        data = PricingRequest(
+            input_price_per_1k_tokens=Decimal("0.005"),
+            output_price_per_1k_tokens=Decimal("0.025"),
+            effective_from=datetime.now(timezone.utc),
+        )
+        with patch("app.services.model_service.ModelRepository") as MockRepo, \
+             patch("app.services.model_service.audit_logger") as mock_audit:
+            repo = MockRepo.return_value
+            repo.get_by_alias = AsyncMock(return_value=_make_model())
+            repo.get_current_pricing = AsyncMock(return_value=None)
+            repo.close_current_pricing = AsyncMock()
+            repo.create_pricing = AsyncMock()
+            mock_audit.log = AsyncMock()
+
+            outcome = await model_service.set_pricing(
+                mock_session, alias="claude-sonnet", data=data, actor=admin_user
+            )
+
+        # 모델 id 키도 — 게이트웨이가 모델 id 로 지목한 해석(단가 포함)을 그 키에 캐시한다.
+        assert outcome.cache_keys == [
+            "model:claude-sonnet",
+            "model:anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "model:list",
+        ]
+        mock_redis.delete.assert_not_called()
 
     async def test_set_pricing_defaults_cache_to_zero(
         self, model_service: ModelService, mock_session: AsyncMock, admin_user: CurrentUser
@@ -246,7 +299,7 @@ class TestSetPricing:
 
 
 class TestPatchStatus:
-    async def test_patch_status_to_inactive_invalidates_cache(
+    async def test_patch_status_to_inactive_returns_the_keys_to_invalidate_after_commit(
         self, model_service: ModelService, mock_session: AsyncMock, admin_user: CurrentUser, mock_redis: AsyncMock
     ):
         data = StatusPatchRequest(active=False)
@@ -262,5 +315,12 @@ class TestPatchStatus:
 
             result = await model_service.patch_status(mock_session, alias="claude-sonnet", data=data, actor=admin_user)
 
-        assert result.status == "INACTIVE"
-        assert mock_redis.delete.call_count >= 1
+        assert result.response.status == "INACTIVE"
+        # 커밋 전(서비스 안)에는 지우지 않는다 — 먼저 지우면 그 창의 캐시 미스가 아직 ACTIVE 인 행을
+        # 300초 다시 캐시해 kill switch 가 늦게 걸린다. 라우터가 커밋 뒤에 지운다(ModelMutation).
+        assert result.cache_keys == [
+            "model:claude-sonnet",
+            "model:anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "model:list",
+        ]
+        mock_redis.delete.assert_not_called()

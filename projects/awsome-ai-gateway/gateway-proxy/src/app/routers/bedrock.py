@@ -16,6 +16,7 @@ from app.observability.provider_metrics import (
 )
 from app.schemas.domain import ProviderType
 from app.services import bg_tasks
+from app.services.account_credentials import resolve_account_target
 from app.services.fallback_loop import release_reservations
 from app.services.router_service import RouterService
 
@@ -128,11 +129,22 @@ async def _handle_bedrock(request: Request, model_id: str, path_suffix: str, str
         DegradationLevel.BOTH_DEGRADED,
     )
 
-    if not is_db_degraded and session_factory is not None:
-        async with session_factory() as db:
-            model_config = await _router_service.resolve_bedrock_model(redis, db, model_id)
-    else:
-        model_config = await _router_service.resolve_bedrock_model(redis, None, model_id)
+    # LookupError → 404 (FR-1.2), /v1/messages 와 같다. 예전에는 전역 핸들러로 새어 나가
+    # 미등록 모델 id 가 이유 없는 500 "Internal server error" 였다. 이 라우트는 모델을
+    # **모델 id** 로 지목하므로(/model/{id}/invoke), 같은 모델 id 의 alias 들이 서로 다른 AWS
+    # 계정을 부를 때의 거절(router_service._pmid_fallback_row)도 여기서 드러난다 — 그 이유가
+    # 500 에 묻히면 안 된다.
+    try:
+        if not is_db_degraded and session_factory is not None:
+            async with session_factory() as db:
+                model_config = await _router_service.resolve_bedrock_model(redis, db, model_id)
+        else:
+            model_config = await _router_service.resolve_bedrock_model(redis, None, model_id)
+    except LookupError as e:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"type": "not_found_error", "message": str(e)}},
+        )
     state["model_config"] = model_config
 
     # Use resolved model_id (may differ from URL model_id due to aliasing)
@@ -187,6 +199,10 @@ async def _handle_bedrock(request: Request, model_id: str, path_suffix: str, str
 
     adapter = registry.get(ProviderType.BEDROCK)
     rate_limit_state = state.get("rate_limit_state")
+    # alias 별 대상 계정(0043). 이 패스스루는 라우팅 프로필을 보지 않으므로(오늘 동작) alias
+    # 계정만이 출처다 — 없으면 인자가 오늘과 같고 파드 클라이언트로 나간다.
+    _target = resolve_account_target(model_config)
+    acct = {"account": _target} if _target is not None else {}
 
     # ── 프로바이더 호출 결과 지표 ──
     #
@@ -213,7 +229,7 @@ async def _handle_bedrock(request: Request, model_id: str, path_suffix: str, str
         # /v1/messages 라 안 드러남). await 를 먼저 풀고 앞 3개만 취한다.
         try:
             status, chunk_iter, headers, _req_id = await adapter.invoke_stream(
-                body, bedrock_model_id, path_suffix=path_suffix
+                body, bedrock_model_id, path_suffix=path_suffix, **acct
             )
         except Exception as e:
             # 기록만 하고 **그대로 재던진다** — 지표를 위해 에러를 삼키면 안 된다.
@@ -279,7 +295,7 @@ async def _handle_bedrock(request: Request, model_id: str, path_suffix: str, str
     else:
         try:
             status, response_body, headers, usage = await adapter.invoke(
-                body, bedrock_model_id, path_suffix=path_suffix
+                body, bedrock_model_id, path_suffix=path_suffix, **acct
             )
         except Exception as e:
             record_provider_error(_pm, _pm_labels, status="exception", error_code=type(e).__name__)

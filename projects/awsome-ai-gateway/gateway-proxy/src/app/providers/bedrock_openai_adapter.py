@@ -65,6 +65,13 @@ import structlog
 from app.providers.base import ProviderAdapter
 from app.providers.openai_usage import extract_chat_usage, extract_responses_usage
 from app.schemas.domain import TokenUsage
+from app.services.account_credentials import (
+    ACCOUNT_UNAVAILABLE_BODY,
+    ACCOUNT_UNAVAILABLE_MESSAGE,
+    ACCOUNT_UNAVAILABLE_STATUS,
+    AccountCredentialsUnavailable,
+    redact_account_identifiers_bytes,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -92,6 +99,7 @@ class _Signer(Protocol):
         headers: Optional[dict] = ...,
         role_arn: Optional[str] = ...,
         external_id: Optional[str] = ...,
+        account=...,
     ) -> dict: ...
 
 
@@ -149,14 +157,14 @@ def with_chat_usage(request_body: bytes) -> bytes:
     return json.dumps(body).encode()
 
 
-def _error_chunk(wire: str, message: str) -> bytes:
+def _error_chunk(wire: str, message: str, err_type: str = "provider_error") -> bytes:
     """One error frame, in whatever framing the wire's downstream consumer expects.
 
     ``responses`` chunks are re-framed by ``responses_sse_stream`` (bare JSON in), while
     ``chat`` chunks are passed through to the client untouched — an unframed payload on
     the chat wire would land in the client's event stream as garbage.
     """
-    payload = json.dumps({"error": {"type": "provider_error", "message": message}})
+    payload = json.dumps({"error": {"type": err_type, "message": message}})
     return payload.encode() if wire == "responses" else f"data: {payload}\n\n".encode()
 
 
@@ -177,7 +185,7 @@ class BedrockOpenAIAdapter(ProviderAdapter):
         return f"{endpoint.rstrip('/')}{suffix}"
 
     async def _prepare(
-        self, request_body: bytes, model_id: str, endpoint: str, profile, wire: str
+        self, request_body: bytes, model_id: str, endpoint: str, profile, wire: str, account=None
     ) -> tuple[str, dict]:
         url = self._url(endpoint, wire)
         if not model_id.startswith(_CRIS_PREFIXES):
@@ -186,6 +194,10 @@ class BedrockOpenAIAdapter(ProviderAdapter):
             # be ON_DEMAND. Logged so a mis-registered alias is diagnosable from the logs
             # instead of only from a client's 400.
             logger.warning("bedrock_openai_model_id_not_cris", model_id=model_id)
+        # alias 계정(0043)이 있으면 그것만 넘긴다 — 프로필 역할보다 우선한다. 없으면 오늘 호출
+        # 그대로(프로필 역할 → 없으면 파드). account 키는 있을 때만 넣어, 계정 없는 alias 의
+        # 서명 호출이 이 변경 전과 같은 인자가 되게 한다.
+        acct = {"account": account} if account is not None else {}
         headers = await self._signer.sign(
             method="POST",
             url=url,
@@ -193,6 +205,7 @@ class BedrockOpenAIAdapter(ProviderAdapter):
             region=_region_for(endpoint, profile),
             role_arn=getattr(profile, "account_role_arn", None),
             external_id=getattr(profile, "external_id", None),
+            **acct,
         )
         return url, headers
 
@@ -204,10 +217,17 @@ class BedrockOpenAIAdapter(ProviderAdapter):
         profile=None,
         endpoint: str = "",
         wire: str = "responses",
+        account=None,
         **kwargs,
     ) -> tuple[int, bytes, dict, TokenUsage]:
         try:
-            url, headers = await self._prepare(request_body, model_id, endpoint, profile, wire)
+            url, headers = await self._prepare(
+                request_body, model_id, endpoint, profile, wire, account
+            )
+        except AccountCredentialsUnavailable:
+            # alias 계정을 쓸 수 없다 — 502(폴백·서킷 대상)가 아니라 고정 500. 서명 실패의
+            # 다른 원인(파드 IRSA 부재 등)은 아래 기존 502 그대로다.
+            return ACCOUNT_UNAVAILABLE_STATUS, ACCOUNT_UNAVAILABLE_BODY, {}, TokenUsage()
         except Exception:
             logger.exception("bedrock_openai_sign_failed", model_id=model_id, wire=wire)
             return (
@@ -248,7 +268,9 @@ class BedrockOpenAIAdapter(ProviderAdapter):
                 aws_request_id=aws_request_id,
                 error_body=body[:500].decode("utf-8", "replace"),
             )
-            return resp.status_code, body, out_headers, TokenUsage()
+            # 원문은 위 로그에만 — 클라이언트로 가는 본문에서는 서명 계정의 ARN·번호를 지운다.
+            safe_body = redact_account_identifiers_bytes(body)
+            return resp.status_code, safe_body, out_headers, TokenUsage()
 
         logger.info(
             "bedrock_openai_invoked",
@@ -276,6 +298,7 @@ class BedrockOpenAIAdapter(ProviderAdapter):
         profile=None,
         endpoint: str = "",
         wire: str = "responses",
+        account=None,
         **kwargs,
     ) -> tuple[int, AsyncIterator[bytes], dict, str | None]:
         if wire == "chat":
@@ -283,7 +306,15 @@ class BedrockOpenAIAdapter(ProviderAdapter):
             # request_body 를 쓴다.
             request_body = with_chat_usage(request_body)
         try:
-            url, headers = await self._prepare(request_body, model_id, endpoint, profile, wire)
+            url, headers = await self._prepare(
+                request_body, model_id, endpoint, profile, wire, account
+            )
+        except AccountCredentialsUnavailable:
+
+            async def _account_err() -> AsyncIterator[bytes]:
+                yield _error_chunk(wire, ACCOUNT_UNAVAILABLE_MESSAGE, err_type="api_error")
+
+            return ACCOUNT_UNAVAILABLE_STATUS, _account_err(), {}, None
         except Exception:
             logger.exception("bedrock_openai_stream_sign_failed", model_id=model_id, wire=wire)
 

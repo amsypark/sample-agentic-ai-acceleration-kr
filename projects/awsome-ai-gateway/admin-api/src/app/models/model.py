@@ -61,6 +61,36 @@ class RateLimitScope(str, enum.Enum):
     GLOBAL = "GLOBAL"
 
 
+# ── AwsAccount ──
+
+
+class AwsAccount(Base):
+    """등록된 대상 AWS 계정 (마이그레이션 0044).
+
+    운영자는 계정을 한 번 등록하고 alias 에서 ``name`` 으로 고른다. 게이트웨이는 이 테이블을
+    읽지 않는다 — 고른 계정의 ``role_arn`` / ``external_id`` 는 DB 트리거
+    (``model.alias_account_materialize`` / ``model.aws_account_propagate``)가
+    ``model_aliases.account_role_arn`` / ``account_external_id`` 로 복사하고, 게이트웨이는
+    그 사본으로 서명한다.
+    """
+
+    __tablename__ = "aws_accounts"
+    __table_args__ = {"schema": "model"}
+
+    #: 바꿀 수 없는 slug(CHECK ck_aws_accounts_name). FK 대상이자 로그·콘솔의 식별자라서다.
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: UNIQUE: 역할 하나 = 계정 항목 하나(0044 docstring).
+    role_arn: Mapped[str] = mapped_column(String(2048), nullable=False, unique=True)
+    external_id: Mapped[str | None] = mapped_column(String(1224), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("auth.users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 # ── ModelAlias ──
 
 
@@ -92,6 +122,21 @@ class ModelAlias(Base):
     #:
     #: ``auth.user_allowed_clients``(사용자 × 앱)와는 **다른 축**이고 AND 로 걸린다.
     allowed_clients: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    #: 이 alias 를 서명할 **대상 AWS 계정**의 역할 ARN과 그 ExternalId (마이그레이션 0043).
+    #: NULL = alias 계정 없음 → 게이트웨이는 오늘 규칙대로 라우팅 프로필 계정, 그것도 없으면
+    #: 파드 IRSA 로 호출한다(우선순위: gateway-proxy ``services/account_credentials.py``).
+    #:
+    #: ★ 0044 부터 두 컬럼은 **사본**이다 — admin-api 는 쓰지 않는다. 운영자가 쓰는 것은 아래
+    #: ``account_name`` 하나이고, DB 트리거가 레지스트리의 값을 복사한다(선택 시 채움, 해제 시
+    #: 비움, 레지스트리 수정 시 전파). 트리거가 채운 값은 flush 후 ORM 인스턴스에 반영되지
+    #: 않으므로 응답을 만들기 전에 refresh 해야 한다(services/model_service).
+    account_role_arn: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    account_external_id: Mapped[str | None] = mapped_column(String(1224), nullable=True)
+    #: 레지스트리 선택(0044). NULL = 기본 계정. 지울 때 ON DELETE RESTRICT — SET NULL 은 그
+    #: alias 의 청구를 조용히 기본 계정으로 옮긴다.
+    account_name: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("model.aws_accounts.name", ondelete="RESTRICT"), nullable=True
+    )
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("auth.users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

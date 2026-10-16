@@ -596,13 +596,14 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     # ── Register routers ──
-    from app.routers import analytics, apps, budgets, cli, dashboard, internal, keys, models, monitoring, my, productivity, rate_limits, routing, service_tokens, settings as settings_router, users
+    from app.routers import analytics, apps, aws_accounts, budgets, cli, dashboard, internal, keys, models, monitoring, my, productivity, rate_limits, routing, service_tokens, settings as settings_router, users
 
     app.include_router(keys.router)
     app.include_router(budgets.router)
     app.include_router(models.router)
     app.include_router(rate_limits.router)
     app.include_router(routing.router)
+    app.include_router(aws_accounts.router)  # /admin/aws-accounts — 계정 레지스트리 (0044)
     app.include_router(apps.router)
     app.include_router(settings_router.router)
     app.include_router(users.router)

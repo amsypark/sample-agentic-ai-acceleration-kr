@@ -26,6 +26,7 @@ from app.schemas.domain import (
     TokenUsage,
 )
 from app.schemas.routing import RoutingProfileSchema
+from app.services.account_credentials import profile_account_target, resolve_account_target
 from app.services.body_log_records import (
     build_body_record_for_nonstream,
     build_body_record_for_stream,
@@ -127,6 +128,17 @@ class BackendDecision:
     model_config: ModelConfigSchema | None = None  # pre-resolved for Mantle
     model_id: str | None = None          # resolved provider_model_id for Mantle; None = default Bedrock path
     endpoint: str | None = None
+
+
+def _account_kwargs(cand_config) -> dict:
+    """후보 alias 의 대상 계정(0043)을 어댑터 kwargs 로. 계정이 없으면 ``{}``.
+
+    빈 dict 인 이유: 계정 없는 alias 의 어댑터 호출 인자가 이 기능 이전과 **같아야** 한다
+    (account=None 키조차 없다). 우선순위는 alias 계정 → 경로별 오늘 규칙(프로필) → 파드이고,
+    뒤 두 단계는 어댑터/브로커의 기존 코드가 그대로 정한다(services/account_credentials.py).
+    """
+    target = resolve_account_target(cand_config)
+    return {"account": target} if target is not None else {}
 
 
 async def _select_backend(*, loader, router_service, redis, db, client, requested_alias):
@@ -250,6 +262,9 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
     # cross-account(claude-code→374) 일 때만 Bedrock 분기에서 profile.region 으로 설정.
     # 분기 전 명시 초기화 → 아래 _rewrite 클로저가 locals() 리플렉션 없이 직접 참조(리팩터 안전).
     _region_for_rewrite = None
+    # 요청 단위 cross-account 어댑터(있으면). 실제 서빙 계정 기록(0045)이 "프로필 계정으로
+    # 나갔는가, in-account 로 폴백했는가" 를 이 어댑터에 묻는다.
+    _xacct_adapter: BedrockAdapter | None = None
     if decision.provider == ProviderType.BEDROCK_MANTLE:
         model_config = decision.model_config
         adapter = registry.get(ProviderType.BEDROCK_MANTLE)
@@ -282,7 +297,12 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
                     bedrock_client=None,
                     client_resolver=lambda: _provider.get_client(_role, _reg, _ext),
                     fallback_client=getattr(_inacct_adapter, "_client", None),  # assume 실패 시 859 폴백
+                    # alias 계정(0043)이 있는 후보는 위 resolver 대신 그 계정으로 — 같은 리전
+                    # (profile.region)에서, 폴백 없이.
+                    account_clients=_provider,
+                    account_region=_prof.region,
                 )
+                _xacct_adapter = adapter
                 _region_for_rewrite = _prof.region
             else:
                 adapter = _inacct_adapter
@@ -350,6 +370,20 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
 
     is_mantle = decision.provider == ProviderType.BEDROCK_MANTLE
 
+    def _served_profile_account():
+        """이 요청에서 **라우팅 프로필 계정이 실제로 서명에 쓰였다면** 그 계정(0045 기록용).
+
+        서명 규칙과 같다: Mantle 은 프로필에 역할이 있으면 그 계정. native 는 claude-code 형
+        cross-account 어댑터가 있고 그 호출이 in-account 로 폴백하지 **않았을** 때만 — 폴백한
+        호출을 프로필 계정으로 기록하면 정산이 그 계정의 invocation log 에서 찾다가 "미매칭" 이
+        된다. alias 계정은 finalize 쪽(effective_account_id)이 이 값보다 먼저 본다.
+        """
+        if is_mantle:
+            return profile_account_target(decision.profile)
+        if _xacct_adapter is not None and not _xacct_adapter.served_by_fallback:
+            return profile_account_target(decision.profile)
+        return None
+
     # 클라이언트가 보낸 anthropic-beta 와 넘길 목록은 요청마다 한 번만 읽는다
     # (_build_candidate_body 는 폴백 후보·웹 검색 턴마다 불린다).
     # English: read once per request; the body builder runs per fallback candidate and per
@@ -385,10 +419,14 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
             mantle_b = normalize_thinking(
                 mantle_b, cand_config.provider_model_id, request_id=request_id
             )
+            # 후보 **자신의** alias 계정(0043). model_config(원래 요청 alias)가 아니라
+            # cand_config 다 — 폴백 후보는 다른 alias 이고 다른 계정일 수 있다. 없으면 kwargs 가
+            # 오늘과 같다(브로커가 프로필 계정 → 파드).
+            _acct = _account_kwargs(cand_config)
             return (
                 json.dumps(mantle_b).encode(),
-                {"profile": decision.profile, "endpoint": decision.endpoint},
-                {"profile": decision.profile, "endpoint": decision.endpoint},
+                {"profile": decision.profile, "endpoint": decision.endpoint, **_acct},
+                {"profile": decision.profile, "endpoint": decision.endpoint, **_acct},
             )
         else:
             bedrock_b = {k: v for k, v in req_d.items() if k in _BEDROCK_ALLOWED_FIELDS}
@@ -415,10 +453,13 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
             # English: last, so no normalisation step above can drop them. Not on the Mantle
             # branch (betas would go as a header there; untested).
             apply_forwarded_betas(bedrock_b, req_d, _client_betas, _fwd_map)
+            # 후보별 alias 계정 — Mantle 분기와 같은 이유(cand_config). 없으면 kwargs 가 오늘과
+            # 같다(프로필 cross-account resolver + in-account 폴백, 또는 파드).
+            _acct = _account_kwargs(cand_config)
             return (
                 json.dumps(bedrock_b).encode(),
-                {"path_suffix": "invoke-with-response-stream"},
-                {"path_suffix": "invoke"},
+                {"path_suffix": "invoke-with-response-stream", **_acct},
+                {"path_suffix": "invoke", **_acct},
             )
 
     # cross-account(333) 면 profile.region, 아니면 None (분기 전 초기화됨).
@@ -493,6 +534,8 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
                 rate_limit_state=state.get("rate_limit_state"),
                 downgraded_from=state.get("downgraded_from"),
                 client=client,
+                # 실제 서빙 계정 기록(0045).
+                profile_account=_served_profile_account(),
             )
 
         # 본문 로깅 — 웹서치 경로 전용 훅. 이 return 은 아래 본문 로깅 배선보다 **먼저**
@@ -684,6 +727,8 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
                 availability_fallback_from=availability_fallback_from,
                 bedrock_request_id=aws_request_id,
                 client=client,
+                # 실제 서빙 계정 기록(0045).
+                profile_account=_served_profile_account(),
             )
 
         response_headers: dict = {}
@@ -761,6 +806,8 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
                 # FallbackResult.payload and is never sent to the client.
                 bedrock_request_id=(headers or {}).get("x-amzn-requestid"),
                 client=client,
+                # 실제 서빙 계정 기록(0045).
+                profile_account=_served_profile_account(),
             )
 
         # 본문 로깅(성공 **및** 오류). enqueue 만 하므로 응답을 지연시키지 않는다.
@@ -910,12 +957,19 @@ async def count_tokens(request: Request) -> JSONResponse:
                 bedrock_client=None,
                 client_resolver=lambda: _provider.get_client(_role, _reg, _ext),
                 fallback_client=getattr(_inacct_adapter, "_client", None),
+                account_clients=_provider,
+                account_region=_ct_profile.region,
             )
         else:
             adapter = _inacct_adapter
     else:
         adapter = registry.get(ProviderType.BEDROCK)
-    status, input_tokens = await adapter.count_tokens(body, count_tokens_model_id)
+    # alias 별 대상 계정(0043). CountTokens 도 모델 액세스를 가진 계정에서만 허가된다 — 다른
+    # 계정으로 서빙되는 alias 를 여기서 세면 추론은 되는데 카운트만 403 이 된다(위 claude-code
+    # 계정 스플릿과 같은 부류). alias 계정이 없으면 인자가 오늘과 같다.
+    status, input_tokens = await adapter.count_tokens(
+        body, count_tokens_model_id, **_account_kwargs(model_config)
+    )
 
     if status != 200:
         return JSONResponse(

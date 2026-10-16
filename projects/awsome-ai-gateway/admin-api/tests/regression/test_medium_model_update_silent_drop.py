@@ -81,6 +81,10 @@ class _FakeModel:
         #    AttributeError 로 터져 500 이 되고, 그 500 은 "이 테스트가 검증하려는 결함"
         #    처럼 보인다(실제로 그렇게 오독될 뻔했다). None = per-app 제한 없음.
         self.allowed_clients = None
+        # 대상 AWS 계정(0043/0044). None = 기본 계정.
+        self.account_name = None
+        self.account_role_arn = None
+        self.account_external_id = None
         self.created_at = datetime.now(timezone.utc)
         self.updated_at = datetime.now(timezone.utc)
 

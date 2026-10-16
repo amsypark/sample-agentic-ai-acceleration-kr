@@ -9,6 +9,8 @@ import { AwsPriceSyncButton } from '@/components/models/AwsPriceSyncButton';
 import { TeamModelPermissionPanel } from '@/components/models/TeamModelPermissionPanel';
 import { WebSearchTogglePanel } from '@/components/models/WebSearchTogglePanel';
 import type { RoutingProfileItem } from '@/lib/actions/routing';
+import { AwsAccountsPanel } from '@/components/models/AwsAccountsPanel';
+import type { AwsAccountList } from '@/lib/actions/awsAccounts';
 
 interface APIModelItem {
   alias: string;
@@ -18,6 +20,8 @@ interface APIModelItem {
   status: string;
   description: string | null;
   display_name: string | null;
+  account_name?: string | null;
+  account_role_arn?: string | null;
   current_pricing: {
     input_price_per_1k_tokens: string;
     output_price_per_1k_tokens: string;
@@ -56,21 +60,27 @@ function mapToModelListItem(item: APIModelItem): ModelListItem {
     context_window: 0,
     description: item.description,
     display_name: item.display_name,
+    account_name: item.account_name ?? null,
+    account_role_arn: item.account_role_arn ?? null,
   };
 }
 
 export default async function ModelsPage() {
   const t = await getTranslations('models');
 
-  const [modelsRes, teamsRes, routingRes] = await Promise.allSettled([
+  const [modelsRes, teamsRes, routingRes, accountsRes] = await Promise.allSettled([
     adminAPI.get<{ items: APIModelItem[] }>('/admin/models'),
     adminAPI.get<{ items: APITeamItem[] }>('/admin/users/teams'),
     adminAPI.get<{ items: RoutingProfileItem[] }>('/admin/routing-profiles'),
+    adminAPI.get<AwsAccountList>('/admin/aws-accounts'),
   ]);
 
   const models = (modelsRes.status === 'fulfilled' && modelsRes.value?.items ? modelsRes.value.items : []).map(mapToModelListItem);
   const allTeams = teamsRes.status === 'fulfilled' && teamsRes.value?.items ? teamsRes.value.items : [];
   const routingProfiles = routingRes.status === 'fulfilled' && routingRes.value?.items ? routingRes.value.items : [];
+  // 계정 레지스트리(0044). 실패해도 페이지는 그린다 — 모델 다이얼로그는 "기본값" 만 고를 수 있다.
+  const awsAccounts = accountsRes.status === 'fulfilled' ? accountsRes.value?.items ?? [] : [];
+  const appAccounts = accountsRes.status === 'fulfilled' ? accountsRes.value?.app_accounts ?? [] : [];
   const teams = allTeams
     .filter(t => (t.member_count ?? 0) > 0)
     .map(t => ({ id: t.id, name: t.name }));
@@ -82,10 +92,15 @@ export default async function ModelsPage() {
           <h1 className="text-2xl font-bold">{t('title')}</h1>
           <div className="flex items-center gap-2">
             <AwsPriceSyncButton />
-            <CreateModelButton />
+            <CreateModelButton accounts={awsAccounts} models={models} />
           </div>
         </div>
-        <ModelsTable models={models} />
+        <ModelsTable models={models} accounts={awsAccounts} />
+      </div>
+
+      <div>
+        <h2 className="text-lg font-semibold mb-4">{t('awsAccountsTitle')}</h2>
+        <AwsAccountsPanel accounts={awsAccounts} appAccounts={appAccounts} />
       </div>
 
       <div>

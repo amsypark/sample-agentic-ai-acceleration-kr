@@ -93,6 +93,10 @@ export const ModelCreateSchema = z.object({
   // (두 필드는 ModelListItem 표시용 타입에만 존재하며 항상 0 으로 채워진다.)
   description: z.string().max(512).optional(),
   display_name: z.string().max(128).optional(),
+  // 대상 AWS 계정(0044) — 레지스트리 이름. null = 기본값(백엔드에서 해제로 처리된다).
+  account_name: z.string().max(64).nullable().optional(),
+  // 같은 모델 id 의 다른 ACTIVE alias 에도 같은 계정을 같은 저장에서 건다(admin-api 409 의 해소).
+  apply_to_siblings: z.boolean().optional(),
 })
   // BEDROCK_RUNTIME_OPENAI 은 endpoint_url 이 **필수**다. 게이트웨이 어댑터가 SigV4 서명
   // 리전을 endpoint 호스트(bedrock-runtime.{region}.amazonaws.com)에서 뽑아내므로, 비어
@@ -270,6 +274,34 @@ export interface AwsPriceSyncResponse {
 // ─── Inferred Zod Types ───────────────────────────────────────────────────────
 
 export type BudgetSetInput = z.infer<typeof BudgetSetSchema>;
+// ─── AWS Accounts (migration 0044) ───────────────────────────────────────────
+// admin-api(schemas/aws_accounts.py)·DB CHECK 와 같은 규칙. 여기서 먼저 막아 필드 단위로 보여 준다.
+const AWS_ACCOUNT_NAME_RE = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
+const RESERVED_AWS_ACCOUNT_NAMES = ['default', 'gateway', 'inherit', 'none'];
+// admin-api(schemas/models.py)·DB CHECK·terraform 과 같은 문법: aws / aws-<소문자> 파티션만, 역할
+// 경로·이름은 IAM 문자 집합만(와일드카드 없음). ExternalId 는 STS 문자 집합의 ASCII 판.
+const ROLE_ARN_RE = /^arn:aws(-[a-z]+)*:iam::[0-9]{12}:role\/[A-Za-z0-9+=,.@_/-]+$/;
+const EXTERNAL_ID_RE = /^[A-Za-z0-9_+=,.@:/-]{2,1224}$/;
+
+export const AwsAccountSchema = z.object({
+  name: z
+    .string()
+    .regex(AWS_ACCOUNT_NAME_RE, '3-64 lowercase letters, digits and hyphens')
+    .refine((v) => !RESERVED_AWS_ACCOUNT_NAMES.includes(v), 'This name is reserved'),
+  display_name: z.string().min(1).max(128),
+  role_arn: z
+    .string()
+    .regex(ROLE_ARN_RE, 'Must be an IAM role ARN: arn:aws:iam::<12-digit account>:role/<name>'),
+  external_id: z
+    .string()
+    .regex(EXTERNAL_ID_RE, '2-1224 chars of A-Z a-z 0-9 + = , . @ : / _ -')
+    .nullable()
+    .optional(),
+  description: z.string().max(1000).nullable().optional(),
+});
+
+export type AwsAccountInput = z.infer<typeof AwsAccountSchema>;
+
 export type ModelCreateInput = z.infer<typeof ModelCreateSchema>;
 export type ModelDeactivateInput = z.infer<typeof ModelDeactivateSchema>;
 export type AnalyticsFilterInput = z.infer<typeof AnalyticsFilterSchema>;

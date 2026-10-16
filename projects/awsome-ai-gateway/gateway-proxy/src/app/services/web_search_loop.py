@@ -877,14 +877,21 @@ async def _anthropic_nonstream(
                 {"role": "user", "content": tool_results},
             ]
     finally:
-        # Fire on_usage whenever any tokens accrued — even if a LATER turn failed after
-        # earlier turns succeeded (tokens were consumed and must be accounted) (F-9).
+        # on_usage 를 **항상** 쏜다 — 두 스트리밍 스티처의 finally 와 같다.
+        #   * 토큰이 쌓였으면 그 합계로 정산한다. 앞 턴이 성공한 뒤 나중 턴이 실패해도 앞 턴의
+        #     토큰은 소비됐으므로 청구한다(F-9).
+        #   * 하나도 없으면(첫 턴이 4xx/5xx — 예: alias 계정 AssumeRole 실패의 500) zero-usage
+        #     finalize 가 enforce 의 예약(TPM·CPM/CPH)을 전부 되돌린다. 원장에는 아무것도 쓰지
+        #     않는다(XADD 전에 return) — 스트리밍 경로의 실패와 같은 결과다.
+        # ⚠️ 라우터의 웹서치 분기는 release_reservations 를 부르지 않는다 — 이 콜백이 정산의
+        #    **유일한** 주인이다. 예전에는 토큰이 0 이면 건너뛰어 예약이 창이 끝날 때까지(CPH 는
+        #    최대 1시간) 남았다. 라우터에 release 를 하나 더 두면 이 finalize 와 겹쳐 이중 환불이
+        #    된다(카운터가 예약액만큼 음수).
         merged.web_search_count = searches_done
-        if (merged.input_tokens + merged.output_tokens) > 0:
-            try:
-                await on_usage(merged)
-            except Exception:
-                logger.warning("web_search.on_usage_failed")
+        try:
+            await on_usage(merged)
+        except Exception:
+            logger.warning("web_search.on_usage_failed")
 
     if final_status == 200 and isinstance(final_body.get("usage"), dict):
         # Overwrite the returned body's usage with the merged (multi-turn) totals so the
@@ -1347,12 +1354,13 @@ async def _responses_nonstream(
                 )
             conv_input = conv_input + new_items
     finally:
-        merged.web_search_count = searches_done  # fire on any accrued usage even on late failure (F-9)
-        if (merged.input_tokens + merged.output_tokens) > 0:
-            try:
-                await on_usage(merged)
-            except Exception:
-                logger.warning("web_search.on_usage_failed")
+        # 항상 쏜다 — 토큰이 있으면 정산(F-9), 없으면 zero-usage finalize 가 예약을 되돌린다.
+        # 근거는 _anthropic_nonstream 의 같은 finally 참조.
+        merged.web_search_count = searches_done
+        try:
+            await on_usage(merged)
+        except Exception:
+            logger.warning("web_search.on_usage_failed")
 
     if final_status == 200 and isinstance(final_body.get("usage"), dict):
         # Same wire-vs-billing split as _finalize_responses_obj: the client must see the
@@ -1474,8 +1482,9 @@ async def run_web_search_loop(
                                      media_type="text/event-stream", headers=response_headers)
         base.pop("stream", None)
         status, body, _h, usage = await invoke(base)
-        if usage and (usage.input_tokens + usage.output_tokens) > 0:
-            await on_usage(usage)
+        # 0 이어도 쏜다 — 실패한 호출(usage 없음)은 zero-usage finalize 가 예약을 되돌린다
+        # (_anthropic_nonstream 의 finally 참조). 건너뛰면 예약이 창 끝까지 남는다.
+        await on_usage(usage if usage is not None else TokenUsage())
         await _log_nonstream(status, body)
         try:
             content = json.loads(body)
@@ -1522,8 +1531,9 @@ async def run_web_search_loop(
             return StreamingResponse(_log_stream(gen), status_code=status,
                                      media_type="text/event-stream", headers=response_headers)
         status, body, _h, usage = await invoke(base)
-        if usage and (usage.input_tokens + usage.output_tokens) > 0:
-            await on_usage(usage)
+        # 0 이어도 쏜다 — 실패한 호출(usage 없음)은 zero-usage finalize 가 예약을 되돌린다
+        # (_anthropic_nonstream 의 finally 참조). 건너뛰면 예약이 창 끝까지 남는다.
+        await on_usage(usage if usage is not None else TokenUsage())
         await _log_nonstream(status, body)
         try:
             content = json.loads(body)

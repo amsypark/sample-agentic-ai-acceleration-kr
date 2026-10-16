@@ -8,9 +8,14 @@ DB writer 로 넘기는 흐름. 양쪽 파일을 동기화 상태로 유지 (지
 """
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# usage_logs.aws_account_id 는 VARCHAR(12) 다(0045). 형식이 어긋난 값 하나가 INSERT 를 실패시키면
+# 그 배치 전체가 기록되지 않으므로(XACK 안 됨 → 재시도 반복) 여기서 걸러 None 으로 둔다.
+_ACCOUNT_ID_RE = re.compile(r"[0-9]{12}")
 
 
 class CostStreamEntry(BaseModel):
@@ -58,5 +63,16 @@ class CostStreamEntry(BaseModel):
     client: str | None = None
     # 청구 티어 감사 (마이그레이션 0039) — 게이트웨이가 채운 값을 그대로 usage_logs 에 쓴다.
     context_tier: str | None = None
+    # 이 요청을 실제로 서빙한 AWS 계정 12자리 (마이그레이션 0045). None = 게이트웨이 자신의
+    # 계정(또는 0045 이전 gateway 의 엔트리). 기본 None 이라 필드 없는 엔트리도 파싱된다.
+    aws_account_id: str | None = None
+
+    @field_validator("aws_account_id", mode="before")
+    @classmethod
+    def _drop_malformed_account_id(cls, v):
+        # 감사용 부가 정보다 — 과금 행을 잃느니 계정만 비운다.
+        if isinstance(v, str) and _ACCOUNT_ID_RE.fullmatch(v):
+            return v
+        return None
 
     schema_version: int = Field(default=2)

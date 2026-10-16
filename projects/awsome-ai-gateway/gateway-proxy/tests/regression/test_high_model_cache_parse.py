@@ -61,6 +61,10 @@ def test_valid_cache_entry_returns_model_config():
             "output_per_1k": "0.015",
         },
         "status": "ACTIVE",
+        # 지금 이미지가 쓰는 payload 는 계정 칸을 항상 싣는다(null 이어도). 칸이 없는 것은 0043 이전
+        # 파드의 payload 로 보고 미스다 — test_router_service.py 의 같은 이름 테스트들.
+        "account_role_arn": None,
+        "account_external_id": None,
     })
     result = _parse_cached_model(valid, model_ref="test-model")
     assert result is not None

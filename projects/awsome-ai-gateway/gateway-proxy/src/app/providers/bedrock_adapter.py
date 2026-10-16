@@ -13,6 +13,12 @@ from botocore.exceptions import ClientError
 
 from app.providers.base import ProviderAdapter
 from app.schemas.domain import TokenUsage
+from app.services.account_credentials import (
+    ACCOUNT_UNAVAILABLE_BODY,
+    ACCOUNT_UNAVAILABLE_STATUS,
+    AccountCredentialsUnavailable,
+    redact_account_identifiers,
+)
 
 _BEDROCK_POOL_SIZE = int(os.environ.get("BEDROCK_THREAD_POOL_SIZE", "128"))
 _bedrock_executor = ThreadPoolExecutor(max_workers=_BEDROCK_POOL_SIZE, thread_name_prefix="bedrock")
@@ -25,6 +31,9 @@ _BOTO_ERROR_MAP: dict[str, int] = {
     "AccessDeniedException": 403,
     "ResourceNotFoundException": 404,
     "ThrottlingException": 429,
+    # 계정의 쿼터(예: 일일 토큰)다. 기본값 502 로 두면 폴백·서킷 브레이커 대상이 되어, 그 계정의
+    # 쿼터가 같은 모델 id 를 다른 계정으로 부르는 alias 의 브레이커까지 연다.
+    "ServiceQuotaExceededException": 429,
     "ModelTimeoutException": 504,
     "ServiceException": 502,
     "InternalServerException": 502,
@@ -67,27 +76,96 @@ class BedrockAdapter(ProviderAdapter):
     - cross-account(claude-code→374): client_resolver = async () -> boto3 client
       (STS assume 후 대상 계정 bedrock-runtime). assume/build 실패 시 fallback_client
       (in-account 859)로 **투명 폴백** → claude-code 절대 안 죽음(사용자 결정).
+
+    alias 별 대상 계정(0043): 호출에 ``account=AccountTarget`` 이 오면 위 두 모드보다 우선해
+    그 계정의 클라이언트(``account_clients.get_account_client``, 리전 = ``account_region``)로
+    호출한다. 그 경로에는 **폴백이 없다** — AssumeRole 실패는 500 + 고정 본문
+    (account_credentials 모듈 docstring). ``account`` 가 없으면 위 두 모드가 바이트 단위로 그대로다.
     """
 
-    def __init__(self, bedrock_client, client_resolver=None, fallback_client=None) -> None:
+    def __init__(
+        self,
+        bedrock_client,
+        client_resolver=None,
+        fallback_client=None,
+        account_clients=None,
+        account_region: str | None = None,
+    ) -> None:
         self._client = bedrock_client
         self._client_resolver = client_resolver
         self._fallback_client = fallback_client
+        # BedrockAccountClientProvider. None = alias 계정 미배선 → account 가 온 호출은 파드
+        # 자격증명으로 대신하지 않고 거부한다.
+        self._account_clients = account_clients
+        # alias 계정 클라이언트의 리전 = 그 요청이 원래 갔을 리전(파드 리전, 또는 claude-code 형
+        # 프로필이면 profile.region). 계정만 바꾸고 리전은 바꾸지 않는다 — 라우터의 모델 id
+        # 리전 재작성(_rewrite_model_id_for_region)도 같은 리전을 쓴다.
+        self._account_region = account_region
+        #: 마지막 프로필 경로 호출이 in-account 로 폴백했는가. 실제 서빙 계정 기록(0045)용이다.
+        #: resolver 가 있는 **요청 단위** 어댑터(routers/messages.py)에서만 바뀐다 — 공유되는
+        #: 레지스트리 어댑터는 resolver 가 없으므로 이 값을 건드리지 않는다.
+        self.served_by_fallback = False
 
     async def _get_client(self):
         """resolver 있으면 cross-account 클라이언트, 실패 시 in-account fallback."""
         if self._client_resolver is None:
             return self._client
         try:
-            return await self._client_resolver()
+            client = await self._client_resolver()
+            self.served_by_fallback = False
+            return client
         except Exception:
             logger.warning("bedrock_xacct_resolve_failed_fallback_inaccount", exc_info=True)
             if self._fallback_client is not None:
+                self.served_by_fallback = True
                 return self._fallback_client
             raise
 
+    async def _client_for(self, account):
+        """``account`` (alias 계정) 이 있으면 그 계정의 클라이언트, 없으면 위 두 모드.
+
+        Raises:
+            AccountCredentialsUnavailable: alias 계정을 쓸 수 없다. 파드 자격증명으로 대신
+                하지 않는다 — 그것은 다른 계정에 청구되는 성공 응답이다.
+        """
+        if account is None:
+            return await self._get_client()
+        if self._account_clients is None:
+            raise AccountCredentialsUnavailable(
+                account.role_arn,
+                "alias requests a target AWS account but no account client provider is wired "
+                "into BedrockAdapter; refusing to call with the pod's own credentials",
+            )
+        region = self._account_region or getattr(
+            getattr(self._client, "meta", None), "region_name", None
+        )
+        if not region:
+            raise AccountCredentialsUnavailable(
+                account.role_arn, "no region for the account client"
+            )
+        try:
+            return await self._account_clients.get_account_client(account, region)
+        except AccountCredentialsUnavailable:
+            raise
+        except Exception as exc:
+            # 클라이언트 빌드 실패도 같은 타입으로 — 아니면 어댑터 밖으로 새어 나가 500 전역
+            # 핸들러로 가고, 라우터의 예약 해제 경로를 건너뛴다.
+            logger.warning(
+                "bedrock_account_client_build_failed",
+                role_arn=account.role_arn,
+                error=type(exc).__name__,
+            )
+            raise AccountCredentialsUnavailable(
+                account.role_arn, f"account client build failed: {type(exc).__name__}"
+            ) from exc
+
     async def invoke(
-        self, request_body: bytes, model_id: str, path_suffix: str = "invoke", **kwargs
+        self,
+        request_body: bytes,
+        model_id: str,
+        path_suffix: str = "invoke",
+        account=None,
+        **kwargs,
     ) -> tuple[int, bytes, dict, TokenUsage]:
         """Non-streaming Bedrock call.
 
@@ -104,12 +182,22 @@ class BedrockAdapter(ProviderAdapter):
         (``routers/messages.py``, ``routers/bedrock.py``, ``routers/openai_compat.py``)
         constructs its own ``JSONResponse``/``StreamingResponse`` headers rather than
         passing this dict through, so the AWS id is not leaked outward.
+
+        ``account`` — alias 의 대상 계정(0043). 해석 실패는 provider 오류가 아니라 게이트웨이
+        설정 오류라서 아래 try 블록 **밖**에서 자기 응답(500)으로 답한다 — 502 로 섞이면 폴백
+        루프가 다른 후보(다른 계정일 수 있다)로 넘기고 서킷 브레이커가 올라간다.
         """
         import asyncio
 
         loop = asyncio.get_event_loop()
+        if account is not None:
+            try:
+                client = await self._client_for(account)
+            except AccountCredentialsUnavailable:
+                return ACCOUNT_UNAVAILABLE_STATUS, ACCOUNT_UNAVAILABLE_BODY, {}, TokenUsage()
         try:
-            client = await self._get_client()
+            if account is None:
+                client = await self._get_client()
             if path_suffix in ("invoke", ""):
                 response = await loop.run_in_executor(
                     _bedrock_executor,
@@ -148,9 +236,14 @@ class BedrockAdapter(ProviderAdapter):
         except ClientError as e:
             code = e.response["Error"]["Code"]
             status = _BOTO_ERROR_MAP.get(code, 502)
-            logger.warning("bedrock_client_error", error_code=code, model_id=model_id)
+            # 원문은 로그에만. 클라이언트 본문에서는 ARN·계정 번호를 지운다 — AccessDenied 문장에
+            # 서명한 계정의 assumed-role ARN 이 들어 있다
+            # (account_credentials.redact_account_identifiers).
+            logger.warning(
+                "bedrock_client_error", error_code=code, model_id=model_id, error=str(e)
+            )
             error_body = json.dumps(
-                {"error": {"type": "provider_error", "message": str(e)}}
+                {"error": {"type": "provider_error", "message": redact_account_identifiers(str(e))}}
             ).encode()
             return status, error_body, {}, TokenUsage()
         except Exception:
@@ -162,13 +255,26 @@ class BedrockAdapter(ProviderAdapter):
                 TokenUsage(),
             )
 
-    async def count_tokens(self, request_body: bytes, model_id: str) -> tuple[int, int]:
-        """Bedrock CountTokens API — returns (status, input_tokens). No cost, no inference."""
+    async def count_tokens(
+        self, request_body: bytes, model_id: str, account=None
+    ) -> tuple[int, int]:
+        """Bedrock CountTokens API — returns (status, input_tokens). No cost, no inference.
+
+        ``account`` 를 받는 이유는 :meth:`invoke` 와 같다: CountTokens 는 모델 액세스를 가진
+        계정에서만 허가되므로, 다른 계정으로 서빙되는 alias 를 이 계정에서 세면 추론은 되는데
+        토큰 카운트만 403 이 된다(claude-code 의 invoke/count_tokens 계정 스플릿과 같은 부류).
+        """
         import asyncio
 
         loop = asyncio.get_event_loop()
+        if account is not None:
+            try:
+                client = await self._client_for(account)
+            except AccountCredentialsUnavailable:
+                return ACCOUNT_UNAVAILABLE_STATUS, 0
         try:
-            client = await self._get_client()
+            if account is None:
+                client = await self._get_client()
             response = await loop.run_in_executor(
                 None,
                 lambda: client.count_tokens(
@@ -191,13 +297,24 @@ class BedrockAdapter(ProviderAdapter):
         request_body: bytes,
         model_id: str,
         path_suffix: str = "invoke-with-response-stream",
+        account=None,
         **kwargs,
     ) -> tuple[int, AsyncIterator[bytes], dict, str | None]:
         import asyncio
 
         loop = asyncio.get_event_loop()
+        if account is not None:
+            try:
+                client = await self._client_for(account)
+            except AccountCredentialsUnavailable:
+
+                async def _account_err() -> AsyncIterator[bytes]:
+                    yield ACCOUNT_UNAVAILABLE_BODY
+
+                return ACCOUNT_UNAVAILABLE_STATUS, _account_err(), {}, None
         try:
-            client = await self._get_client()
+            if account is None:
+                client = await self._get_client()
             if path_suffix == "invoke-with-response-stream":
                 response = await loop.run_in_executor(
                     _bedrock_executor,
@@ -238,10 +355,10 @@ class BedrockAdapter(ProviderAdapter):
         except ClientError as e:
             code = e.response["Error"]["Code"]
             status = _BOTO_ERROR_MAP.get(code, 502)
-            error_msg = str(e)
             logger.warning(
-                "bedrock_stream_client_error", error_code=code, model_id=model_id, error=error_msg
+                "bedrock_stream_client_error", error_code=code, model_id=model_id, error=str(e)
             )
+            error_msg = redact_account_identifiers(str(e))  # invoke 의 같은 주석
 
             async def error_gen():
                 yield json.dumps(
@@ -250,7 +367,7 @@ class BedrockAdapter(ProviderAdapter):
 
             return status, error_gen(), {}, None
         except Exception as exc:
-            error_msg = str(exc)
+            error_msg = redact_account_identifiers(str(exc))
             logger.exception("bedrock_stream_failed", model_id=model_id)
 
             async def error_gen():

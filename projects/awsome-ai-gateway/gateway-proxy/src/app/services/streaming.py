@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.providers.openai_usage import extract_chat_usage, extract_responses_usage
 from app.schemas.domain import TokenUsage
 from app.services import bg_tasks
+from app.services.account_credentials import redact_account_identifiers
 
 logger = structlog.get_logger(__name__)
 
@@ -397,7 +398,11 @@ async def bedrock_anthropic_sse_stream(
         await _spawn_finalize("partial")
         err = {
             "type": "error",
-            "error": {"type": "stream_error", "message": str(exc) or "stream_error"},
+            # 상류 예외 문장에 서명 계정의 ARN 이 들어 있을 수 있다 — 원문은 위 로그에만.
+            "error": {
+                "type": "stream_error",
+                "message": redact_account_identifiers(str(exc)) or "stream_error",
+            },
         }
         yield f"event: error\ndata: {json.dumps(err)}\n\n".encode()
         return
@@ -675,7 +680,10 @@ async def openai_sse_stream(
     except Exception as exc:
         logger.exception("openai_stream_proxy_error")
         await _spawn_finalize("partial")  # yield 앞에서 확정 (timeout 경로와 동일 이유)
-        yield _emit_error_chunk("stream_error", str(exc) or "stream_error")
+        # 상류 예외 문장에 서명 계정의 ARN 이 들어 있을 수 있다 — 원문은 위 로그에만.
+        yield _emit_error_chunk(
+            "stream_error", redact_account_identifiers(str(exc)) or "stream_error"
+        )
         return
 
     if not client_disconnected:
@@ -916,7 +924,10 @@ async def responses_sse_stream(
     except Exception as exc:
         logger.exception("responses_stream_proxy_error")
         await _spawn_finalize("partial")  # yield 앞에서 확정 (timeout 경로와 동일 이유)
-        yield _emit_error_chunk("stream_error", str(exc) or "stream_error")
+        # 상류 예외 문장에 서명 계정의 ARN 이 들어 있을 수 있다 — 원문은 위 로그에만.
+        yield _emit_error_chunk(
+            "stream_error", redact_account_identifiers(str(exc)) or "stream_error"
+        )
         return
 
     if not client_disconnected:

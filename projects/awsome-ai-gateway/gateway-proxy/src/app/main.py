@@ -189,15 +189,44 @@ async def lifespan(app: FastAPI):
 
     # 12. Provider Registry
     provider_registry = ProviderRegistry()
-    bedrock_adapter = BedrockAdapter(bedrock_client)
+
+    # 12'. Cross-account Bedrock credential/client broker — created BEFORE the adapters
+    # because all three Bedrock planes take it. Original role (12c' below): claude-code's
+    # routing-profile cross-account on Bedrock NATIVE. Since migration 0043 it is also the
+    # ONE credential cache for per-alias target accounts on every plane (native boto3
+    # clients, runtime SigV4, Mantle bearers), keyed (role, ExternalId, session name), so an
+    # alias account is assumed once and never carries two expiries. Reuses the same STS
+    # assume region + BotoConfig as the in-account client (streaming timeout parity).
+    sts_client = boto3.client("sts", region_name=settings.mantle_assume_region)
+    bedrock_account_client_provider = BedrockAccountClientProvider(
+        sts_client=sts_client,  # same STS(mantle_assume_region); creds are account-global
+        boto_config=BotoConfig(
+            max_pool_connections=50,
+            connect_timeout=10,
+            read_timeout=settings.stream_timeout,
+            # in-account 클라이언트와 동일한 retries 정책(폭풍 증폭 억제) — 축⑥.
+            retries={"total_max_attempts": settings.bedrock_max_attempts, "mode": "standard"},
+        ),
+    )
+
+    # alias 계정 클라이언트는 파드 리전(settings.aws_region, in-account 클라이언트와 같다)에서
+    # 만든다 — alias 계정은 서명 주체만 바꾸고 리전은 바꾸지 않는다.
+    bedrock_adapter = BedrockAdapter(
+        bedrock_client,
+        account_clients=bedrock_account_client_provider,
+        account_region=settings.aws_region,
+    )
     openmodel_adapter = OpenModelAdapter(httpx_client, settings.openmodel_base_url)
     provider_registry.register(ProviderType.BEDROCK, bedrock_adapter)
     provider_registry.register(ProviderType.OPENMODEL, openmodel_adapter)
 
     # 12b. Mantle (Cowork cross-account) — broker assumes the 905 role at request time
     # (no long-lived 905 keys held). Mantle is HTTP+bearer, NOT boto3 invoke_model.
-    sts_client = boto3.client("sts", region_name=settings.mantle_assume_region)
-    mantle_broker = MantleCredentialBroker(sts_client=sts_client)
+    # The routing-profile path keeps its own credential cache exactly as before; only
+    # per-alias accounts (0043) mint from the shared provider.
+    mantle_broker = MantleCredentialBroker(
+        sts_client=sts_client, account_provider=bedrock_account_client_provider
+    )
     mantle_http = httpx.AsyncClient(
         timeout=httpx.Timeout(
             connect=5, read=settings.mantle_http_timeout, write=10, pool=30
@@ -223,26 +252,17 @@ async def lifespan(app: FastAPI):
     # Registering unconditionally is safe: nothing routes here until a model row carries
     # provider=BEDROCK_RUNTIME_OPENAI, so this is inert until the catalogue opts in.
     bedrock_openai_adapter = BedrockOpenAIAdapter(
-        http_client=mantle_http, signer=SigV4Signer(sts_client=sts_client)
+        http_client=mantle_http,
+        signer=SigV4Signer(sts_client=sts_client, account_provider=bedrock_account_client_provider),
     )
     provider_registry.register(ProviderType.BEDROCK_RUNTIME_OPENAI, bedrock_openai_adapter)
 
-    # 12c'. Cross-account Bedrock NATIVE (claude-code → 374). Assumes the 374 role at
-    # request time (no long-lived 374 keys), builds/caches a bedrock-runtime client from
-    # the temp creds. boto3 invoke_model, NOT Mantle bearer. Reuses the same STS assume
-    # region + BotoConfig as the in-account client (streaming timeout parity). The router
-    # only uses this when a routing profile has backend=invoke AND account_role_arn set;
-    # otherwise the default in-account bedrock_adapter is used (zero-regression).
-    bedrock_account_client_provider = BedrockAccountClientProvider(
-        sts_client=sts_client,  # same STS(mantle_assume_region); creds are account-global
-        boto_config=BotoConfig(
-            max_pool_connections=50,
-            connect_timeout=10,
-            read_timeout=settings.stream_timeout,
-            # in-account 클라이언트와 동일한 retries 정책(폭풍 증폭 억제) — 축⑥.
-            retries={"total_max_attempts": settings.bedrock_max_attempts, "mode": "standard"},
-        ),
-    )
+    # 12c'. Cross-account Bedrock NATIVE (claude-code → 374) uses the provider built in 12'.
+    # Assumes the 374 role at request time (no long-lived 374 keys), builds/caches a
+    # bedrock-runtime client from the temp creds. boto3 invoke_model, NOT Mantle bearer. The
+    # router only uses that path when a routing profile has backend=invoke AND
+    # account_role_arn set; otherwise the default in-account bedrock_adapter is used
+    # (zero-regression).
 
     # 12d. AgentCore MCP client (server-side web search, 2026-07-01). Only constructed
     # when a gateway URL is configured — else web_search_loop sees None and the router

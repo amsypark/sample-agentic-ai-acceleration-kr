@@ -30,6 +30,10 @@ def sample_alias_row():
     row.status = "ACTIVE"
     row.description = "Claude Sonnet 4.6"
     row.created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # alias 별 대상 계정(0043) — ORM 행에 있는 컬럼이다. 자동 MagicMock 속성은 _orm_to_schema
+    # 가 str | None 필드에 넣을 때 pydantic 검증을 깨뜨린다. None = alias 계정 없음.
+    row.account_role_arn = None
+    row.account_external_id = None
     return row
 
 
@@ -134,7 +138,16 @@ async def test_cache_hit_skips_db():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_cache_miss_writes_both_keys(sample_alias_row, sample_pricing_row):
+async def test_cache_miss_on_an_alias_request_writes_only_the_alias_key(
+    sample_alias_row, sample_pricing_row
+):
+    """alias 로 지목한 해석은 ``model:{alias}`` 만 쓴다.
+
+    예전에는 ``model:{provider_model_id}`` 도 썼다. 그 키는 provider_model_id 와 **이름이
+    같은 다른 alias** 의 캐시 칸이기도 해서(시드: claude-opus-4-8 → global.anthropic.
+    claude-opus-4-8 이라는 alias 가 따로 있다) TTL 동안 그 alias 가 이 alias 의 설정 — 단가,
+    허용 앱, status, alias 계정(0043) — 으로 서빙됐다(router_service._cache_resolved).
+    """
     redis = AsyncMock()
     redis.get = AsyncMock(return_value=None)
     redis.setex = AsyncMock()
@@ -144,8 +157,27 @@ async def test_cache_miss_writes_both_keys(sample_alias_row, sample_pricing_row)
     await rs.resolve_bedrock_model(redis, db, "claude-sonnet-4-6")
 
     keys_set = [call.args[0] for call in redis.setex.call_args_list]
-    assert "model:claude-sonnet-4-6" in keys_set
-    assert "model:global.anthropic.claude-sonnet-4-6" in keys_set
+    assert keys_set == ["model:claude-sonnet-4-6"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cache_miss_on_a_model_id_request_writes_both_keys(
+    sample_alias_row, sample_pricing_row
+):
+    """provider_model_id 로 지목한 해석은 두 키 모두 — 다음 같은 요청이 캐시에서 끝난다."""
+    redis = AsyncMock()
+    redis.get = AsyncMock(return_value=None)
+    redis.setex = AsyncMock()
+    # 1) alias 정확 매칭 없음 → 2) provider_model_id 형제 스캔 → 3) 단가
+    db = _make_db_mock([None, sample_alias_row, sample_pricing_row])
+
+    rs = RouterService()
+    schema = await rs.resolve_bedrock_model(redis, db, "global.anthropic.claude-sonnet-4-6")
+
+    assert schema.alias == "claude-sonnet-4-6"
+    keys_set = [call.args[0] for call in redis.setex.call_args_list]
+    assert keys_set == ["model:claude-sonnet-4-6", "model:global.anthropic.claude-sonnet-4-6"]
 
 
 @pytest.mark.unit
@@ -341,3 +373,59 @@ def test_check_key_scope_legacy_str_signature_still_works():
     RouterService().check_key_scope(_auth(["claude-haiku"]), "claude-haiku")
     with pytest.raises(PermissionError):
         RouterService().check_key_scope(_auth(["claude-haiku"]), "claude-opus")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_cached_payload_from_before_alias_accounts_is_a_miss(
+    sample_alias_row, sample_pricing_row
+):
+    """롤링 배포: 0043 이전 이미지의 파드가 쓴 ``model:{alias}`` 에는 계정 칸이 **없다**. 새 파드가
+    그것을 그대로 받으면 스키마 기본값 None = "alias 계정 없음" 으로 읽어, 그 alias 를 TTL(300초)
+    동안 파드/프로필 계정으로 서명한다 — 다른 계정에 청구되는 200 이다. 칸이 없는 payload 는
+    미스로 보고 DB 에서 다시 읽는다(명시적 null 은 정상 payload 다)."""
+    legacy = ModelConfigSchema(
+        provider_model_id="global.anthropic.claude-sonnet-4-6",
+        alias="claude-sonnet-4-6",
+        provider=ProviderType.BEDROCK,
+        api_format=ApiFormat.BEDROCK_NATIVE,
+        endpoint="",
+        pricing=ModelPricingSchema(input_per_1k=Decimal("0.003"), output_per_1k=Decimal("0.015")),
+        status=ModelStatus.ACTIVE,
+    ).model_dump(mode="json")
+    legacy.pop("account_role_arn")
+    legacy.pop("account_external_id")
+    sample_alias_row.account_role_arn = "arn:aws:iam::111122223333:role/in-region-bedrock"
+    redis = AsyncMock()
+    redis.get = AsyncMock(return_value=json.dumps(legacy))
+    redis.setex = AsyncMock()
+    db = _make_db_mock([sample_alias_row, sample_pricing_row])
+
+    schema = await RouterService().resolve_bedrock_model(redis, db, "claude-sonnet-4-6")
+
+    assert schema.account_role_arn == "arn:aws:iam::111122223333:role/in-region-bedrock"
+    db.execute.assert_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_cached_payload_with_an_explicit_null_account_is_a_hit():
+    cached = ModelConfigSchema(
+        provider_model_id="global.anthropic.claude-sonnet-4-6",
+        alias="claude-sonnet-4-6",
+        provider=ProviderType.BEDROCK,
+        api_format=ApiFormat.BEDROCK_NATIVE,
+        endpoint="",
+        pricing=ModelPricingSchema(input_per_1k=Decimal("0.003"), output_per_1k=Decimal("0.015")),
+        status=ModelStatus.ACTIVE,
+    ).model_dump_json()
+    assert '"account_role_arn":null' in cached
+    redis = AsyncMock()
+    redis.get = AsyncMock(return_value=cached)
+    db = AsyncMock()
+    db.execute = AsyncMock()
+
+    schema = await RouterService().resolve_bedrock_model(redis, db, "claude-sonnet-4-6")
+
+    assert schema.account_role_arn is None
+    db.execute.assert_not_called()

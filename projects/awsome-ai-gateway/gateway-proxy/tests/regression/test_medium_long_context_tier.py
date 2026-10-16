@@ -183,6 +183,8 @@ def test_orm_to_schema_carries_explicit_long_columns():
         created_at = datetime(2026, 1, 1)
         description = None
         allowed_clients = None
+        account_role_arn = None  # 0043 — ORM 행에 있는 컬럼
+        account_external_id = None
 
     class _Row:
         input_price_per_1k_tokens = _IN
