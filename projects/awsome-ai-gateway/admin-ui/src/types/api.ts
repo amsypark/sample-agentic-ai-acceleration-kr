@@ -62,18 +62,29 @@ export interface ModelCreateForm {
   display_name?: string;
 }
 
+/**
+ * 단가 상한 — `model.model_pricings` 의 단가 컬럼은 `NUMERIC(12,8)`(0040 이 넓혔다)이라 정수부가
+ * 4자리다. admin-api `schemas/models.py` 의 `MAX_PRICE_PER_1K` 와 **같은 값**이어야 한다 — 서버는
+ * 이미 `le=` 로 422 를 내지만, 여기서 막으면 그 칸 아래에 필드 단위 메시지가 붙고 왕복이 없다.
+ */
+export const MAX_PRICE_PER_1K = 9999.99999999;
+
 export const ModelCreateSchema = z.object({
-  alias: z.string().min(1, 'Alias is required').max(64),
+  // ★ 문자열 상한은 admin-api `schemas/models.py`(= DB 컬럼 폭)와 **같아야** 한다:
+  //   alias VARCHAR(128) / provider_model_id VARCHAR(512). 예전 alias 는 64 였다 — 서버가
+  //   받아들이는 65~128자 alias 를 콘솔이 막는 막다른 길이었고, 이 스키마는 편집 저장에도 쓰이므로
+  //   그런 alias 는 단가만 고치는 저장조차 영구히 불가능했다.
+  alias: z.string().min(1, 'Alias is required').max(128),
   provider: z.string().min(1, 'Provider is required'),
-  model_id: z.string().min(1, 'Model ID is required'),
+  model_id: z.string().min(1, 'Model ID is required').max(512),
   endpoint_url: z.string().optional(),
-  input_price_per_1k: z.number().nonnegative(),
-  output_price_per_1k: z.number().nonnegative(),
-  cache_creation_5m_price_per_1k: z.number().nonnegative().default(0),
+  input_price_per_1k: z.number().nonnegative().max(MAX_PRICE_PER_1K),
+  output_price_per_1k: z.number().nonnegative().max(MAX_PRICE_PER_1K),
+  cache_creation_5m_price_per_1k: z.number().nonnegative().max(MAX_PRICE_PER_1K).default(0),
   // 1h 캐시쓰기 단가 — 과거 스키마 누락으로 폼 값이 strip 되어 백엔드 default 0 으로
   // 박혀 1시간 캐시 사용분 청구가 누락되던 버그 수정(deepdive Q-pricing).
-  cache_creation_1h_price_per_1k: z.number().nonnegative().default(0),
-  cache_read_price_per_1k: z.number().nonnegative().default(0),
+  cache_creation_1h_price_per_1k: z.number().nonnegative().max(MAX_PRICE_PER_1K).default(0),
+  cache_read_price_per_1k: z.number().nonnegative().max(MAX_PRICE_PER_1K).default(0),
   // NOTE: max_tokens / context_window 를 여기에 두면 안 된다. 모델 추가/편집 폼에는 두 필드의
   // 입력란이 없고(CreateModelDialog 의 FormState 에도 없음), 백엔드 ModelCreateRequest 와
   // model.model_aliases 테이블에도 대응 필드가 없다. required 로 남겨두면 폼이 값을 보낼 방법이
@@ -219,6 +230,8 @@ export const RateLimitSetSchema = z.object({
   tpm: z.number().int().positive().nullable().optional(),
   cpm: z.number().positive().nullable().optional(),
   cph: z.number().positive().nullable().optional(),
+  /** GLOBAL 전용 — 다른 모델이 한도를 갖고 있으면 그 alias(해제 동의). 없으면 admin-api 가 409. */
+  release_alias: z.string().min(1).optional(),
 });
 
 // ─── Page Permission Map ──────────────────────────────────────────────────────

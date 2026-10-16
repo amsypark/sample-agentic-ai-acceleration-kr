@@ -196,6 +196,7 @@ async def get_team_allocation(
         session,
         team_id=uuid.UUID(team_id),
         period=effective_period,
+        actor=user,
     )
 
 
@@ -236,6 +237,7 @@ async def get_budget_summary(
         scope=scope,
         target_id=uuid.UUID(target_id) if target_id else None,
         period=period,
+        actor=user,
     )
 
 
@@ -252,6 +254,7 @@ async def get_downgrade_config(
         session,
         scope=BudgetScope(scope.upper()),
         scope_id=uuid.UUID(scope_id),
+        actor=user,
     )
 
 

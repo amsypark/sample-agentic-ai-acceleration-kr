@@ -158,3 +158,66 @@ class TestRetryFailed:
 
         assert resolved == 0
         assert failure.retry_count == 3
+
+
+class TestRetryPatternFailures:
+    """``invalidate_pattern`` 실패는 ``pattern:<glob>`` 로 기록된다. 예전 ``retry_failed`` 는 그 문자열을
+    **리터럴 키**로 DEL 했다 — 그런 키는 없으니 아무것도 지우지 않고 resolved 로 표시했다. 옛 정책 캐시는
+    TTL 까지 남았고 실패 기록은 "해결됨" 이라 다시 보지도 않았다. 패턴은 패턴으로 다시 지워야 한다."""
+
+    @staticmethod
+    def _session(*failures):
+        session = AsyncMock()
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = list(failures)
+        session.execute = AsyncMock(return_value=result)
+        return session
+
+    @staticmethod
+    def _failure(key: str, retry_count: int = 0):
+        from app.models.audit import CacheInvalidationFailure
+
+        f = MagicMock(spec=CacheInvalidationFailure)
+        f.cache_key, f.resolved_at, f.retry_count = key, None, retry_count
+        return f
+
+    async def test_pattern_failure_is_retried_as_a_scan(self):
+        keys = ["rl:config:USER:u1:claude-opus", "rl:config:USER:u1:claude-sonnet"]
+
+        async def _scan(*_a, **_kw):
+            for k in keys:
+                yield k
+
+        redis = AsyncMock()
+        redis.scan_iter = MagicMock(side_effect=lambda *a, **kw: _scan())
+        redis.delete = AsyncMock()
+        failure = self._failure("pattern:rl:config:USER:u1:*")
+
+        resolved = await CacheInvalidationManager(redis).retry_failed(self._session(failure))
+
+        assert resolved == 1 and failure.resolved_at is not None
+        assert redis.scan_iter.call_args.kwargs["match"] == "rl:config:USER:u1:*"
+        deleted = [c.args[0] for c in redis.delete.call_args_list]
+        assert deleted == keys
+        assert "pattern:rl:config:USER:u1:*" not in deleted, "리터럴 'pattern:…' 키를 지웠다"
+
+    async def test_pattern_retry_failure_is_counted_not_resolved(self):
+        redis = AsyncMock()
+        redis.scan_iter = MagicMock(side_effect=ConnectionError("still down"))
+        failure = self._failure("pattern:rl:config:GLOBAL:NULL:*", retry_count=1)
+
+        resolved = await CacheInvalidationManager(redis).retry_failed(self._session(failure))
+
+        assert resolved == 0
+        assert failure.resolved_at is None and failure.retry_count == 2
+
+    async def test_plain_key_failure_is_still_a_single_delete(self):
+        """대조군 — 일반 키는 예전처럼 그 키 하나를 지운다(SCAN 하지 않는다)."""
+        redis = AsyncMock()
+        redis.scan_iter = MagicMock()
+        redis.delete = AsyncMock()
+        failure = self._failure("ratelimit:config:user:u1")
+
+        assert await CacheInvalidationManager(redis).retry_failed(self._session(failure)) == 1
+        redis.delete.assert_awaited_once_with("ratelimit:config:user:u1")
+        redis.scan_iter.assert_not_called()

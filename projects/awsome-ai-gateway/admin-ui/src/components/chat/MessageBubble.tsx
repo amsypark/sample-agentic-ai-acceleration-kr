@@ -308,13 +308,20 @@ export function MessageBubble({ message, onPlanProceed, sessionId }: Props) {
         {/* 분석 결과 → 보고서 다운로드(서술 본문 + recharts 벡터 차트 + 데이터 표 +
             실행 SQL 부록). 화면에 보이는 것을 그대로 자체완결 HTML 로 모아 인쇄(PDF
             저장)한다 — 서버 왕복·데이터 재집계 없음, SVG 무손실 보존. */}
-        {(canExport || message.costUsd || message.durationMs) && (
+        {/* `!= null` 이어야 한다(truthy 아님). 진짜 0 — 캐시 히트만으로 끝난 턴의 `$0.0000`, 1ms 미만의
+            `0ms` — 이 truthy 가드에서는 값이 없는 것과 같게 접히고, `{0 && …}` 는 React 가 숫자 0 을 그대로
+            찍어 footer 자리에 "0" 이 홀로 남는다. "표시할 값이 없다" 와 "값이 0 이다" 는 다른 사실이다. */}
+        {(canExport || message.costUsd != null || message.durationMs != null) && (
           <div className="mt-3 flex items-center gap-3">
-            {(message.costUsd || message.durationMs) && (
+            {(message.costUsd != null || message.durationMs != null) && (
               <div className="text-[11px] text-muted-foreground/80">
-                {message.costUsd && <span>{t('costLabel', { amount: message.costUsd.toFixed(4) })}</span>}
-                {message.costUsd && message.durationMs && <span className="mx-2">·</span>}
-                {message.durationMs && <span>{message.durationMs}ms</span>}
+                {message.costUsd != null && (
+                  <span>{t('costLabel', { amount: message.costUsd.toFixed(4) })}</span>
+                )}
+                {message.costUsd != null && message.durationMs != null && (
+                  <span className="mx-2">·</span>
+                )}
+                {message.durationMs != null && <span>{message.durationMs}ms</span>}
               </div>
             )}
             {canExport && (

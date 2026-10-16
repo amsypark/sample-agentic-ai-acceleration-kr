@@ -1,0 +1,85 @@
+[
+  {
+    "id": "claude-opus-4-7",
+    "label": "claude-opus-4-7",
+    "scope": "GLOBAL",
+    "is_active": true,
+    "config": {
+      "target_id": "claude-opus-4-7",
+      "scope": "GLOBAL",
+      "rpm": null,
+      "tpm": 200000,
+      "cpm": null,
+      "cph": null
+    },
+    "children": [],
+    "inherited_from": null
+  },
+  {
+    "id": "claude-sonnet-4-6[1m]",
+    "label": "claude-sonnet-4-6[1m]",
+    "scope": "GLOBAL",
+    "is_active": true,
+    "config": null,
+    "children": [],
+    "inherited_from": null
+  },
+  {
+    "id": "11111111-1111-1111-1111-111111111111",
+    "label": "Platform",
+    "scope": "TEAM",
+    "is_active": true,
+    "config": {
+      "target_id": "11111111-1111-1111-1111-111111111111",
+      "scope": "TEAM",
+      "rpm": 100,
+      "tpm": 9000,
+      "cpm": "0.5000",
+      "cph": "12.3456"
+    },
+    "children": [
+      {
+        "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "label": "Alice",
+        "scope": "USER",
+        "is_active": true,
+        "config": {
+          "target_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "scope": "USER",
+          "rpm": 60,
+          "tpm": 1000,
+          "cpm": "0.5000",
+          "cph": "12.3456"
+        },
+        "children": [],
+        "inherited_from": null
+      },
+      {
+        "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "label": "Bob",
+        "scope": "USER",
+        "is_active": true,
+        "config": {
+          "target_id": "11111111-1111-1111-1111-111111111111",
+          "scope": "TEAM",
+          "rpm": 100,
+          "tpm": 9000,
+          "cpm": "0.5000",
+          "cph": "12.3456"
+        },
+        "children": [],
+        "inherited_from": "11111111-1111-1111-1111-111111111111"
+      }
+    ],
+    "inherited_from": null
+  },
+  {
+    "id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    "label": "Zoe",
+    "scope": "USER",
+    "is_active": true,
+    "config": null,
+    "children": [],
+    "inherited_from": null
+  }
+]

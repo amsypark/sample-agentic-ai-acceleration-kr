@@ -18,19 +18,29 @@ export function CognitoSyncButton() {
       const result = await syncCognitoAction();
       setConfirmOpen(false);
       if (result.success) {
-        const { groups_synced, users_created, users_updated, users_deactivated, errors } =
-          result.data;
+        const {
+          groups_synced,
+          users_created,
+          users_updated,
+          users_deactivated,
+          // 필드명은 `teams_deleted` 지만 팀은 삭제되지 않는다 — Cognito 그룹이 사라진 팀의 활성
+          // 멤버가 기본 팀으로 **이동**한 팀 수다(lib/actions/users.ts CognitoSyncSummary 주석).
+          teams_deleted,
+          errors,
+        } = result.data;
         const summary = [
           `그룹 ${groups_synced}개 동기화`,
           users_created > 0 ? `신규 ${users_created}명` : null,
           users_updated > 0 ? `업데이트 ${users_updated}명` : null,
           users_deactivated > 0 ? `비활성화 ${users_deactivated}명` : null,
+          teams_deleted > 0 ? `그룹이 사라진 팀 ${teams_deleted}개의 멤버를 기본 팀으로 이동` : null,
         ]
           .filter(Boolean)
           .join(', ');
 
         toast({
-          type: errors.length > 0 ? 'warning' : 'success',
+          // 팀 이동은 예산·허용 모델·레이트리밋 축이 바뀐 사건이라 성공 토스트로 흘려보내지 않는다.
+          type: errors.length > 0 || teams_deleted > 0 ? 'warning' : 'success',
           message: summary || '동기화 완료 (변경 없음)',
           auto_dismiss_ms: 5000,
         });

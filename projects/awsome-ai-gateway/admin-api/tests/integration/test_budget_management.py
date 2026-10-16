@@ -43,15 +43,20 @@ class TestAllocationExceedsTeamBudget:
         team_config.max_budget_usd = Decimal("100.00")
         team_config.policy = BudgetPolicy.HARD_BLOCK
 
-        with patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo:
+        members = [uuid.uuid4(), uuid.uuid4()]
+        with patch("app.services.budget_service.BudgetRepository") as MockBudgetRepo, patch(
+            "app.services.budget_service.UserRepository"
+        ) as MockUserRepo:
             MockBudgetRepo.return_value.get_active_config = AsyncMock(return_value=team_config)
+            # 두 사용자 모두 이 팀의 멤버다 — 이 테스트가 보려는 것은 합계 초과 판정이다.
+            MockUserRepo.return_value.team_member_ids = AsyncMock(return_value=set(members))
 
             resp = await client.put(
                 f"/admin/budgets/team/{team_id}/allocate",
                 json={
                     "allocations": [
-                        {"user_id": str(uuid.uuid4()), "allocated_usd": "60.00"},
-                        {"user_id": str(uuid.uuid4()), "allocated_usd": "60.00"},
+                        {"user_id": str(members[0]), "allocated_usd": "60.00"},
+                        {"user_id": str(members[1]), "allocated_usd": "60.00"},
                     ]
                 },
                 headers=admin_headers,
@@ -59,6 +64,28 @@ class TestAllocationExceedsTeamBudget:
 
         assert resp.status_code == 400
         assert "exceeds" in resp.json()["error"]["message"]
+
+
+class TestAllocationMembershipOverHttp:
+    async def test_leader_allocating_an_outsider_is_a_403(self, client: AsyncClient, leader_headers: dict):
+        """리더가 자기 팀 URL 로 팀 밖 사용자(mock DB: 멤버 0명)에게 배정하면 403."""
+        from tests.integration.conftest import ADMIN_TEAM_ID
+
+        resp = await client.put(
+            f"/admin/budgets/team/{ADMIN_TEAM_ID}/allocate",
+            json={"allocations": [{"user_id": str(uuid.uuid4()), "allocated_usd": "1.00"}]},
+            headers=leader_headers,
+        )
+        assert resp.status_code == 403, resp.text
+        assert "not members" in resp.json()["error"]["message"]
+
+    async def test_non_uuid_user_id_is_a_400(self, client: AsyncClient, admin_headers: dict):
+        resp = await client.put(
+            f"/admin/budgets/team/{uuid.uuid4()}/allocate",
+            json={"allocations": [{"user_id": "not-a-uuid", "allocated_usd": "1.00"}]},
+            headers=admin_headers,
+        )
+        assert resp.status_code == 400, resp.text
 
 
 class TestBudgetSummary:
@@ -106,3 +133,36 @@ class TestBudgetSummary:
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["summary"]) >= 1
+
+
+class TestDowngradeDisableBodyOverHttp:
+    """``PUT …/downgrade`` 의 끄기 본문은 규칙이 비어 있어도 받는다(예전: 422)."""
+
+    async def test_disable_with_empty_rules_is_accepted(self, client: AsyncClient, admin_headers: dict):
+        from app.schemas.budgets import AutoDowngradeConfigResponse
+
+        team_id = "66666666-6666-4666-8666-666666666666"
+        off = AutoDowngradeConfigResponse(scope="TEAM", scope_id=team_id, enabled=False, rules=[])
+        with patch("app.services.budget_service.DowngradePolicyRepository") as Rules, patch(
+            "app.services.budget_service.audit_logger"
+        ) as mock_audit, patch(
+            "app.services.budget_service.BudgetService.get_downgrade_config", AsyncMock(return_value=off)
+        ):
+            Rules.return_value.get_rules = AsyncMock(return_value=[])
+            Rules.return_value.delete_rules = AsyncMock(return_value=0)
+            mock_audit.log = AsyncMock()
+            resp = await client.put(
+                f"/admin/budgets/team/{team_id}/downgrade",
+                json={"enabled": False, "rules": []},
+                headers=admin_headers,
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["enabled"] is False
+
+    async def test_enable_with_empty_rules_is_still_422(self, client: AsyncClient, admin_headers: dict):
+        resp = await client.put(
+            "/admin/budgets/team/66666666-6666-4666-8666-666666666666/downgrade",
+            json={"enabled": True, "rules": []},
+            headers=admin_headers,
+        )
+        assert resp.status_code == 422, resp.text

@@ -198,6 +198,20 @@ def kst_day_range_filter(start_day: str, end_day: str) -> ColumnElement:
     return and_(UsageLog.requested_at >= start_utc, UsageLog.requested_at < end_utc)
 
 
+def cost_day_range_filter(start_day: str, end_day: str, *, success_only: bool = True) -> ColumnElement:
+    """`cost_period_filter` 의 일자 범위판 — KST [start_day, end_day] + (기본) SUCCESS 만.
+
+    /admin/analytics 의 `직접 입력` 범위(start_date/end_date)가 월 필터와 **같은 규약**
+    (§59: SUCCESS + KST, sargable)으로 집계되게 하는 단일 출처다. 범위 질의에서 한 집계만
+    `kst_day_range_filter` 에 SUCCESS 를 빠뜨리면 그 카드만 실패 호출 비용을 더해, 같은
+    화면 안에서 요약과 분해의 합계가 어긋난다.
+    """
+    conds: list[ColumnElement] = [kst_day_range_filter(start_day, end_day)]
+    if success_only:
+        conds.append(UsageLog.status == UsageStatus.SUCCESS)
+    return and_(*conds)
+
+
 def cost_period_filter(period: str, *, success_only: bool = True) -> ColumnElement:
     """비용 집계 표준 WHERE — KST 월 경계 + (기본) SUCCESS 만.
 

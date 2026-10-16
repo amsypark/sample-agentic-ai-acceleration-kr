@@ -43,6 +43,17 @@ class ModelRepository:
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_alias_names(self, *, status: ModelStatus | None = None) -> list[str]:
+        """alias 문자열만 (정렬됨). rate-limit 트리의 GLOBAL 루트 목록용.
+
+        `list_all()` 은 행 전체(가격 관계 포함)를 읽는다 — 트리는 이름만 쓰므로 컬럼 하나만 읽는다.
+        """
+        stmt = select(ModelAlias.alias).order_by(ModelAlias.alias)
+        if status is not None:
+            stmt = stmt.where(ModelAlias.status == status)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
     async def update_model(self, alias: str, **kwargs) -> ModelAlias | None:
         model = await self.get_by_alias(alias)
         if model is None:

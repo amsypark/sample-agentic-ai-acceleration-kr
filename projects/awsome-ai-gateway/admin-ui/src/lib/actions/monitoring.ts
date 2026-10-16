@@ -19,9 +19,20 @@ export interface MonitoringOverviewResponse {
   };
 }
 
+/**
+ * `GET /admin/monitoring/models` 의 상태 열. `string` 이 아니라 닫힌 유니온이어야 한다 — 서버가 새
+ * 값을 추가하면 타입 검사에서 걸려 배지 톤 표를 함께 늘리게 된다. `string` 이던 동안 이 열은 서버가
+ * 리터럴 `"ACTIVE"` 를 박아 보내는 것을 아무도 눈치채지 못한 자리였다(항상 초록 = 정보량 0).
+ *
+ *  - ACTIVE / INACTIVE : `model.model_aliases.status` 의 실제 값
+ *  - UNREGISTERED      : 등록부에 없는 alias 인데 최근 1시간 트래픽에 있음
+ *                        (usage_logs.model_alias 는 FK 없는 free-text 컬럼)
+ */
+export type MonitoringModelStatus = 'ACTIVE' | 'INACTIVE' | 'UNREGISTERED';
+
 export interface MonitoringModelItem {
   alias: string;
-  status: string;
+  status: MonitoringModelStatus;
   last_1h_requests: number;
   avg_latency_ms: number;
   error_rate_pct: number;

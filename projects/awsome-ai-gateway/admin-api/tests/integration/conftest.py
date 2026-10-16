@@ -155,6 +155,7 @@ async def _mock_get_db_session(request: Request):
     session.get = AsyncMock(return_value=None)
     session.add = MagicMock()
     session.flush = AsyncMock()
+    session.info = {}  # 실물처럼 dict — 커밋 뒤 캐시 무효화 대기열(RateLimitService)
 
     open_tx = {"value": True}
     session.in_transaction = MagicMock(side_effect=lambda: open_tx["value"])

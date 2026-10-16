@@ -49,6 +49,17 @@ export function toKoreanMonthLabel(p: string): string {
 }
 
 /**
+ * 'YYYY-MM' → 콘솔 로케일의 월 이름(ko '2026년 8월', en 'August 2026').
+ * 그 달 1일의 UTC 자정으로 만들고 UTC 로 포맷한다 — 로컬 시간대로 포맷하면 음수 오프셋에서 전월이 된다.
+ */
+export function formatMonthLabel(p: string, locale: string): string {
+  const [y, m] = p.split('-').map(Number);
+  return new Intl.DateTimeFormat(locale, { year: 'numeric', month: 'long', timeZone: 'UTC' }).format(
+    new Date(Date.UTC(y, m - 1, 1)),
+  );
+}
+
+/**
  * 절대 월을 상대 레이블로. 이번 달/지난 달이면 그 레이블, 아니면 'YYYY년 M월'.
  * 시간이 흘러도(7월·8월…) 안정적인 표기.
  */

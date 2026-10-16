@@ -709,14 +709,30 @@ Request body:
 |--------|------|------|
 | GET | `/admin/rate-limits/tree` | 계층 트리 |
 | PUT | `/admin/rate-limits/user/{user_id}` | 사용자 RL 설정 |
+| DELETE | `/admin/rate-limits/user/{user_id}` | 사용자 개인 RL 제거 — 팀이 있으면 팀 RL 을 다시 상속하고, 팀이 없으면 개인 한도 없이 GLOBAL 만 남는다 |
 | PUT | `/admin/rate-limits/team/{team_id}` | 팀 RL 설정 |
-| PUT | `/admin/rate-limits/global/{model}` | 글로벌 RL 설정 |
+| PUT | `/admin/rate-limits/global/{model}` | 글로벌 RL 설정 (`?release_alias=` — 아래 참고) |
+
+Rate Limit API 는 모두 **ADMIN 전용**이다(개인 RL 제거 포함). TEAM_LEADER 와 DEVELOPER 는 403 이다.
 
 Request body:
 ```jsonc
 // PUT /admin/rate-limits/{scope}/{id}  (모든 필드 선택 — null이면 해당 메트릭 미적용)
 { "rpm": 30, "tpm": 100000, "cpm": null, "cph": null }
 ```
+
+> ⚠️ **GLOBAL 한도는 한 번에 한 모델만 가질 수 있습니다.** 한 모델에 저장하면 다른 모델의 GLOBAL 한도가 해제됩니다.
+> 그래서 다른 모델이 실제 한도(rpm 또는 tpm)를 갖고 있으면 `PUT /admin/rate-limits/global/{model}` 은 **409** 를 돌려줍니다.
+> 해제에 동의하려면 현재 주인의 alias 를 쿼리로 넘깁니다.
+>
+> ```
+> PUT /admin/rate-limits/global/claude-opus?release_alias=claude-sonnet
+> ```
+>
+> - 확인한 뒤 다른 운영자가 주인을 바꿨다면(`release_alias` 가 현재 주인과 다르면) 다시 409 입니다.
+> - 같은 모델을 다시 저장할 때, 주인이 없을 때, 주인의 rpm·tpm 이 모두 비어 있을 때는 `release_alias` 없이도 200 입니다.
+> - 해제된 한도는 감사 로그의 `released` 에 남습니다. 콘솔은 저장 전에 해제될 한도를 보여 주고 확인을 받습니다.
+> - alias 에 `/` 나 `[1m]` 이 들어 있어도 됩니다. 경로에 넣을 때 URL 인코딩합니다.
 
 ### 키 관리
 

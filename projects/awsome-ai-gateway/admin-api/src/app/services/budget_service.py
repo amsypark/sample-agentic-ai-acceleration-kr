@@ -166,11 +166,18 @@ class BudgetService:
 
                 # Per-app seed must also refresh the total key (client=None) so
                 # enforcement sees the correct aggregate.
+                # ⚠️ 그 사용자 행 전부를 더하면 안 된다. 총합 행(client NULL)은 앱별 지출을 **이미 포함한다**
+                #    (cost-recorder-worker 가 총합 행과 앱별 행을 둘 다 쓴다). 예전엔 SUM 전부라 총액 → 앱 순서로
+                #    시드하면 앱 지출이 두 번 들어갔고(100 + 30 = 130) 게이트웨이가 개인 예산을 일찍 막았다.
+                #    총합 행이 있으면 그 값(게이트웨이가 키를 잃었을 때 DB 에서 복원하는 값과 같다), 없으면 시드된
+                #    앱별 행의 합이다.
                 if client is not None and scope == "USER":
                     from sqlalchemy import text as sa_text
                     total_row = await session.execute(
                         sa_text(
-                            "SELECT COALESCE(SUM(used_usd), 0) "
+                            "SELECT COALESCE("
+                            "MAX(used_usd) FILTER (WHERE client IS NULL), "
+                            "SUM(used_usd) FILTER (WHERE client IS NOT NULL), 0) "
                             "FROM budget.budget_usages "
                             "WHERE scope = 'USER' AND scope_id = :sid AND period = :period"
                         ),
@@ -277,8 +284,10 @@ class BudgetService:
             raise NotFoundError("User", str(user_id))
 
         # BR-BUD-03: Team leader can only set budgets for own team
+        # ⚠️ 팀 없는 리더(actor.team_id None)는 누구의 예산도 다루지 못한다. `user.team_id != actor.team_id`
+        #    만 보면 팀 없는 사용자에게는 None != None → False 라 통과했다. 아래 앱별 예산 3곳도 같은 규칙이다.
         if actor.role == UserRole.TEAM_LEADER:
-            if user.team_id != actor.team_id:
+            if actor.team_id is None or user.team_id != actor.team_id:
                 raise ForbiddenError("Team leaders can only set budgets for their own team members")
 
         # BR-BUD-01: Validate member budget sum <= team budget
@@ -395,9 +404,9 @@ class BudgetService:
         if user is None:
             raise NotFoundError("User", str(user_id))
 
-        # BR-BUD-03: Team leaders can only set budgets for their own team members.
+        # BR-BUD-03: Team leaders can only set budgets for their own team members (팀 없는 리더는 불가 — set_user_budget).
         if actor.role == UserRole.TEAM_LEADER:
-            if user.team_id != actor.team_id:
+            if actor.team_id is None or user.team_id != actor.team_id:
                 raise ForbiddenError("Team leaders can only set budgets for their own team members")
 
         from app.services.user_allowed_client_service import UserAllowedClientService
@@ -497,7 +506,7 @@ class BudgetService:
         if user is None:
             raise NotFoundError("User", str(user_id))
         if actor.role == UserRole.TEAM_LEADER:
-            if user.team_id != actor.team_id:
+            if actor.team_id is None or user.team_id != actor.team_id:  # 팀 없는 리더는 불가 — set_user_budget
                 raise ForbiddenError("Team leaders can only set budgets for their own team members")
 
         repo = BudgetRepository(session)
@@ -548,7 +557,8 @@ class BudgetService:
         user = await user_repo.get_user(user_id)
         if user is None:
             raise NotFoundError("User", str(user_id))
-        if actor.role == UserRole.TEAM_LEADER and user.team_id != actor.team_id:
+        # 팀 없는 리더는 불가 — set_user_budget 의 ⚠️ 참조(None != None 은 False).
+        if actor.role == UserRole.TEAM_LEADER and (actor.team_id is None or user.team_id != actor.team_id):
             raise ForbiddenError("Team leaders can only read budgets for their own team members")
 
         repo = BudgetRepository(session)
@@ -577,6 +587,26 @@ class BudgetService:
         if actor.role == UserRole.TEAM_LEADER and actor.team_id != team_id:
             raise ForbiddenError("Team leaders can only allocate budgets within their own team")
 
+        # ⚠️ 배정 대상이 **이 팀의 멤버인지** 확인한다. 위 검사는 URL 의 team_id 만 본다 — 본문의
+        #    user_id 는 아무 사용자나 될 수 있었고, 아래 루프가 그 사용자의 개인 예산 행을 그대로
+        #    덮어썼다. 즉 TEAM_LEADER 가 자기 팀 URL 로 **다른 팀(또는 팀 없는) 사용자의 예산**을
+        #    마음대로 바꿀 수 있었다(예: 남의 한도를 0 으로 만들어 차단, 자기 사람에게 무제한).
+        #    UUID 가 아닌 user_id 는 예전엔 uuid.UUID 의 ValueError 로 500 이었다 → 400.
+        user_ids: list[uuid.UUID] = []
+        for alloc in data.allocations:
+            try:
+                user_ids.append(uuid.UUID(alloc.user_id))
+            except ValueError:
+                raise ValidationError(f"Invalid user_id: {alloc.user_id!r}") from None
+        members = await UserRepository(session).team_member_ids(team_id, user_ids)
+        outsiders = sorted(str(u) for u in user_ids if u not in members)
+        if outsiders:
+            message = f"Users are not members of team {team_id}: {', '.join(outsiders)}"
+            # 리더에게는 권한 문제(403), 관리자에게는 잘못된 요청(400)이다 — 어느 쪽도 쓰지 않는다.
+            if actor.role == UserRole.TEAM_LEADER:
+                raise ForbiddenError(message)
+            raise ValidationError(message)
+
         repo = BudgetRepository(session)
         team_config = await repo.get_active_config(BudgetScope.TEAM, team_id)
         if team_config is None:
@@ -591,8 +621,7 @@ class BudgetService:
 
         # Batch upsert user budgets
         cache_keys: list[str] = []
-        for alloc in data.allocations:
-            uid = uuid.UUID(alloc.user_id)
+        for alloc, uid in zip(data.allocations, user_ids):
             config = BudgetConfig(
                 id=uuid.uuid4(),
                 scope=BudgetScope.USER,
@@ -630,7 +659,14 @@ class BudgetService:
         *,
         team_id: uuid.UUID,
         period: str,
+        actor: CurrentUser,
     ) -> TeamBudgetAllocation | None:
+        # BR-BUD-03: 리더는 자기 팀의 배정만 본다(팀 없는 리더는 어느 팀도 — set_user_budget 의 ⚠️).
+        # ⚠️ 이 검사가 없었다. 라우트는 require_admin_or_team_leader 뿐이라 리더가 다른 팀 UUID 로 그 팀의
+        #    총액·멤버 이름·개인 배정액·사용액을 읽었다. 팀 존재 여부보다 먼저 거른다(남의 팀 UUID 탐색 방지).
+        if actor.role == UserRole.TEAM_LEADER and (actor.team_id is None or actor.team_id != team_id):
+            raise ForbiddenError("Team leaders can only view their own team's allocation")
+
         user_repo = UserRepository(session)
         team = await user_repo.get_team(team_id)
         if team is None:
@@ -700,6 +736,7 @@ class BudgetService:
         scope: str | None = None,
         target_id: uuid.UUID | None = None,
         period: str,
+        actor: CurrentUser,
     ) -> BudgetSummaryResponse:
         if not re.match(r'^\d{4}-\d{2}$', period):
             raise ValidationError(f"Invalid period format: {period}. Expected YYYY-MM")
@@ -723,6 +760,14 @@ class BudgetService:
         #    정렬 키(created_at)와 커서 키(id)가 달라 행을 건너뛴다. 전수 조회를 쓴다.
         users = await user_repo.iter_all_users()
         teams = await user_repo.list_all_teams()
+        # ⚠️ TEAM_LEADER 는 자기 팀과 그 멤버만 본다. 이 필터가 없어서 리더가 전사 요약(다른 팀의 한도·사용액,
+        #    다른 팀 사용자 이름·개인 예산, 팀 없는 사용자)을 받았다. 403 이 아니라 걸러서 준다 — 리더 화면
+        #    (/budgets, 대시보드 팀 순위)이 이 응답을 쓰고 자기 팀 행은 그대로 필요하다. 팀 없는 리더는 빈 요약
+        #    (None == None 으로 팀 없는 사용자가 섞이지 않게 actor.team_id 부터 본다).
+        if actor.role == UserRole.TEAM_LEADER:
+            own_team = actor.team_id
+            users = [u for u in users if own_team is not None and getattr(u, "team_id", None) == own_team]
+            teams = [t for t in teams if own_team is not None and t.id == own_team]
 
         # team_id(str) → (dept_id, dept_name). teams are loaded with
         # selectinload(Team.department), so this needs no extra query.
@@ -1031,7 +1076,20 @@ class BudgetService:
         *,
         scope: BudgetScope,
         scope_id: uuid.UUID,
+        actor: CurrentUser,
     ) -> AutoDowngradeConfigResponse:
+        # BR-BUD-03: 리더는 자기 팀(TEAM)과 자기 팀 멤버(USER)의 규칙만 읽는다. 팀 없는 리더는 아무것도.
+        # ⚠️ 이 검사가 없었다 — 리더가 다른 팀·다른 팀 사용자의 자동 하향 규칙을 읽었다.
+        if actor.role == UserRole.TEAM_LEADER:
+            own_team = actor.team_id
+            if scope == BudgetScope.TEAM:
+                allowed = own_team is not None and scope_id == own_team
+            else:
+                member = await UserRepository(session).get_user(scope_id)
+                allowed = own_team is not None and member is not None and member.team_id == own_team
+            if not allowed:
+                raise ForbiddenError("Team leaders can only view downgrade rules for their own team")
+
         rule_repo = DowngradePolicyRepository(session)
         rules = await rule_repo.get_rules(scope, scope_id)
 
@@ -1064,6 +1122,46 @@ class BudgetService:
         request_id: str = "",
     ) -> AutoDowngradeConfigResponse:
         from app.repositories.model_repository import ModelRepository
+
+        # ⚠️ ``enabled: False`` 는 "자동 하향 끄기" 다. budget.downgrade_policies 에는 enabled 컬럼이
+        #    없고 "꺼짐" 의 유일한 표현은 활성 행이 없는 것이다. 예전에는 이 플래그를 감사 로그의
+        #    after 에만 적고 규칙은 전부 is_active=True 로 다시 썼다 — 체크를 끄고 저장한 운영자는
+        #    200 + 성공 토스트를 받았지만 gateway-proxy 는 임계값에서 계속 모델을 바꿔치기했고, 감사
+        #    기록은 DB 와 반대(enabled:false)를 주장했다. 그래서 삭제 경로로 단축한다. alias/provider/
+        #    예산 검증은 일부러 하지 않는다 — 저장해 둔 alias 가 나중에 무효가 됐거나 예산 행이
+        #    지워졌어도 기능을 **끌 수는** 있어야 한다.
+        if not data.enabled:
+            rule_repo = DowngradePolicyRepository(session)
+            # 끈 뒤에는 활성 규칙이 DB 에 남지 않는다 — 무엇을 껐는지는 감사 기록(before)에만 남는다.
+            removed_rules = await rule_repo.get_rules(scope, scope_id)
+            deactivated = await rule_repo.delete_rules(scope, scope_id)
+            cache_key = f"budget:downgrade:{scope.value.lower()}:{scope_id}"
+            await self._cache_mgr.invalidate([cache_key], session=session)
+            await audit_logger.log(
+                session,
+                actor_user_id=actor.user_id,
+                actor_role=actor.role.value,
+                action="SET_AUTO_DOWNGRADE",
+                resource_type="DowngradePolicy",
+                resource_id=str(scope_id),
+                # 요청 echo 가 아니라 **실제로 남긴 상태**를 기록한다.
+                changes={
+                    "before": {
+                        "rules": [
+                            {
+                                "from_model_alias": r.from_model_alias,
+                                "to_model_alias": r.to_model_alias,
+                                "threshold_pct": r.threshold_pct,
+                            }
+                            for r in removed_rules
+                        ]
+                    },
+                    "after": {"enabled": False, "rules": [], "deactivated": deactivated},
+                },
+                ip_address=ip_address,
+                request_id=request_id,
+            )
+            return await self.get_downgrade_config(session, scope=scope, scope_id=scope_id, actor=actor)
 
         model_repo = ModelRepository(session)
         all_aliases = {alias for rule in data.rules for alias in (rule.from_model_alias, rule.to_model_alias)}
@@ -1147,7 +1245,7 @@ class BudgetService:
             request_id=request_id,
         )
 
-        return await self.get_downgrade_config(session, scope=scope, scope_id=scope_id)
+        return await self.get_downgrade_config(session, scope=scope, scope_id=scope_id, actor=actor)
 
     async def delete_downgrade_config(
         self,

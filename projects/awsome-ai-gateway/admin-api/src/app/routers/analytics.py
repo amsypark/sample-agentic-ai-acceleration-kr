@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import timedelta
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import Response
@@ -22,19 +22,35 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/analytics", tags=["Analytics"])
 
+#: scope 의 허용 형태 — 화면 라우트와 export 가 **같은** 집합을 쓴다.
+_SCOPE_PATTERN = r"^(all|team:[0-9a-fA-F-]{36})$"
+
 #: /admin/analytics 응답 캐시 TTL(초). dashboard 와 같은 값이지만 정책이 달라 별도로 둔다
 #: (여기는 ADMIN + scope='all' 에만 캐시한다 — 아래 get_analytics 주석 참조).
 _ANALYTICS_CACHE_TTL = 30
 
 
-def _analytics_cache_key(*, period: str, group_by: str) -> str:
+def _analytics_cache_key(
+    *,
+    period: str,
+    group_by: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> str:
     """전사(ADMIN, scope='all') 응답 전용 캐시 키.
 
     ⚠️ scope 를 키에 넣지 않는다 — 이 키는 `scope='all'` 인 경우에만 쓰이므로 상수다.
     대신 **호출부가 role 을 검사**해 ADMIN 이 아니면 캐시를 아예 쓰지 않는다.
     키에 scope 만 넣고 role 을 빼면 TEAM_LEADER 가 ADMIN 의 전사 응답을 받는다.
+
+    ⚠️ 반대로 응답을 바꾸는 **나머지 모든** 파라미터는 키에 들어가야 한다. 일자 범위를 빼면
+    TTL(30초) 동안 다른 범위를 골라도 앞 범위의 숫자가 그대로 나간다 — 범위를 바꿔도 화면이
+    안 바뀐다. 월 질의(범위 없음)의 키 모양은 예전 그대로다.
     """
-    return f"analytics:global:{period}:{group_by}"
+    key = f"analytics:global:{period}:{group_by}"
+    if start_date or end_date:
+        key += f":{start_date or ''}:{end_date or ''}"
+    return key
 
 
 async def _cache_get(request: Request, key: str):
@@ -70,7 +86,18 @@ async def get_analytics(
     #    조용히 by_model 응답이 돌아왔다(쓰레기 값과 바이트 단위로 동일 = 무증상 오답).
     #    이 Literal 집합은 admin-ui/src/types/enums.ts 의 GroupByType 과 일치한다.
     group_by: Literal["model", "team", "user"] = Query("model"),
-    scope: str = Query("all", description="all | team:{uuid}"),
+    # ⚠️ scope 는 닫힌 집합이다 — 그 밖의 값은 422. 예전엔 자유 문자열이라 'xyz' 같은 값이
+    #    서비스의 어느 분기도 타지 않고 전사 범위로 떨어졌다(서비스도 스스로 400 으로 닫는다).
+    scope: str = Query("all", description="all | team:{uuid}", pattern=_SCOPE_PATTERN),
+    # ⚠️ 날짜 범위는 Annotated 로 선언한다 — 기본값이 진짜 None 이라 라우트 함수를 직접
+    #    부르는 회귀 테스트(test_critical_analytics_cache_role_isolation)가 FieldInfo 객체를
+    #    받지 않는다. 둘 다 주면 그 KST 일자 범위만 집계하고, 한쪽만 주면 400 이다.
+    start_date: Annotated[
+        str | None, Query(description="YYYY-MM-DD (KST). end_date 와 함께 주면 그 일자 범위만 집계")
+    ] = None,
+    end_date: Annotated[
+        str | None, Query(description="YYYY-MM-DD (KST). start_date 와 함께 주면 그 일자 범위만 집계")
+    ] = None,
     user: CurrentUser = Depends(require_admin_or_team_leader),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -94,7 +121,9 @@ async def get_analytics(
     #      team_id 까지 넣어야 하고 그러면 적중률이 거의 0 이다 — 복잡도만 늘고 이득이 없다.
     cache_key = None
     if user.role == UserRole.ADMIN and scope == "all":
-        cache_key = _analytics_cache_key(period=period, group_by=group_by)
+        cache_key = _analytics_cache_key(
+            period=period, group_by=group_by, start_date=start_date, end_date=end_date
+        )
         if (cached := await _cache_get(request, cache_key)) is not None:
             return cached
 
@@ -103,6 +132,8 @@ async def get_analytics(
         period=period,
         group_by=group_by,
         scope=scope,
+        start_date=start_date,
+        end_date=end_date,
         actor=user,
     )
     if cache_key is not None:
@@ -201,19 +232,34 @@ async def export_analytics(
     format: Literal["csv", "json"] = Query("csv"),
     period: str = Query(description="YYYY-MM format"),
     group_by: Literal["model", "team", "user"] = Query("model"),
+    # ⚠️ 이 라우트의 쿼리 파라미터는 `GET /admin/analytics` 의 **상위집합**이어야 한다
+    #    (tests/unit/test_analytics_query_param_parity.py 가 강제). 화면이 받는 필터를 export 가
+    #    못 받으면 FastAPI 가 그 파라미터를 422 없이 버리므로, 운영자는 화면과 다른 데이터셋을
+    #    조용히 내려받는다(예전엔 scope 와 범위가 그렇게 빠져 있었다).
+    scope: str = Query("all", description="all | team:{uuid}", pattern=_SCOPE_PATTERN),
+    start_date: Annotated[str | None, Query(description="YYYY-MM-DD (KST). end_date 와 함께")] = None,
+    end_date: Annotated[str | None, Query(description="YYYY-MM-DD (KST). start_date 와 함께")] = None,
     user: CurrentUser = Depends(require_admin_or_team_leader),
     session: AsyncSession = Depends(get_db_session),
 ):
+    from app.services.analytics_service import AnalyticsService
+
     svc: AnalyticsService = request.app.state.analytics_service
     content, content_type = await svc.export_analytics(
         session,
         format=format,
         period=period,
         group_by=group_by,
+        scope=scope,
+        start_date=start_date,
+        end_date=end_date,
         actor=user,
     )
 
-    filename = f"analytics_{period}.{format}"
+    # 파일명도 실제 구간을 말한다 — 범위 내보내기가 월 이름으로만 저장되면 나중에 그 파일이
+    # 5일치인지 한 달치인지 알 수 없다(서비스가 범위를 검증한 뒤이므로 값은 YYYY-MM-DD 다).
+    span = f"{start_date}_{end_date}" if start_date and end_date else period
+    filename = f"analytics_{span}.{format}"
     return Response(
         content=content,
         media_type=content_type,

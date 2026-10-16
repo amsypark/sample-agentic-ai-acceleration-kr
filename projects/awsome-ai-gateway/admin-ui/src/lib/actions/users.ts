@@ -149,25 +149,24 @@ export async function forceReauthTeamAction(
 
 // ─── syncCognitoAction ─────────────────────────────────────────────────────
 // Cognito User Pool 에서 그룹/사용자를 가져와 DB 동기화.
+//
+// `teams_deleted` 는 서버가 늘 보내던 여섯 번째 카운터인데(admin-api routers/users.py) 여기 타입에
+// 없어서 화면까지 오지 못했다. 이름과 달리 팀 행은 삭제되지 않는다 — Cognito 그룹이 사라진 팀의
+// **활성 멤버 전원이 기본 팀으로 이동**하고 그 팀 수를 센다(services/cognito_sync_service.py 5단계).
+// 이동한 사용자는 팀 예산·허용 모델·레이트리밋이 전부 기본 팀 것으로 바뀌므로 보고해야 한다.
+export type CognitoSyncSummary = {
+  groups_synced: number;
+  users_created: number;
+  users_updated: number;
+  users_deactivated: number;
+  teams_deleted: number;
+  errors: string[];
+};
 
-export async function syncCognitoAction(): Promise<
-  ActionResult<{
-    groups_synced: number;
-    users_created: number;
-    users_updated: number;
-    users_deactivated: number;
-    errors: string[];
-  }>
-> {
+export async function syncCognitoAction(): Promise<ActionResult<CognitoSyncSummary>> {
   try {
     const res = await withRetry(() =>
-      adminAPI.post<{
-        groups_synced: number;
-        users_created: number;
-        users_updated: number;
-        users_deactivated: number;
-        errors: string[];
-      }>('/admin/users/sync-cognito', {})
+      adminAPI.post<CognitoSyncSummary>('/admin/users/sync-cognito', {})
     );
     revalidatePath('/users');
     return { success: true, data: res };

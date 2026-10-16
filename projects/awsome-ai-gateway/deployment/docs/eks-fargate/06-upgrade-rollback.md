@@ -69,6 +69,26 @@ kubectl get pods -n llm-gateway -l app.kubernetes.io/component=gateway-proxy -w
 
 `Terminating` → 새 `Pending` → `Running` 순서로 하나씩 교체.
 
+### 1.5 서비스 간 배포 순서 — admin-api 먼저
+
+admin-api 와 admin-ui 가 함께 바뀌면 **admin-api 를 먼저** 올린다. helm 한 번의 `upgrade` 로 둘을 같이
+올려도 롤링 동안 몇 분은 두 버전이 섞인다 — 새 admin-api × 이전 admin-ui, 이전 admin-api × 새 admin-ui 가
+모두 생긴다. 그래서 admin-api 응답은 **더하기만** 한다.
+
+- 이전 admin-ui 가 읽는 필드는 이름·타입·의미를 그대로 둔다. 새 의미는 새 필드로 낸다.
+- admin-ui 는 새 필드가 없는 응답(이전 admin-api)에서도 동작하고, 없는 필드에서 거부·차단 같은 상태를
+  추론하지 않는다.
+
+예: `GET /admin/my/budget` 은 개인 예산이 없어도 예전처럼 `limit_usd: 0` · `policy: "HARD_BLOCK"` ·
+`usage_pct: 0` 을 보내고, '미설정' 은 더한 필드 `budget.configured` 로만 알린다. 한때 이 값들을 `null` 로
+바꿨더니 admin-api 를 먼저 올린 동안 이전 카드가 `null.toFixed()` 로 죽었고(미설정·$0 사용자), 반대 순서에서는
+새 카드가 기본 상태의 모든 사용자에게 "$0 → 차단" 을 그렸다. 두 방향을 테스트가 고정한다.
+
+- admin-api `tests/unit/test_my_budget_wire_fixture.py` — 이전 카드가 `.toFixed()` 하는 값이 모든 상태에서
+  숫자이고, main 이 알던 상태에서는 main 과 같은 값이다.
+- admin-ui `tests/unit/components/MyBudgetCard.test.tsx` — 새 카드를 main 의 실제 응답
+  (`tests/fixtures/my-budget.json` 의 `main`)으로 그린다.
+
 ---
 
 ## 2. values/config 변경 (코드 동일)
@@ -147,6 +167,8 @@ helm rollback llm-gateway 1 -n llm-gateway --wait --timeout 10m
   - **해결**: 마이그레이션은 반드시 **backward-compatible** 하게. 컬럼 추가는 nullable, 삭제는 2단계 (코드에서 use 중단 → 다음 릴리즈에서 drop)
 - **Secret 스키마가 바뀐 경우**: 구 이미지가 parse 못 함
   - **해결**: Secret 키는 추가만 하고 제거는 2단계
+- **API 응답 모양이 바뀐 경우**: admin-api 만 되돌리면 새 admin-ui × 이전 admin-api 가 된다
+  - **해결**: 응답은 더하기만 하고, admin-ui 는 새 필드가 없는 응답에서도 동작하게 만든다(위 1.5)
 
 ### 4.3 강제 롤백 (긴급)
 
