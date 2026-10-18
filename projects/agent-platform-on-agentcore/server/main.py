@@ -59,6 +59,9 @@ async def lifespan(app: FastAPI):
         logger.info("Insights collector started (every %ss)", COLLECTOR_INTERVAL_SECONDS)
     elif COLLECTOR_ENABLED:
         logger.warning("COLLECTOR_ENABLED but USAGE_TABLE is unset; collector not started")
+    heartbeat = None
+    if streaming_service.run_broker.leases is not None:
+        heartbeat = asyncio.create_task(streaming_service.run_broker.heartbeat_forever())
     try:
         yield
     finally:
@@ -66,6 +69,8 @@ async def lifespan(app: FastAPI):
         # Each run's generator writes `interrupted` on cancellation, so a
         # redeploy leaves no thread stuck on `busy` with nothing behind it.
         await streaming_service.run_broker.shutdown()
+        if heartbeat is not None:
+            heartbeat.cancel()
         if task is not None:
             task.cancel()
 

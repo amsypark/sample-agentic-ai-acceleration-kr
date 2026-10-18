@@ -248,7 +248,9 @@ def _member_counts() -> Optional[Dict[str, int]]:
 # 60 s, then stale for up to 15 min while one background read replaces it, so a
 # polling page costs at most one computation a minute however many admins watch.
 # A write that changes the figures (a rate registered or removed) clears it.
-_DASHBOARDS = StaleWhileRevalidate(fresh_seconds=60, max_age_seconds=900)
+# Bounded: record_insights is keyed by a record id any signed-in user may send,
+# and every key carries the date, so without a cap the map only ever grew.
+_DASHBOARDS = StaleWhileRevalidate(fresh_seconds=60, max_age_seconds=900, max_entries=256)
 # The reader a shared computation runs as: the admin view, which the route then
 # narrows for the caller (record_insights hides owners from non-admins).
 _DASHBOARD_READER = AuthUser(sub="", username="insights-dashboard", role="admin")
@@ -310,8 +312,16 @@ def _window(days: int) -> Dict[str, Any]:
     and none of them had. The half-window delta was comparing a fraction of today
     against whole days and reporting the shortfall as a decline in usage.
     """
-    days = days if days in SUPPORTED_DAYS else max(SUPPORTED_DAYS)
-    return clock.window(days)
+    return clock.window(_supported_days(days))
+
+
+# Agents listed per person in /insights/users; the rest are a count and a sum.
+USER_AGENTS_SHOWN = 10
+
+
+def _supported_days(days: int) -> int:
+    """The window length a request actually gets: one of SUPPORTED_DAYS."""
+    return days if days in SUPPORTED_DAYS else max(SUPPORTED_DAYS)
 
 
 def _window_fields(window: Dict[str, Any]) -> Dict[str, Any]:
@@ -878,7 +888,7 @@ def summary(
 ) -> Dict[str, Any]:
     _require_admin(user)
     return _dashboard(
-        ("summary", days, clock.today()),
+        ("summary", _supported_days(days), clock.today()),
         lambda: _compute_summary(days=days, user=_DASHBOARD_READER),
     )
 
@@ -1160,7 +1170,7 @@ def telemetry(
 ) -> Dict[str, Any]:
     _require_admin(user)
     return _dashboard(
-        ("telemetry", days, clock.today()),
+        ("telemetry", _supported_days(days), clock.today()),
         lambda: _compute_telemetry(days=days, user=_DASHBOARD_READER),
     )
 
@@ -1304,7 +1314,7 @@ def composition(
 ) -> Dict[str, Any]:
     _require_admin(user)
     return _dashboard(
-        ("composition", days, clock.today()),
+        ("composition", _supported_days(days), clock.today()),
         lambda: _compute_composition(days=days, user=_DASHBOARD_READER),
     )
 
@@ -1369,7 +1379,7 @@ def user_leaderboard(
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required.")
     return _dashboard(
-        ("user_leaderboard", days, clock.today()),
+        ("user_leaderboard", _supported_days(days), clock.today()),
         lambda: _compute_user_leaderboard(days=days, user=_DASHBOARD_READER),
     )
 
@@ -1457,7 +1467,12 @@ def _compute_user_leaderboard(
         )
         rows.append({
             "sub": sub,
-            "agents": agents,
+            # The most-used few, plus what the rest add up to. Every agent of
+            # every person made the response 3.8 MB at 1,000 people (bst,
+            # 2026-10-18) for a table that shows one name and a count.
+            "agents": agents[:USER_AGENTS_SHOWN],
+            "agents_total": len(agents),
+            "other_agent_turns": sum(entry["turns"] for entry in agents[USER_AGENTS_SHOWN:]),
             "active_days": len(per_day.get(sub, {})),
             # The person's own days, sparse and oldest first, for the drill-down
             # a row click opens. Read with `by_day` above, so it is free.
@@ -1556,7 +1571,7 @@ def team_insights(days: int = Query(7), user: AuthUser = Depends(current_user)) 
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required.")
     return _dashboard(
-        ("team_insights", days, clock.today()),
+        ("team_insights", _supported_days(days), clock.today()),
         lambda: _compute_team_insights(days=days, user=_DASHBOARD_READER),
     )
 
@@ -2095,13 +2110,24 @@ def record_insights(
     user: AuthUser = Depends(current_user),
 ) -> Dict[str, Any]:
     out = _dashboard(
-        ("record_insights", record_id, days, clock.today()),
+        ("record_insights", record_id, _supported_days(days), clock.today()),
         lambda: _compute_record_insights(record_id=record_id, days=days, user=_DASHBOARD_READER),
     )
     if not user.is_admin:
-        # Computed once for everyone, as an admin sees it; only an admin sees
-        # other people's turns by owner.
-        out = {**out, "turns": [{**turn, "owner_sub": None} for turn in out.get("turns", [])]}
+        # Computed once for everyone, as an admin sees it. A record's counters
+        # are public; whose turn each was, and which thread it ran in, is not —
+        # a non-admin keeps the thread only on their own turns.
+        out = {
+            **out,
+            "turns": [
+                {
+                    **turn,
+                    "owner_sub": None,
+                    "thread_id": turn.get("thread_id") if turn.get("owner_sub") == user.sub else None,
+                }
+                for turn in out.get("turns", [])
+            ],
+        }
     return out
 
 

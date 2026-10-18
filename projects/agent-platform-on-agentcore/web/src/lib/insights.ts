@@ -552,8 +552,12 @@ export interface MyUsage extends WindowFields {
  */
 export interface UserUsageRow {
   sub: string;
-  /** The agents this person used in the window, most-used first. */
+  /** The agents this person used in the window, most-used first; the top few only. */
   agents?: { record_id: string; name: string; turns: number }[];
+  /** How many agents this person used, `agents` included. */
+  agents_total?: number;
+  /** Turns on the agents past `agents`. */
+  other_agent_turns?: number;
   /** Days in the window on which this person took at least one turn. */
   active_days?: number;
   /** This person's days with turns, sparse and oldest first. */

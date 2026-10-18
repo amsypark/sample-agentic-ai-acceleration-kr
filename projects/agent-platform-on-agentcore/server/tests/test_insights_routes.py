@@ -1001,3 +1001,25 @@ def test_user_rows_carry_their_own_days_from_the_same_read():
     assert rows["sub-2"]["daily"] == []
     today = next(p for p in body["daily_active_users"] if p["date"] == _today_str)
     assert today["users"] == 1
+
+
+def test_a_user_row_lists_the_top_agents_and_counts_the_rest():
+    """3.8 MB at 1,000 people when every row carried every agent (bst,
+    2026-10-18). The table shows one name and how many more; the drill-down a
+    ranked list. Both still add up."""
+    usage = usage_with_one_agent({
+        f"USERS#{_current_month}": [
+            {"sk": f"D#{_today_str}#U#sub-1", "turns": Decimal(78)},
+        ],
+    })
+    wire(usage, StubTelemetry())
+    matrix = {"sub-1": {f"rec-{i:02d}": i + 1 for i in range(12)}}
+    usage.agent_user_matrix = lambda ids, start, end: matrix
+
+    row = insights.user_leaderboard(days=7, user=user(is_admin=True))["users"][0]
+
+    assert len(row["agents"]) == insights.USER_AGENTS_SHOWN
+    assert row["agents"][0]["turns"] == 12
+    assert row["agents_total"] == 12
+    assert row["other_agent_turns"] == 1 + 2
+    assert sum(a["turns"] for a in row["agents"]) + row["other_agent_turns"] == 78

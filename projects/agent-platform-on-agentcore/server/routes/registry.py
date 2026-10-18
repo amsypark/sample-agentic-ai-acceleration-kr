@@ -117,10 +117,25 @@ def _fail(exc: Exception) -> None:
         raise HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, ClientError):
         error = exc.response.get("Error", {})
-        raise HTTPException(
-            status_code=502,
-            detail=f"AWS error ({error.get('Code', 'Unknown')}): {error.get('Message', str(exc))}",
-        )
+        code = error.get("Code", "Unknown")
+        detail = f"AWS error ({code}): {error.get('Message', str(exc))}"
+        # The caller's request conflicts with the record's state, names nothing,
+        # or is malformed: theirs to fix, so not a 502 (which the web reads as
+        # "the server is broken"). A duplicate name and an edit while the record
+        # is still CREATING/UPDATING were 502 (bst T1 smoke, 2026-10-18); the
+        # Registry settles a write within seconds, so a 409 says "retry shortly".
+        if code == "ConflictException":
+            message = str(error.get("Message", ""))
+            if "CREATING" in message or "UPDATING" in message:
+                detail = "레코드가 아직 저장되는 중입니다. 잠시 후 다시 시도하세요. " + detail
+            raise HTTPException(status_code=409, detail=detail)
+        if code == "ResourceNotFoundException":
+            raise HTTPException(status_code=404, detail=detail)
+        if code == "ValidationException":
+            raise HTTPException(status_code=400, detail=detail)
+        if code in ("ThrottlingException", "TooManyRequestsException", "ServiceQuotaExceededException"):
+            raise HTTPException(status_code=503, detail=detail, headers={"Retry-After": "2"})
+        raise HTTPException(status_code=502, detail=detail)
     logger.error("Registry route error: %s", exc)
     logger.error(traceback.format_exc())
     raise HTTPException(status_code=500, detail=str(exc))

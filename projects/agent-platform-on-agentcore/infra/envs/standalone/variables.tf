@@ -141,9 +141,10 @@ variable "desired_count" {
 
 # Task sizes. The defaults suit a pilot. Load-tested 2026-10-18 at 1,000 users
 # (88k threads, 90 days of ledger): one 512-CPU server saturated at ~50 req/s
-# and one 256-CPU web proxy at the same point. The server is one Python process
-# with in-memory runs, so it scales up (1024 is the most one process uses); the
-# web proxy is stateless and scales out (web_tasks).
+# and one 256-CPU web proxy at the same point. The server is one Python process,
+# so a task gets the most out of 1024 CPU; beyond that it scales out
+# (server_tasks; chat runs are leased across tasks). The web proxy is stateless
+# and scales out too (web_tasks).
 variable "server_cpu" {
   description = "Server task CPU units (512 = 0.5 vCPU). 1024 for an organisation-wide rollout."
   type        = number
@@ -170,6 +171,12 @@ variable "web_memory" {
 
 variable "web_tasks" {
   description = "Web tasks (stateless proxy, scales out). Ignored while desired_count = 0."
+  type        = number
+  default     = 1
+}
+
+variable "server_tasks" {
+  description = "Server tasks. Two also keep chat up while one is replaced by a deploy. Ignored while desired_count = 0."
   type        = number
   default     = 1
 }
@@ -383,4 +390,10 @@ variable "demo_expense_teams" {
   type        = list(string)
   description = "With demo_tools: team names whose harness role (`<project>-harness-<team>`, made by the Organization page) may call approve_expense below the amount cap. Empty = no cap policy, and approve_expense stays unreachable."
   default     = []
+}
+
+variable "guardrail_tier" {
+  description = "Bedrock Guardrail safeguard tier. STANDARD evaluates Korean (CLASSIC: English, French, Spanish only) and is routed within the region's geography (us/eu/apac guardrail profile)."
+  type        = string
+  default     = "STANDARD"
 }

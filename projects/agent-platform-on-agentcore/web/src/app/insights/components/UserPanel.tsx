@@ -152,8 +152,17 @@ export function UserPanel({ days }: { days: number }) {
   const agentsOf = (user: UserUsageRow) => {
     const agents = user.agents ?? [];
     if (agents.length === 0) return "—";
-    const [top, ...rest] = agents;
-    return rest.length > 0 ? `${top.name} +${rest.length}` : top.name;
+    const others = (user.agents_total ?? agents.length) - 1;
+    return others > 0 ? `${agents[0].name} +${others}` : agents[0].name;
+  };
+  const agentsTitle = (user: UserUsageRow) => {
+    const agents = user.agents ?? [];
+    const listed = agents.map((agent) => `${agent.name} ${agent.turns.toLocaleString("ko-KR")}턴`);
+    const rest = (user.agents_total ?? agents.length) - agents.length;
+    if (rest > 0) {
+      listed.push(`그 외 ${rest}개 ${(user.other_agent_turns ?? 0).toLocaleString("ko-KR")}턴`);
+    }
+    return listed.join(", ");
   };
 
   return (
@@ -266,9 +275,7 @@ export function UserPanel({ days }: { days: number }) {
                         full list is the tooltip. */}
                     <td
                       className="whitespace-nowrap px-3 py-2 text-xxs"
-                      title={(user.agents ?? [])
-                        .map((agent) => `${agent.name} ${agent.turns.toLocaleString("ko-KR")}턴`)
-                        .join(", ")}
+                      title={agentsTitle(user)}
                     >
                       {agentsOf(user)}
                     </td>
@@ -472,12 +479,15 @@ function UserDetail({
       cost: (point?.model_cost_micros ?? 0) / 1_000_000,
     };
   });
-  const agents: RankedEntry[] = (row.agents ?? []).map((agent) => ({
-    name: agent.name,
-    value: agent.turns,
-    display: `${agent.turns.toLocaleString("ko-KR")}턴`,
-    meta: row.turns > 0 ? formatRate({ rate: agent.turns / row.turns }) : undefined,
-  }));
+  const ranked = (name: string, turns: number): RankedEntry => ({
+    name,
+    value: turns,
+    display: `${turns.toLocaleString("ko-KR")}턴`,
+    meta: row.turns > 0 ? formatRate({ rate: turns / row.turns }) : undefined,
+  });
+  const agents: RankedEntry[] = (row.agents ?? []).map((agent) => ranked(agent.name, agent.turns));
+  const unlisted = (row.agents_total ?? agents.length) - agents.length;
+  if (unlisted > 0) agents.push(ranked(`그 외 ${unlisted}개`, row.other_agent_turns ?? 0));
   const threads = row.threads_started ?? 0;
   const perTurn =
     row.model_cost_micros !== null && row.priced_turns > 0

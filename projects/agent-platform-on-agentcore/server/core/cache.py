@@ -100,6 +100,10 @@ class StaleWhileRevalidate:
     ReadThroughCache, so concurrent callers share that load). A failed
     background load keeps the stale value and is retried by the next request.
 
+    At most `max_entries` values are kept. Storing one first drops those past
+    `max_age_seconds` (they would never be served again), then the oldest
+    computed, so keys built from request input cannot grow the map without end.
+
     `invalidate()` forgets everything; use it after a write that changes what
     the loads would compute.
     """
@@ -110,9 +114,11 @@ class StaleWhileRevalidate:
         max_age_seconds: float,
         clock: Callable[[], float] = time.monotonic,
         spawn: Optional[Callable[[Callable[[], None]], None]] = None,
+        max_entries: int = 256,
     ):
         self._fresh = fresh_seconds
         self._max_age = max_age_seconds
+        self._max_entries = max_entries
         self._clock = clock
         self._lock = threading.Lock()
         self._values: Dict[Hashable, Tuple[float, Any]] = {}
@@ -137,7 +143,7 @@ class StaleWhileRevalidate:
         value = self._loads.get(key, load)
         with self._lock:
             if generation == self._generation:
-                self._values[key] = (self._clock(), value)
+                self._store(key, value)
         return value, 0.0
 
     def _refresh_in_background(self, key: Hashable, load: Callable[[], Any], generation: int) -> None:
@@ -151,7 +157,7 @@ class StaleWhileRevalidate:
                 value = load()
                 with self._lock:
                     if generation == self._generation:
-                        self._values[key] = (self._clock(), value)
+                        self._store(key, value)
             except Exception:
                 logger.warning("Background refresh failed for %s; serving the previous value", key, exc_info=True)
             finally:
@@ -159,6 +165,17 @@ class StaleWhileRevalidate:
                     self._refreshing.discard(key)
 
         self._spawn(run)
+
+    def _store(self, key: Hashable, value: Any) -> None:
+        """Caller holds the lock."""
+        now = self._clock()
+        self._values[key] = (now, value)
+        if len(self._values) <= self._max_entries:
+            return
+        for old in [k for k, (at, _) in self._values.items() if now - at >= self._max_age]:
+            del self._values[old]
+        while len(self._values) > self._max_entries:
+            del self._values[min(self._values, key=lambda k: self._values[k][0])]
 
     def invalidate(self) -> None:
         with self._lock:

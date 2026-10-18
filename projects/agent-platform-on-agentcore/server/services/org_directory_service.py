@@ -19,6 +19,7 @@ import logging
 import secrets
 import string
 import threading
+from contextlib import contextmanager
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -38,6 +39,10 @@ _GROUP_READ_WORKERS = 8
 
 class NotCognitoUser(ValueError):
     """A write was attempted on a person the pool does not hold (Entra)."""
+
+
+class UserGone(LookupError):
+    """Cognito no longer has the user (deleted elsewhere, or by an earlier request)."""
 
 
 class InviteFailed(ValueError):
@@ -90,7 +95,8 @@ def temporary_password(length: int = 16) -> str:
 class OrgDirectoryService:
     def __init__(self, cognito, user_pool_id: str, users=None,
                  entra_teams: Optional[Callable[[List[str]], List[str]]] = None,
-                 cache_seconds: int = 60, clock: Callable[[], float] = time.monotonic):
+                 cache_seconds: int = 60, clock: Callable[[], float] = time.monotonic,
+                 version: Any = None):
         self._cognito = cognito
         self._pool = user_pool_id or ""
         self._users = users
@@ -103,6 +109,14 @@ class OrgDirectoryService:
         # while it waited and take that result instead of reading again.
         self._refresh_lock = threading.Lock()
         self._reads_done = 0
+        # Shared across server tasks (TeamRepository.directory_version). The
+        # snapshot is per process, and with two tasks a user deleted through
+        # one was still listed by the other for up to a minute — 3 of 16 list
+        # calls in the bst smoke (2026-10-18), and a second delete got a 500.
+        # A write here bumps it; a read whose snapshot predates it reads again.
+        # Without a teams table there is one copy and nothing to share.
+        self._version = version
+        self._snapshot_version: Optional[int] = None
 
     @property
     def configured(self) -> bool:
@@ -115,6 +129,21 @@ class OrgDirectoryService:
 
     def invalidate(self) -> None:
         self._snapshot = None
+        if self._version is not None:
+            try:
+                self._version.bump_directory_version()
+            except Exception:
+                # The other tasks catch up at the TTL, as before this existed.
+                logger.warning("Directory version not bumped", exc_info=True)
+
+    def _shared_version(self) -> Optional[int]:
+        if self._version is None:
+            return None
+        try:
+            return self._version.directory_version()
+        except Exception:
+            logger.warning("Directory version unreadable; trusting the TTL", exc_info=True)
+            return None
 
     # ── reads ──────────────────────────────────────────────────────────────
     def list_users(self, refresh: bool = False) -> List[OrgUser]:
@@ -130,6 +159,7 @@ class OrgDirectoryService:
             # after a failed read they all retried in turn.
             if self._reads_done != done or (not refresh and self._snapshot_fresh()):
                 return list(self._snapshot or [])
+            version = self._shared_version()
             try:
                 fresh = self._read()
             except Exception:
@@ -139,10 +169,16 @@ class OrgDirectoryService:
             if fresh is None:
                 return list(self._snapshot or [])
             self._snapshot, self._snapshot_at = fresh, self._clock()
+            self._snapshot_version = version
             return list(fresh)
 
     def _snapshot_fresh(self) -> bool:
-        return self._snapshot is not None and self._clock() - self._snapshot_at < self._cache_seconds
+        if self._snapshot is None or self._clock() - self._snapshot_at >= self._cache_seconds:
+            return False
+        if self._snapshot_version is None:
+            return True
+        current = self._shared_version()
+        return current is None or current == self._snapshot_version
 
     def get_user(self, sub: str) -> Optional[OrgUser]:
         return next((u for u in self.list_users() if u.sub == sub), None)
@@ -336,20 +372,22 @@ class OrgDirectoryService:
     def set_role(self, user: OrgUser, role: str) -> None:
         self._cognito_only(user)
         user = self._fresh(user)
-        if role == "admin" and user.role != "admin":
-            self._cognito.admin_add_user_to_group(UserPoolId=self._pool, Username=user.username, GroupName=ADMIN_GROUP)
-        elif role != "admin" and user.role == "admin":
-            self._cognito.admin_remove_user_from_group(UserPoolId=self._pool, Username=user.username, GroupName=ADMIN_GROUP)
+        with self._user_gone():
+            if role == "admin" and user.role != "admin":
+                self._cognito.admin_add_user_to_group(UserPoolId=self._pool, Username=user.username, GroupName=ADMIN_GROUP)
+            elif role != "admin" and user.role == "admin":
+                self._cognito.admin_remove_user_from_group(UserPoolId=self._pool, Username=user.username, GroupName=ADMIN_GROUP)
         self.invalidate()
 
     def set_teams(self, user: OrgUser, teams: List[str]) -> None:
         self._cognito_only(user)
         user = self._fresh(user)
         wanted, current = set(teams), set(user.teams)
-        for t in sorted(current - wanted):
-            self._cognito.admin_remove_user_from_group(UserPoolId=self._pool, Username=user.username, GroupName=f"{TEAM_PREFIX}{t}")
-        for t in sorted(wanted - current):
-            self._cognito.admin_add_user_to_group(UserPoolId=self._pool, Username=user.username, GroupName=f"{TEAM_PREFIX}{t}")
+        with self._user_gone():
+            for t in sorted(current - wanted):
+                self._cognito.admin_remove_user_from_group(UserPoolId=self._pool, Username=user.username, GroupName=f"{TEAM_PREFIX}{t}")
+            for t in sorted(wanted - current):
+                self._cognito.admin_add_user_to_group(UserPoolId=self._pool, Username=user.username, GroupName=f"{TEAM_PREFIX}{t}")
         self.invalidate()
 
     def add_to_team(self, user: OrgUser, team: str) -> None:
@@ -362,17 +400,53 @@ class OrgDirectoryService:
 
     def set_enabled(self, user: OrgUser, enabled: bool) -> None:
         self._cognito_only(user)
-        if enabled:
-            self._cognito.admin_enable_user(UserPoolId=self._pool, Username=user.username)
-        else:
-            self._cognito.admin_disable_user(UserPoolId=self._pool, Username=user.username)
+        with self._user_gone():
+            if enabled:
+                self._cognito.admin_enable_user(UserPoolId=self._pool, Username=user.username)
+            else:
+                self._cognito.admin_disable_user(UserPoolId=self._pool, Username=user.username)
         self.invalidate()
 
     def reset_password(self, user: OrgUser) -> None:
+        """A new password for someone who has signed in; a new invitation for
+        someone who never has.
+
+        Cognito refuses AdminResetUserPassword for a user still on the
+        temporary password (FORCE_CHANGE_PASSWORD) with NotAuthorizedException,
+        which came back as a 500. The useful thing in that state is what the
+        admin means: send the invitation again, with a fresh temporary password.
+        """
         self._cognito_only(user)
-        self._cognito.admin_reset_user_password(UserPoolId=self._pool, Username=user.username)
+        try:
+            with self._user_gone():
+                self._cognito.admin_reset_user_password(UserPoolId=self._pool, Username=user.username)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "NotAuthorizedException":
+                raise
+            # By e-mail, not `username`: the pool signs in by e-mail, so the
+            # username is the UUID, and RESEND rejects it ("Username should be
+            # an email") — the first live run of this fallback still got a 500.
+            with self._user_gone():
+                self._cognito.admin_create_user(
+                    UserPoolId=self._pool, Username=user.email or user.username,
+                    MessageAction="RESEND", DesiredDeliveryMediums=["EMAIL"],
+                )
 
     def delete(self, user: OrgUser) -> None:
         self._cognito_only(user)
-        self._cognito.admin_delete_user(UserPoolId=self._pool, Username=user.username)
-        self.invalidate()
+        try:
+            with self._user_gone():
+                self._cognito.admin_delete_user(UserPoolId=self._pool, Username=user.username)
+        finally:
+            self.invalidate()
+
+    @contextmanager
+    def _user_gone(self):
+        """Cognito's UserNotFoundException as UserGone (a 404, not a 500)."""
+        try:
+            yield
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "UserNotFoundException":
+                self.invalidate()
+                raise UserGone(str(exc)) from exc
+            raise

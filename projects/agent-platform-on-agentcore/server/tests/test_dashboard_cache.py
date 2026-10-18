@@ -111,7 +111,10 @@ def stub_compute(monkeypatch):
 
     def compute_record(record_id, days, user):
         calls.append(user.is_admin)
-        return {"record_id": record_id, "turns": [{"turn_id": "t1", "owner_sub": "alice"}]}
+        return {"record_id": record_id, "turns": [
+            {"turn_id": "t1", "owner_sub": "alice", "thread_id": "th-alice"},
+            {"turn_id": "t2", "owner_sub": "s", "thread_id": "th-mine"},
+        ]}
 
     monkeypatch.setattr(insights, "_compute_record_insights", compute_record)
     monkeypatch.setattr(insights, "_compute_summary", lambda days, user: calls.append("summary") or {"days": days})
@@ -138,3 +141,40 @@ def test_a_record_page_is_computed_once_and_owners_hidden_from_non_admins(stub_c
     assert admin_view["turns"][0]["owner_sub"] == "alice"
     assert user_view["turns"][0]["owner_sub"] is None
     assert stub_compute == [True]  # one computation, as the admin view
+
+
+def test_a_non_admin_sees_threads_only_on_their_own_turns(stub_compute):
+    """Someone else's thread id says which conversation used the agent; the
+    counters are the public part of a record."""
+    turns = insights.record_insights(record_id="rec-1", days=7, user=_user(False))["turns"]
+    assert [t["thread_id"] for t in turns] == [None, "th-mine"]
+    admin_turns = insights.record_insights(record_id="rec-1", days=7, user=_user(True))["turns"]
+    assert [t["thread_id"] for t in admin_turns] == ["th-alice", "th-mine"]
+
+
+def test_the_map_is_bounded_and_drops_the_oldest_computed():
+    """record_insights is keyed by any record id a user sends; the map must not
+    grow with them."""
+    clock = Clock()
+    cache = StaleWhileRevalidate(fresh_seconds=60, max_age_seconds=900, clock=clock,
+                                 spawn=lambda fn: None, max_entries=3)
+    for key in ("a", "b", "c", "d"):
+        cache.get(key, lambda key=key: key)
+        clock.now += 1
+    assert sorted(cache._values) == ["b", "c", "d"]
+
+
+def test_values_past_max_age_go_first():
+    clock = Clock()
+    cache = StaleWhileRevalidate(fresh_seconds=60, max_age_seconds=900, clock=clock,
+                                 spawn=lambda fn: None, max_entries=2)
+    cache.get("old", lambda: 1)
+    clock.now += 1000
+    cache.get("x", lambda: 2)
+    cache.get("y", lambda: 3)
+    assert sorted(cache._values) == ["x", "y"]
+
+
+def test_unsupported_days_share_the_window_they_are_served():
+    assert insights._supported_days(12345) == insights._supported_days(90) == max(insights.SUPPORTED_DAYS)
+    assert insights._supported_days(7) == 7

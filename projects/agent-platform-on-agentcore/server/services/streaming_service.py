@@ -1060,7 +1060,7 @@ class StreamingService:
         # put — after the first run had started writing, clobbering its human
         # message. Reserved, a second request is refused (409) before it writes
         # anything, and a Stop pressed during setup has a run to land on.
-        reservation = self.run_broker.reserve(thread_id, owner_sub=owner_sub or None)
+        reservation = await self.run_broker.claim(thread_id, owner_sub=owner_sub or None)
         try:
             prepared_thread, requested_config, learned_target = await self._prepare_run(
                 thread_id, request, existing, owner_sub, t_request, caller

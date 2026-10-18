@@ -8,11 +8,13 @@ from repositories.usage_repository import UsageRepository
 from repositories.prefs_repository import PrefsRepository
 from repositories.user_repository import UserRepository
 from repositories.team_repository import TeamRepository
+from repositories.run_repository import RunRepository
 from services.artifact_service import ArtifactService
 from services.thread_service import ThreadService
 from services.mcp_apps_service import shared_relay
 from services.streaming_service import StreamingService
 from services.run_broker import RunBroker
+from services.run_leases import RunLeases
 from services.harness_output_service import HarnessOutputService
 from services.artifact_preview_service import ArtifactPreviewService
 from services.knowledge_provisioner import KnowledgeProvisioner
@@ -39,6 +41,10 @@ from agents.agentcore_client import AgentCoreClient
 from core.config import (
     MCP_GATEWAY_ID,
     TEAMS_TABLE,
+    RUNS_TABLE,
+    RUN_LEASE_SECONDS,
+    RUN_HEARTBEAT_SECONDS,
+    SERVER_PORT,
     COGNITO_REGION,
     COGNITO_USER_POOL_ID,
     ARTIFACTS_BUCKET,
@@ -148,8 +154,20 @@ evaluation_service = EvaluationService(region_name=AWS_REGION)
 # stamped with the MCP record that serves it: the runtime knows only the ui:// URI,
 # and the relay resolves endpoints from records alone.
 # One broker for the process: the routes that attach to and cancel runs must see
-# the same runs the start route created. See services/run_broker.py.
-run_broker = RunBroker()
+# the same runs the start route created. See services/run_broker.py. With
+# RUNS_TABLE it also leases each run so other server tasks see it
+# (services/run_leases.py).
+run_repository = (
+    RunRepository(table_name=RUNS_TABLE, region_name=AWS_REGION) if RUNS_TABLE else None
+)
+run_broker = RunBroker(
+    leases=(
+        RunLeases(run_repository, port=SERVER_PORT, lease_seconds=RUN_LEASE_SECONDS)
+        if run_repository is not None
+        else None
+    ),
+    heartbeat_seconds=RUN_HEARTBEAT_SECONDS,
+)
 
 streaming_service = StreamingService(
     thread_service=thread_service,
@@ -283,6 +301,9 @@ org_directory_service = OrgDirectoryService(
     user_pool_id=COGNITO_USER_POOL_ID,
     users=user_repository,
     entra_teams=team_service.teams_for_entra_groups,
+    # The teams table carries the directory version every task checks its
+    # snapshot against (None without a table: one process, nothing to share).
+    version=team_repository,
 )
 # Registry records are stamped with their registering user's e-mail; a Cognito
 # access token only names the sub, so the directory resolves it.
@@ -332,6 +353,7 @@ def verify_tables() -> None:
         prefs_repository,
         team_repository,
         user_repository,
+        run_repository,
     ):
         if repository is not None:
             repository.verify()

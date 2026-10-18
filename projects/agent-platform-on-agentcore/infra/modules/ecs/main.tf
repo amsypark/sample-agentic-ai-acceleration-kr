@@ -248,7 +248,7 @@ resource "aws_ecs_service" "server" {
   name            = "server"
   cluster         = aws_ecs_cluster.this.id
   task_definition = local.server_task_definition
-  desired_count   = var.desired_count
+  desired_count   = var.desired_count == 0 ? 0 : var.server_tasks
   launch_type     = "FARGATE"
 
   network_configuration {

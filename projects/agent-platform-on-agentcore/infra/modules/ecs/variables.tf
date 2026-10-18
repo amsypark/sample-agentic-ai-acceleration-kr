@@ -56,7 +56,13 @@ variable "desired_count" {
 }
 
 variable "web_tasks" {
-  description = "Web tasks when not parked. The web tier is a stateless proxy and scales out; the server does not (its run broker is in memory), so it scales up via server_cpu."
+  description = "Web tasks when not parked. The web tier is a stateless proxy and scales out."
+  type        = number
+  default     = 1
+}
+
+variable "server_tasks" {
+  description = "Server tasks when not parked. Chat runs are leased in the runs table, so a second task may take any request (server/services/run_leases.py)."
   type        = number
   default     = 1
 }

@@ -73,6 +73,32 @@ aws sts get-caller-identity   # 배포할 계정이 맞는지 확인
 - Amazon Bedrock 콘솔의 **Model access** 에서 Anthropic Claude 모델(기본값 Sonnet 5.5,
   스레드 오버라이드 선택지 `allowed_models` 의 Opus 5.5·Haiku 5.5)을 켭니다.
 
+**계정 한도**
+
+첫 apply 는 VPC 1개, NAT 게이트웨이 1개(`azs` 의 첫 AZ), Elastic IP 1개를 만듭니다. 여러 프로젝트가
+같이 쓰는 계정이면 이 셋이 이미 한도에 차 있어서, apply 가 몇 분씩 진행한 뒤
+`VpcLimitExceeded`·`AddressLimitExceeded`·`NatGatewayLimitExceeded` 로 멈출 수 있습니다. 인스톨러는
+`계정 한도 점검` 단계에서 이를 미리 확인하고, 수동으로 할 때는 아래로 확인합니다.
+
+```bash
+R=<region>
+aws ec2 describe-vpcs --region $R --query 'length(Vpcs)'                       # VPC 한도 기본 5
+aws ec2 describe-account-attributes --region $R --attribute-names vpc-max-elastic-ips \
+  --query 'AccountAttributes[0].AttributeValues[0].AttributeValue'             # EIP 한도
+aws ec2 describe-addresses --region $R --query 'length(Addresses)'             # 사용 중인 EIP
+# AZ 별 NAT 게이트웨이 수 (AZ 당 기본 5)
+for s in $(aws ec2 describe-nat-gateways --region $R --filter Name=state,Values=pending,available \
+    --query 'NatGateways[].SubnetId' --output text); do
+  aws ec2 describe-subnets --region $R --subnet-ids $s --query 'Subnets[0].AvailabilityZone' --output text
+done | sort | uniq -c
+```
+
+NAT 가 찬 AZ 가 있으면 `azs` 에서 여유 있는 AZ 를 첫째로 둡니다. EIP 한도 증설은 Service Quotas 가
+승인으로 바뀐 뒤에도 EC2 가 이전 값을 한동안 강제하므로, 위 `vpc-max-elastic-ips` 값으로 반영을
+확인합니다. `azs` 는 첫 apply 전에 정합니다. 배포 뒤에 바꾸면 서브넷이 교체되는데, ALB 의 네트워크
+인터페이스가 옛 서브넷에 남아 삭제가 20분 대기 뒤 `DependencyViolation` 으로 실패합니다(복구:
+새 AZ 에 임시 서브넷을 만들어 `aws elbv2 set-subnets` 로 ALB 를 옮긴 뒤 다시 apply).
+
 **비용**
 
 ALB, NAT 게이트웨이, Fargate 태스크 2개는 사용량과 관계없이 시간당 요금이 붙습니다.
@@ -183,6 +209,7 @@ user_password  = "<choose-a-password>"
 | `alert_email` | `""` | CloudWatch 알람 SNS 구독 주소 |
 | `bucket_suffix` | `""` | S3 버킷 이름이 이미 쓰이고 있으면 `-<account-id>` 등을 덧붙임 |
 | `enable_agent_registry` | `true` | 조직 SCP 가 Registry API 를 막는 경우 `false` |
+| `guardrail_tier` | `STANDARD` | Guardrail 등급. `CLASSIC` 은 영어·프랑스어·스페인어만 판정해 한국어 입력은 걸러지지 않습니다. `STANDARD` 는 같은 지역권(us/eu/apac) 안의 리전으로 평가를 보냅니다 |
 
 > **HTTPS 를 권장합니다.** `certificate_arn` 없이 올리면 ALB 는 평문 HTTP 입니다. 대부분의
 > 기능은 동작하지만 Entra ID 로그인은 HTTPS 가 전제이고, 사내망 밖에 노출한다면
@@ -551,20 +578,21 @@ python scripts/backfill_thread_index.py --table <project>-threads --region <regi
 
 백필 전에도 사용자 목록은 동작하고(요약이 없는 행만 원본을 읽음), 관리자 전체 목록에만 이전 쓰레드가 빠집니다.
 
-**규모별 크기.** 기본 태스크 크기는 시범 운영용입니다. 사용자 1,000명 규모에서 실측한 상한은 서버
-1 vCPU 당 약 60 req/s, 동시 스트리밍 약 300 이며, 서버는 프로세스 하나라 `server_cpu = 1024` 까지가
-쓸모 있는 크기입니다. 웹 프록시는 상태가 없어 `web_tasks` 로 늘립니다.
+**규모별 크기.** 기본 태스크 크기는 시범 운영용입니다. 사용자 1,000명 규모(쓰레드 8.8만, 원장 90일)에서
+서버 태스크(1 vCPU) 하나의 상한은 약 70 req/s 였고, 2개로 늘리면 약 138 req/s 와 동시 채팅 300 의 첫 토큰
+p50 8.8초(1개일 때 15.9초)였습니다. 서버는 프로세스 하나라 태스크당 `server_cpu = 1024` 까지가 쓸모 있는
+크기이고, 그 위로는 `server_tasks` 로 늘립니다. 진행 중인 채팅 런은 runs 테이블의 리스로 태스크 사이에서
+공유되어, 어느 태스크가 받든 중복 실행은 409 로 막히고 재접속·중지는 런을 가진 태스크로 전달됩니다.
+2개 이상이면 태스크 하나가 교체되는 동안에도 서비스가 이어집니다(1개일 때는 약 46초 중단).
 
 ```hcl
 server_cpu    = 1024
 server_memory = 2048
+server_tasks  = 2
 web_cpu       = 512
 web_memory    = 1024
 web_tasks     = 2
 ```
-
-서버 태스크는 1개로 둡니다. 진행 중인 채팅 런(재접속·취소·중복 방지)이 서버 메모리에 있어서, 2개 이상이면
-같은 쓰레드에 런이 겹치거나 취소가 다른 태스크로 갑니다.
 
 **Runtime 에이전트 업데이트.** 같은 `AGENT_MODULE` 로 `deploy.sh` 를 다시 실행하면 기존
 Runtime 이 갱신됩니다.

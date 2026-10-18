@@ -231,3 +231,27 @@ resource "aws_dynamodb_table" "teams" {
     type = "S"
   }
 }
+
+# Which server task is running a chat turn on which thread (server/services/run_leases.py).
+# One row per thread with a turn in flight: a conditional put is the "one run per
+# thread" check across tasks, and the row names the task that holds the run so
+# another task can hand it a reattach or a Stop. Rows are leases renewed while
+# the run lives and deleted when it ends; `expires_at` (TTL) sweeps the ones a
+# killed task left behind. Nothing here outlives a turn, so no PITR.
+resource "aws_dynamodb_table" "runs" {
+  deletion_protection_enabled = !var.allow_destroy
+
+  name         = var.runs_table_name
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "thread_id"
+
+  attribute {
+    name = "thread_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+}

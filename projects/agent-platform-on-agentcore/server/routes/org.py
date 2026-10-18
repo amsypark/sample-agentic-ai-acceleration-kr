@@ -10,6 +10,7 @@ not editable. Everything an admin does lands in the audit ledger.
 """
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -22,7 +23,7 @@ from core.auth import AuthUser, require_admin
 from core.config import MCP_GATEWAY_ARN, TEAM_CONDITIONED_ACTIONS, TEAM_SHARED_ACTIONS
 from core.dependencies import audit_service, org_directory_service, team_provisioner, team_service, usage_service
 from models.team import TeamConfig, TeamConfigUpdate, TeamCreate, is_tool_pattern, validate_team_name
-from services.org_directory_service import InviteFailed, NotCognitoUser
+from services.org_directory_service import InviteFailed, NotCognitoUser, UserGone
 from services.org_drift import compute_drift
 from services.registry_service import ReadThroughCache, RegistryNotConfigured
 from services.team_access import team_of
@@ -352,6 +353,15 @@ def delete_team(name: str, user: AuthUser = Depends(require_admin)) -> None:
         logger.warning("Member check failed for team %s", name, exc_info=True)
         raise HTTPException(status_code=503, detail="구성원을 확인하지 못해 지울 수 없습니다. 잠시 후 다시 시도하세요.")
     if member_subs:
+        # ListUsersInGroup lags a removal by a moment: the smoke run removed the
+        # last member and got this 409, then 204 seconds later (2026-10-18). One
+        # re-read after a short wait tells that lag from a member who is there.
+        time.sleep(1.5)
+        try:
+            member_subs = _directory().member_subs(name)
+        except Exception:
+            logger.warning("Member re-check failed for team %s", name, exc_info=True)
+    if member_subs:
         raise HTTPException(status_code=409, detail=f"구성원 {len(member_subs)}명이 남아 있습니다. 먼저 팀에서 빼세요.")
     try:
         records = _team_records(name)
@@ -632,6 +642,8 @@ def update_user(sub: str, body: UserUpdate, user: AuthUser = Depends(require_adm
             _audit().record(user, "user.enable" if body.enabled else "user.disable", person.email or sub)
     except NotCognitoUser as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except UserGone:
+        raise HTTPException(status_code=404, detail="사용자가 없습니다.")
     return _user_row(_directory().get_user(sub) or person, _usage_by_user())
 
 
@@ -642,6 +654,8 @@ def reset_user_password(sub: str, user: AuthUser = Depends(require_admin)) -> No
         _directory().reset_password(person)
     except NotCognitoUser as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except UserGone:
+        raise HTTPException(status_code=404, detail="사용자가 없습니다.")
     _audit().record(user, "user.reset_password", person.email or sub)
 
 
@@ -656,6 +670,8 @@ def delete_user(sub: str, user: AuthUser = Depends(require_admin)) -> None:
         _directory().delete(person)
     except NotCognitoUser as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except UserGone:
+        raise HTTPException(status_code=404, detail="사용자가 없습니다.")
     _audit().record(user, "user.delete", person.email or sub, before=person.model_dump())
 
 

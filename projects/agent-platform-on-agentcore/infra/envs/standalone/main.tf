@@ -82,6 +82,7 @@ module "dynamodb" {
   prefs_table_name     = "${var.project}-prefs"
   users_table_name     = "${var.project}-users"
   teams_table_name     = "${var.project}-teams"
+  runs_table_name      = "${var.project}-runs"
   allow_destroy        = var.allow_destroy
 }
 
@@ -141,6 +142,8 @@ module "cost_allocation_tags" {
 module "bedrock_guardrail" {
   source  = "../../modules/bedrock_guardrail"
   project = var.project
+  region  = var.region
+  tier    = var.guardrail_tier
 }
 
 module "policy_engine" {
@@ -270,6 +273,7 @@ module "iam" {
   prefs_table_arn        = module.dynamodb.prefs_table_arn
   users_table_arn        = module.dynamodb.users_table_arn
   teams_table_arn        = module.dynamodb.teams_table_arn
+  runs_table_arn         = module.dynamodb.runs_table_arn
   team_role_boundary_arn = module.harness_role.boundary_arn
   policy_engine_arn      = var.enable_gateway_policy ? module.policy_engine[0].engine_arn : ""
   gateway_arn            = module.mcp_gateway.gateway_arn
@@ -297,6 +301,7 @@ module "ecs" {
   web_cpu            = var.web_cpu
   web_memory         = var.web_memory
   web_tasks          = var.web_tasks
+  server_tasks       = var.server_tasks
   enable_https       = local.https_enabled
   certificate_arn    = var.certificate_arn
   enable_http2       = var.alb_enable_http2
@@ -328,7 +333,10 @@ module "ecs" {
     # Organization page: teams the server creates at runtime live here; the
     # server fences their roles with the boundary and writes their Cedar
     # policies to the engine (empty when the stack has none).
-    TEAMS_TABLE            = module.dynamodb.teams_table_name
+    TEAMS_TABLE = module.dynamodb.teams_table_name
+    # Chat runs across server tasks: which task holds the turn on a thread, so a
+    # second request is refused and a reattach or Stop reaches it.
+    RUNS_TABLE             = module.dynamodb.runs_table_name
     TEAM_ROLE_BOUNDARY_ARN = module.harness_role.boundary_arn
     POLICY_ENGINE_ID       = var.enable_gateway_policy ? module.policy_engine[0].engine_id : ""
     MCP_GATEWAY_ARN        = module.mcp_gateway.gateway_arn
