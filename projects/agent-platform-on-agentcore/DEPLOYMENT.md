@@ -578,6 +578,12 @@ python scripts/backfill_thread_index.py --table <project>-threads --region <regi
 
 백필 전에도 사용자 목록은 동작하고(요약이 없는 행만 원본을 읽음), 관리자 전체 목록에만 이전 쓰레드가 빠집니다.
 
+**Guardrail 등급(기존 배포 업그레이드).** `guardrail_tier` 기본값 `STANDARD` 는 평가를 같은 지역권의 다른 리전으로도
+보내므로, Runtime 실행 역할에 `arn:aws:bedrock:*:<account>:guardrail-profile/*` 의 `bedrock:ApplyGuardrail` 이 있어야
+합니다. Terraform 의 Runtime 역할은 apply 로 받습니다. 예전에 `EXECUTION_ROLE` 없이 배포해 starter toolkit 이 만든
+역할(`AmazonBedrockAgentCoreSDKRuntime-*`)로 도는 런타임이 있다면, 먼저 `deploy.sh` 로 다시 배포해(빈 `EXECUTION_ROLE`
+은 Terraform output 으로 채워집니다) 역할을 옮긴 뒤 apply 합니다.
+
 **규모별 크기.** 기본 태스크 크기는 시범 운영용입니다. 사용자 1,000명 규모(쓰레드 8.8만, 원장 90일)에서
 서버 태스크(1 vCPU) 하나의 상한은 약 70 req/s 였고, 2개로 늘리면 약 138 req/s 와 동시 채팅 300 의 첫 토큰
 p50 8.8초(1개일 때 15.9초)였습니다. 서버는 프로세스 하나라 태스크당 `server_cpu = 1024` 까지가 쓸모 있는
