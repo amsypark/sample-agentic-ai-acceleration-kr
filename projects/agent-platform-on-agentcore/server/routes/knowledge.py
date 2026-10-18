@@ -168,14 +168,16 @@ def delete_knowledge_base(
         _fail(exc)
 
 
+# Plain `def`: storing the document (S3, the KB data source) is blocking boto3, so
+# it runs on the threadpool; the spooled upload is read synchronously.
 @router.post("/{kb_key}/documents", response_model=KnowledgeDocument)
-async def upload_document(
+def upload_document(
     kb_key: str,
     file: UploadFile = File(...),
     user: AuthUser = Depends(current_user),
 ):
     try:
-        body = await file.read()
+        body = file.file.read()
         return _service().add_document(
             user,
             kb_key,

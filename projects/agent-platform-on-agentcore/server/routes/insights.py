@@ -60,12 +60,13 @@ reader looks at is not a qualifier.
 """
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from core import clock
+from core.cache import StaleWhileRevalidate
 from core.auth import AuthUser, current_user
 from core.dependencies import (
     billing_service,
@@ -225,14 +226,59 @@ def _org_directory():
     return _org_directory_override or org_directory_service
 
 
-def _member_count(team: str) -> Optional[int]:
-    """Live group size, or None when the directory cannot say — a per-member
-    figure divided by a guessed 0 would be infinite, by a guessed 1 a lie."""
+def _member_counts() -> Optional[Dict[str, int]]:
+    """Head count per team from the directory snapshot, or None when the
+    directory cannot say — a per-member figure divided by a guessed 0 would be
+    infinite, by a guessed 1 a lie.
+
+    One snapshot read for every team, like the Organization page's list. Asking
+    `group_members` per team was a live ListUsersInGroup each, in series: 14 s
+    of the 21 s teams widget at ten teams and 1,000 people (2026-10-18)."""
     try:
-        return len(_org_directory().group_members(team))
+        return _org_directory().team_sizes()
     except Exception:
-        logger.info("Team member count unavailable: %s", team, exc_info=True)
+        logger.info("Team member counts unavailable", exc_info=True)
         return None
+
+
+# Insights dashboards are computed once per window and shared. Each is seconds of
+# CPU at 1,000 people — the summary pinned the 0.5-vCPU server at 100% for ~20 s
+# while every other request waited (2026-10-18) — and none depends on who asks
+# beyond the admin gate, which every request still passes first. Served fresh for
+# 60 s, then stale for up to 15 min while one background read replaces it, so a
+# polling page costs at most one computation a minute however many admins watch.
+# A write that changes the figures (a rate registered or removed) clears it.
+_DASHBOARDS = StaleWhileRevalidate(fresh_seconds=60, max_age_seconds=900)
+# The reader a shared computation runs as: the admin view, which the route then
+# narrows for the caller (record_insights hides owners from non-admins).
+_DASHBOARD_READER = AuthUser(sub="", username="insights-dashboard", role="admin")
+
+
+def _dashboard(key: Any, compute: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+    value, age = _DASHBOARDS.get(key, compute)
+    return {**value, "computed_seconds_ago": int(age)}
+
+
+def _session_owners(session_ids: List[str], usage: Any, window: Dict[str, Any]) -> Dict[str, str]:
+    """session (= thread) id -> owner sub, for runtime cost per person.
+
+    Read from the threads by id, so the cost is the number of sessions. It used
+    to read every turn event of the window to find these owners — 70k events
+    for three sessions at 1,000 people (2026-10-18). A session whose thread was
+    deleted since is looked up in its turn events, which keep the owner."""
+    owners: Dict[str, str] = {}
+    try:
+        owners = dict(_threads().owners_of(session_ids))
+    except Exception:
+        logger.info("Thread owners unavailable; using turn events", exc_info=True)
+    missing = [sid for sid in session_ids if sid not in owners]
+    for start in range(0, len(missing), 100):  # an IN filter takes 100 values
+        chunk = set(missing[start:start + 100])
+        for event in usage.turn_events(window["start_date"], window["end_date"],
+                                       thread_ids=sorted(chunk), fields=["thread_id", "owner_sub"]):
+            if event.get("thread_id") in chunk and event.get("owner_sub"):
+                owners.setdefault(str(event["thread_id"]), str(event["owner_sub"]))
+    return owners
 
 
 def _rate_card():
@@ -436,6 +482,10 @@ def _turn_count(thread: Any) -> int:
     exists only once it has been created, and an empty one genuinely had none.
     """
     values = getattr(thread, "values", None) or {}
+    # A listed thread carries its count (ThreadRepository.summary_of) instead of
+    # the transcript the count would otherwise be taken from.
+    if isinstance(values.get("turns"), int):
+        return values["turns"]
     messages = values.get("messages") or []
     return sum(1 for message in messages if message.get("type") == "ai")
 
@@ -826,6 +876,17 @@ def summary(
     days: int = Query(7),
     user: AuthUser = Depends(current_user),
 ) -> Dict[str, Any]:
+    _require_admin(user)
+    return _dashboard(
+        ("summary", days, clock.today()),
+        lambda: _compute_summary(days=days, user=_DASHBOARD_READER),
+    )
+
+
+def _compute_summary(
+    days: int = Query(7),
+    user: AuthUser = Depends(current_user),
+) -> Dict[str, Any]:
     """KPI row plus the agent leaderboard — the point of the page.
 
     Everything here was written before the request arrived: turn events and their
@@ -881,8 +942,12 @@ def summary(
 
     rows: List[Dict[str, Any]] = []
     claimed_runtimes: set = set()
+    # One read per (record, month) for distinct_users below, fetched together
+    # rather than one round trip per leaderboard row.
+    usage.prefetch_distinct_users(list(totals), window["start_date"], window["end_date"])
+    records_by_id = {r.record_id: r for r in records}
     for record_id, counters in totals.items():
-        record = next((r for r in records if r.record_id == record_id), None)
+        record = records_by_id.get(record_id)
         arns = _runtime_arns_of(record, harness_runtimes) if record else []
         runtime_days = {}
         for arn in arns:
@@ -1093,6 +1158,17 @@ def telemetry(
     days: int = Query(7),
     user: AuthUser = Depends(current_user),
 ) -> Dict[str, Any]:
+    _require_admin(user)
+    return _dashboard(
+        ("telemetry", days, clock.today()),
+        lambda: _compute_telemetry(days=days, user=_DASHBOARD_READER),
+    )
+
+
+def _compute_telemetry(
+    days: int = Query(7),
+    user: AuthUser = Depends(current_user),
+) -> Dict[str, Any]:
     """The CloudWatch tier, only when a reader asks for it.
 
     Its own route, and not on the poll, because it is the one metered read on
@@ -1226,6 +1302,17 @@ def composition(
     days: int = Query(7),
     user: AuthUser = Depends(current_user),
 ) -> Dict[str, Any]:
+    _require_admin(user)
+    return _dashboard(
+        ("composition", days, clock.today()),
+        lambda: _compute_composition(days=days, user=_DASHBOARD_READER),
+    )
+
+
+def _compute_composition(
+    days: int = Query(7),
+    user: AuthUser = Depends(current_user),
+) -> Dict[str, Any]:
     """Which MCP servers, skills and knowledge bases earned their place.
 
     Its own route, not part of `summary`, because it needs the harness listing's
@@ -1265,17 +1352,29 @@ def my_insights(
     usage = _usage()
     usage.begin_read()
     window = _window(days)
-    totals = usage.user_totals(window["start_date"], window["end_date"])
+    totals = usage.user_totals_for(target, window["start_date"], window["end_date"])
     return {
         "sub": target,
         **_window_fields(window),
         "sources": {"usage": usage.reads_complete()},
-        "totals": totals.get(target, {}),
+        "totals": totals,
     }
 
 
 @router.get("/users")
 def user_leaderboard(
+    days: int = Query(7),
+    user: AuthUser = Depends(current_user),
+) -> Dict[str, Any]:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return _dashboard(
+        ("user_leaderboard", days, clock.today()),
+        lambda: _compute_user_leaderboard(days=days, user=_DASHBOARD_READER),
+    )
+
+
+def _compute_user_leaderboard(
     days: int = Query(7),
     user: AuthUser = Depends(current_user),
 ) -> Dict[str, Any]:
@@ -1319,10 +1418,7 @@ def user_leaderboard(
     sessions = collected["sessions"]
     runtime_by_user: Dict[str, int] = {}
     if sessions:
-        owner_of_thread: Dict[str, str] = {}
-        for event in usage.turn_events(window["start_date"], window["end_date"]):
-            if event.get("thread_id") and event.get("owner_sub"):
-                owner_of_thread.setdefault(str(event["thread_id"]), str(event["owner_sub"]))
+        owner_of_thread = _session_owners([key.split("#R#", 1)[0] for key in sessions], usage, window)
         for key, days_map in sessions.items():
             session_id = key.split("#R#", 1)[0]
             owner = owner_of_thread.get(session_id)
@@ -1457,6 +1553,15 @@ def user_leaderboard(
 
 @router.get("/teams")
 def team_insights(days: int = Query(7), user: AuthUser = Depends(current_user)) -> Dict[str, Any]:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return _dashboard(
+        ("team_insights", days, clock.today()),
+        lambda: _compute_team_insights(days=days, user=_DASHBOARD_READER),
+    )
+
+
+def _compute_team_insights(days: int = Query(7), user: AuthUser = Depends(current_user)) -> Dict[str, Any]:
     """Spend and policy denials per team. **Admin only.**
 
     A turn is attributed to a team by the caller's groups at the time it ran
@@ -1484,6 +1589,7 @@ def team_insights(days: int = Query(7), user: AuthUser = Depends(current_user)) 
     daily_keys = ("turns", "model_cost_micros", "failed_turns", "tool_calls")
 
     rows: List[Dict[str, Any]] = []
+    member_counts = _member_counts()
     for team in _teams().list():
         totals = by_team.get(team.name, usage._blank())
         # The alert is per day, so the window figure cannot be read against it;
@@ -1505,7 +1611,7 @@ def team_insights(days: int = Query(7), user: AuthUser = Depends(current_user)) 
             "max_day_cost_micros": max(days.values(), default=0),
             # None, not 0, when there is no alert: "0 days over" would claim a comparison that never ran.
             "days_over_alert": None if alert_micros is None else sum(1 for c in days.values() if c >= alert_micros),
-            "members": _member_count(team.name),
+            "members": None if member_counts is None else member_counts.get(team.name, 0),
             # Dense over the window: a team with no item on a day ran no turns
             # that day, so zero is a reading here, not a gap.
             "daily": [
@@ -1988,6 +2094,22 @@ def record_insights(
     days: int = Query(7),
     user: AuthUser = Depends(current_user),
 ) -> Dict[str, Any]:
+    out = _dashboard(
+        ("record_insights", record_id, days, clock.today()),
+        lambda: _compute_record_insights(record_id=record_id, days=days, user=_DASHBOARD_READER),
+    )
+    if not user.is_admin:
+        # Computed once for everyone, as an admin sees it; only an admin sees
+        # other people's turns by owner.
+        out = {**out, "turns": [{**turn, "owner_sub": None} for turn in out.get("turns", [])]}
+    return out
+
+
+def _compute_record_insights(
+    record_id: str,
+    days: int = Query(7),
+    user: AuthUser = Depends(current_user),
+) -> Dict[str, Any]:
     """One agent: its counters, its cost, its models, its trend, its tools, its turns."""
     _require_configured()
     usage = _usage()
@@ -2186,6 +2308,9 @@ def register_rates(
         )
     except RateCardError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        # The reprice moved costs; the next dashboard read must show them.
+        _DASHBOARDS.invalidate()
 
 
 @router.delete("/rates")
@@ -2200,3 +2325,5 @@ def delete_rate(
         return _rate_card().remove(key, today=clock.today())
     except RateCardError as exc:
         raise HTTPException(status_code=404 if "없습니다" in str(exc) else 400, detail=str(exc)) from exc
+    finally:
+        _DASHBOARDS.invalidate()

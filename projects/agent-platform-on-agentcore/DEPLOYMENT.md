@@ -438,6 +438,18 @@ cd infra/envs/standalone && terraform apply
 terraform output runtime_mcp_endpoints   # 4단계에서 쓸 URL
 ```
 
+타깃은 Gateway 가 생성 시점에 동기화한 툴 목록으로 `tools/list` 에 답합니다(`runtime_mcp_listing_mode =
+"DEFAULT"`). MCP 서버를 새 툴과 함께 다시 배포했다면 한 번 동기화합니다.
+
+```bash
+python3 infra/modules/mcp_gateway/scripts/gateway_target.py sync \
+  --gateway-id $(terraform -chdir=infra/envs/standalone output -raw mcp_gateway_id) \
+  --name platform-status --region <region>
+```
+
+`DYNAMIC` 은 매 `tools/list` 를 서버에 전달하므로 재동기화가 필요 없지만, 에이전트 세션마다 MCP 서버의
+microVM 콜드 스타트를 기다리게 됩니다(동시 50 세션에서 툴 로딩 p50 8.8초, 동기화 목록은 0.47초).
+
 **4) Registry 에 MCP 레코드로 등록**
 
 웹의 Registry 화면 → 등록 → 유형 **MCP** 로, 원격 URL 에 위 출력의
@@ -492,8 +504,8 @@ apply 뒤 `/org` 에서 팀을 만들면 달라지는 것:
 `demo_tools = true` 는 워크숍용 모의 툴(`approve_expense`, `lookup_salary`)을 Gateway 에
 싣습니다. 금액 한도가 있는 정책 예제를 보여 주기 위한 것이라 평소에는 꺼 둡니다.
 `demo_expense_teams = ["finance"]` 처럼 `/org` 에서 만든 팀 이름을 적으면 그 팀 역할만
-한도 아래 `approve_expense` 를 부를 수 있습니다. 켜고 끌 때는 Gateway 타깃을 `-replace`
-해야 합니다(`infra/modules/mcp_gateway/README.md`).
+한도 아래 `approve_expense` 를 부를 수 있습니다. 켜고 끈 뒤 apply 하면 Gateway 타깃의 툴
+목록이 제자리에서 갱신됩니다.
 
 사용자를 팀에 넣는 가장 빠른 방법은 `/org` 사용자 탭(또는 Cognito 콘솔의 `team:<name>`
 그룹)이고, 아래 데모 사용자 스크립트는 `--teams finance,hr` 로 이미 만든 팀에 나눠 넣습니다.
@@ -526,6 +538,33 @@ python scripts/seed_demo_users.py --password '<choose-a-password>' --teams finan
 aws ecs update-service --cluster bap-cluster --service server --force-new-deployment --region ap-northeast-1
 aws ecs update-service --cluster bap-cluster --service web    --force-new-deployment --region ap-northeast-1
 ```
+
+**쓰레드 목록 인덱스(기존 배포 업그레이드).** 쓰레드 목록은 threads 테이블의 GSI 3개
+(`owner_sub`·`agent_record_id`·`scope` + `updated_at`)를 읽습니다. 이 인덱스가 없던 버전에서 올라왔다면
+apply 로 인덱스가 ACTIVE 가 된 뒤, 이전 쓰레드에 인덱스 속성을 채웁니다. 다시 실행해도 안전합니다.
+
+```bash
+cd server
+python scripts/backfill_thread_index.py --table <project>-threads --region <region> --dry-run
+python scripts/backfill_thread_index.py --table <project>-threads --region <region>
+```
+
+백필 전에도 사용자 목록은 동작하고(요약이 없는 행만 원본을 읽음), 관리자 전체 목록에만 이전 쓰레드가 빠집니다.
+
+**규모별 크기.** 기본 태스크 크기는 시범 운영용입니다. 사용자 1,000명 규모에서 실측한 상한은 서버
+1 vCPU 당 약 60 req/s, 동시 스트리밍 약 300 이며, 서버는 프로세스 하나라 `server_cpu = 1024` 까지가
+쓸모 있는 크기입니다. 웹 프록시는 상태가 없어 `web_tasks` 로 늘립니다.
+
+```hcl
+server_cpu    = 1024
+server_memory = 2048
+web_cpu       = 512
+web_memory    = 1024
+web_tasks     = 2
+```
+
+서버 태스크는 1개로 둡니다. 진행 중인 채팅 런(재접속·취소·중복 방지)이 서버 메모리에 있어서, 2개 이상이면
+같은 쓰레드에 런이 겹치거나 취소가 다른 태스크로 갑니다.
 
 **Runtime 에이전트 업데이트.** 같은 `AGENT_MODULE` 로 `deploy.sh` 를 다시 실행하면 기존
 Runtime 이 갱신됩니다.

@@ -12,6 +12,47 @@ resource "aws_dynamodb_table" "threads" {
     name = "thread_id"
     type = "S"
   }
+  attribute {
+    name = "owner_sub"
+    type = "S"
+  }
+  attribute {
+    name = "agent_record_id"
+    type = "S"
+  }
+  attribute {
+    name = "scope"
+    type = "S"
+  }
+  attribute {
+    name = "updated_at"
+    type = "S"
+  }
+
+  # The sidebar and the per-agent drill-down list threads newest first. They were
+  # a full-table Scan: at 88k threads (589MB) one sidebar load read ~75k RCU, took
+  # 6-9s and pinned the server CPU deserialising transcripts, and 50 concurrent
+  # users got 57% 504s (bst load test, 2026-10-18). The indexes carry only what a
+  # list row shows (`summary` = first question and answer, clipped), so a page is
+  # one Query with no BatchGet of transcripts.
+  dynamic "global_secondary_index" {
+    for_each = {
+      "owner_sub-updated_at-index"       = "owner_sub"       # a user's own threads
+      "agent_record_id-updated_at-index" = "agent_record_id" # one agent's threads (insights)
+      "scope-updated_at-index"           = "scope"           # every thread (admin)
+    }
+    content {
+      name            = global_secondary_index.key
+      hash_key        = global_secondary_index.value
+      range_key       = "updated_at"
+      projection_type = "INCLUDE"
+      # An index's own hash key is projected already and may not be listed.
+      non_key_attributes = setsubtract(
+        ["created_at", "status", "metadata", "agent_name", "summary", "owner_sub", "agent_record_id"],
+        [global_secondary_index.value],
+      )
+    }
+  }
 }
 
 # Each artifact version is its own item, so the panel can list v1..vN and share a

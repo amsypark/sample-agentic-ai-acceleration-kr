@@ -160,6 +160,8 @@ def wire(repo):
     insights._collector_override = CollectorService(
         repository=repo, cloudwatch=None, pricing=None, registry=registry, harness=Harness(), region="us-east-1"
     )
+    # New wiring is a new deployment as far as the shared dashboards are concerned.
+    insights._DASHBOARDS.invalidate()
     return usage
 
 
@@ -416,6 +418,7 @@ def test_yesterday_enters_the_bill_comparison_only_once_cost_explorer_has_had_a_
     repo.items[(f"RECON#{MONTH}", f"D#{YESTERDAY}#K#agent_runtime#bap_default")].update({
         "billed_micros": D(590_700), "diff_micros": D(72), "checked_at": f"{tomorrow}T04:06:00Z",
     })
+    insights._DASHBOARDS.invalidate()  # past the shared dashboard's freshness window
     cost = insights.summary(days=7, user=admin())["cost"]
     assert cost["diff"]["days_compared"] == 2 and cost["diff"]["through"] == YESTERDAY
     assert cost["diff"]["runtime_micros"] == 272 + 72

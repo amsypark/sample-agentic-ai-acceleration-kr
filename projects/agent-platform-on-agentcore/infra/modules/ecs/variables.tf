@@ -55,6 +55,12 @@ variable "desired_count" {
   default     = 1
 }
 
+variable "web_tasks" {
+  description = "Web tasks when not parked. The web tier is a stateless proxy and scales out; the server does not (its run broker is in memory), so it scales up via server_cpu."
+  type        = number
+  default     = 1
+}
+
 # Whether to terminate TLS. Must be known at plan time (it drives listener
 # count), which is why it is separate from certificate_arn — an ACM ARN created
 # in the same apply is unknown until then.

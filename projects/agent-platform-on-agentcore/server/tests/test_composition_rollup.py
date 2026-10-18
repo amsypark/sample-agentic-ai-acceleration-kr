@@ -575,3 +575,41 @@ def test_a_gateways_daily_series_counts_only_its_own_targets_calls():
         {"date": "2026-08-14", "turns": 0, "tool_calls": 2},
         {"date": "2026-08-15", "turns": 4, "tool_calls": 3},
     ]
+
+
+def test_record_descriptors_are_read_in_bulk_not_one_get_each():
+    """One GetRegistryRecord per MCP/skill record was 102 serial calls (15.7 s)
+    at 100 such records. The registry's bulk read answers them together."""
+    arn = "arn:aws:bedrock-agentcore:us-east-1:1:harness/rec-1"
+    contents = {"mcp-1": {"server": {"remotes": [{"url": MCP_URL}]}}}
+
+    class BulkRegistry(StubRegistry):
+        bulk_calls = []
+
+        def record_details(self, summaries):
+            self.bulk_calls.append([s.record_id for s in summaries])
+            out = {}
+            for summary in summaries:
+                summary.descriptor_content = contents.get(summary.record_id)
+                out[summary.record_id] = summary
+            return out
+
+        def get_record(self, record_id):
+            raise AssertionError("descriptor read one record at a time")
+
+    registry = BulkRegistry([StubRecord("rec-1", "writer", harness_arn=arn),
+                             StubRecord("mcp-1", "example/tools", descriptor_type="MCP")])
+    service = UsageService(
+        repository=StubRepo({"AGENTS#2026-08": [turns("rec-1", 4)]}),
+        registry=registry,
+        harness=StubHarness([
+            Harness("rec-1", arn, tools=[
+                {"type": "remote_mcp", "name": "tools", "config": {"remoteMcp": {"url": MCP_URL}}},
+            ])
+        ]),
+    )
+
+    out = service.composition("2026-08-15", "2026-08-15")["mcp"]
+
+    assert [(entry["name"], entry["turns"]) for entry in out] == [("example/tools", 4)]
+    assert registry.bulk_calls == [["mcp-1"], []]

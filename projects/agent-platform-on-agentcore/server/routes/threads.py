@@ -317,18 +317,19 @@ def delete_thread(
 
 
 @router.post("/{thread_id}/attachments", response_model=Attachment)
-async def upload_attachment(
+def upload_attachment(
     thread_id: str,
     file: UploadFile = File(...),
     user: AuthUser = Depends(current_user),
 ):
     """Store one attachment and return the reference the message will carry.
 
-    `async def` here unlike its neighbours: this handler genuinely awaits the
-    upload body. The S3 write inside is blocking but brief.
+    Plain `def` like its neighbours. It used to be `async def` to await the
+    body, which put the ownership read and the S3 write on the event loop; the
+    upload is already spooled, so it is read synchronously on the threadpool.
     """
     _owned(thread_id, user)
-    body = await file.read()
+    body = file.file.read()
     try:
         return attachment_service.store(thread_id, file.filename or "file", body)
     except AttachmentsNotConfigured as exc:

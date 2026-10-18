@@ -4,7 +4,10 @@ knowledge, artifacts and Insights.
 """
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+
+import anyio.to_thread
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Import routers
 from routes import health, threads, mcp_apps, mcp, auth, registry, harness, artifacts, knowledge, insights, config, settings, org
-from core.config import COLLECTOR_ENABLED, COLLECTOR_INTERVAL_SECONDS
+from core.config import BLOCKING_THREADS, COLLECTOR_ENABLED, COLLECTOR_INTERVAL_SECONDS
 from core.dependencies import collector_service, streaming_service, verify_tables
 
 
@@ -37,7 +40,18 @@ async def lifespan(app: FastAPI):
     Verifies the DynamoDB tables first. Raising here fails uvicorn's startup, so
     a misconfigured task exits before it serves — the check that used to happen
     as a side effect of importing the repositories.
+
+    Sizes the two thread pools blocking work runs on. Both defaults scale with
+    the CPU count, and a 1-vCPU task got 5-6 `asyncio.to_thread` workers (every
+    chat turn's approval, binding and thread setup) and 40 for sync handlers: at
+    300 concurrent new chats the setup queued past the ALB's 60 s and 208 turns
+    got 504 before they started (bst load test, 2026-10-18). The work is boto3
+    I/O, so the pools follow the DynamoDB client's connection pool, not the CPUs.
     """
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=BLOCKING_THREADS, thread_name_prefix="blocking")
+    )
+    anyio.to_thread.current_default_thread_limiter().total_tokens = BLOCKING_THREADS
     await asyncio.to_thread(verify_tables)
     task = None
     if COLLECTOR_ENABLED and collector_service is not None:

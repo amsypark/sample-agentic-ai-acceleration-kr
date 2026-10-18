@@ -150,17 +150,19 @@ module "policy_engine" {
 }
 
 module "mcp_gateway" {
-  source                = "../../modules/mcp_gateway"
-  project               = var.project
-  region                = var.region
-  web_search_backend    = var.web_search_backend
-  runtime_mcp_servers   = var.runtime_mcp_servers
-  attach_registry       = var.enable_agent_registry && var.registry_tool_on_gateway
-  registry_mcp_endpoint = local.registry_mcp_endpoint
-  registry_arn          = local.registry_arn
-  policy_engine_arn     = var.enable_gateway_policy ? module.policy_engine[0].engine_arn : ""
-  policy_mode           = var.policy_mode
-  demo_tools            = var.demo_tools
+  source                   = "../../modules/mcp_gateway"
+  project                  = var.project
+  region                   = var.region
+  web_search_backend       = var.web_search_backend
+  runtime_mcp_servers      = var.runtime_mcp_servers
+  runtime_mcp_listing_mode = var.runtime_mcp_listing_mode
+  attach_registry          = var.enable_agent_registry && var.registry_tool_on_gateway
+  registry_mcp_endpoint    = local.registry_mcp_endpoint
+  registry_arn             = local.registry_arn
+  attach_policy_engine     = var.enable_gateway_policy
+  policy_engine_arn        = var.enable_gateway_policy ? module.policy_engine[0].engine_arn : ""
+  policy_mode              = var.policy_mode
+  demo_tools               = var.demo_tools
 }
 
 module "s3_skills" {
@@ -201,8 +203,10 @@ module "harness_role" {
 }
 
 module "gateway_policies" {
-  source           = "../../modules/gateway_policies"
-  count            = var.enable_gateway_policy ? 1 : 0
+  source = "../../modules/gateway_policies"
+  count  = var.enable_gateway_policy ? 1 : 0
+  # A policy naming a tool fails validation until the target carries it.
+  depends_on       = [module.mcp_gateway.tools_ready]
   project          = var.project
   policy_engine_id = module.policy_engine[0].engine_id
   gateway_arn      = module.mcp_gateway.gateway_arn
@@ -288,6 +292,11 @@ module "ecs" {
   server_image       = var.server_image
   web_image          = var.web_image
   desired_count      = var.desired_count
+  server_cpu         = var.server_cpu
+  server_memory      = var.server_memory
+  web_cpu            = var.web_cpu
+  web_memory         = var.web_memory
+  web_tasks          = var.web_tasks
   enable_https       = local.https_enabled
   certificate_arn    = var.certificate_arn
   enable_http2       = var.alb_enable_http2

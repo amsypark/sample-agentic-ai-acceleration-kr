@@ -7,10 +7,11 @@ from botocore.exceptions import ClientError
 
 from core.config import AWS_REGION
 
-# Routes hand blocking DynamoDB calls to FastAPI's threadpool (~40 workers), so
+# Routes hand blocking DynamoDB calls to the blocking threadpool (BLOCKING_THREADS,
+# 64 by default; see main.lifespan), so
 # botocore's default pool of 10 connections would become the new bottleneck and
 # re-serialise the very requests the threadpool is meant to run concurrently.
-BOTO_CONFIG = BotoConfig(max_pool_connections=50)
+BOTO_CONFIG = BotoConfig(max_pool_connections=64)
 
 
 class DynamoDBRepository:

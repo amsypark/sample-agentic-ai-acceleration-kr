@@ -234,9 +234,11 @@ def list_deployed_targets(_: AuthUser = Depends(current_user)):
             "count": len(targets),
             # Matches what a bulk sync would register, so the UI's drift badge
             # never promises more than pressing the button delivers. Retired
-            # targets need explicit intent and so are counted separately.
+            # targets need explicit intent and so are counted separately, and
+            # other projects' resources are not ours to register at all.
             "unregistered": sum(
-                1 for t in targets if not t.registered and not t.reason and not t.retired
+                1 for t in targets
+                if not t.registered and not t.reason and not t.retired and not t.foreign
             ),
             "retired": sum(1 for t in targets if t.retired and not t.reason),
         }
@@ -267,13 +269,16 @@ def sync_deployed_agents(
 # S3 by hand.
 
 
-async def _stage(file: UploadFile) -> StagedBundle:
-    body = await file.read()
+def _stage(file: UploadFile) -> StagedBundle:
+    # The handlers below are plain `def` so FastAPI runs them on its threadpool:
+    # unpacking the zip, writing the bundle to S3 and the registry calls are all
+    # blocking. Starlette has already spooled the upload, so the sync read is local.
+    body = file.file.read()
     return _bundles().inspect(file.filename or "", body)
 
 
 @router.post("/skills/validate", response_model=SkillBundleInfo)
-async def validate_skill_bundle(
+def validate_skill_bundle(
     file: UploadFile = File(...),
     _: AuthUser = Depends(current_user),
 ):
@@ -287,7 +292,7 @@ async def validate_skill_bundle(
     error in asking it.
     """
     try:
-        return (await _stage(file)).info
+        return _stage(file).info
     except Exception as exc:
         _fail(exc)
 
@@ -313,7 +318,7 @@ def list_bucket_skills(_: AuthUser = Depends(current_user)):
 
 
 @router.post("/skills/bucket", response_model=DiscoveredSkill)
-async def publish_bucket_skill(
+def publish_bucket_skill(
     file: UploadFile = File(...),
     _: AuthUser = Depends(require_admin),
 ):
@@ -326,7 +331,7 @@ async def publish_bucket_skill(
     equivalent of replacing a record's bundle.
     """
     try:
-        staged = await _stage(file)
+        staged = _stage(file)
         info = staged.info
         if not info.valid:
             raise InvalidSkillBundle(
@@ -367,7 +372,7 @@ def delete_bucket_skill(
 
 
 @router.post("/skills", response_model=RegistryRecordSummary)
-async def create_skill_record(
+def create_skill_record(
     file: UploadFile = File(...),
     version: str | None = Form(None),
     submit_for_approval: bool = Form(True),
@@ -380,7 +385,7 @@ async def create_skill_record(
     a second, editable copy could only ever disagree with it.
     """
     try:
-        staged = await _stage(file)
+        staged = _stage(file)
         info = staged.info
         if not info.valid:
             raise InvalidSkillBundle(
@@ -429,7 +434,7 @@ async def create_skill_record(
 
 
 @router.put("/skills/{record_id:path}", response_model=RegistryRecordDetail)
-async def replace_skill_bundle(
+def replace_skill_bundle(
     record_id: str,
     file: UploadFile = File(...),
     _: AuthUser = Depends(require_admin),
@@ -448,7 +453,7 @@ async def replace_skill_bundle(
                 f"{current.descriptor_type} 레코드입니다."
             )
 
-        staged = await _stage(file)
+        staged = _stage(file)
         info = staged.info
         if not info.valid:
             raise InvalidSkillBundle(

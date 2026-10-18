@@ -41,6 +41,11 @@ AGENT_RUNTIME_DISCOVERY_REGIONS = [
 # prefix; Terraform passes it as PLATFORM=var.project.
 PLATFORM = os.getenv("PLATFORM", "bap")
 
+# Worker threads for blocking calls: FastAPI's sync handlers and every
+# `asyncio.to_thread`. Matches the DynamoDB client pool (repositories/base.py);
+# beyond it threads would only queue for a connection. See main.lifespan.
+BLOCKING_THREADS = int(os.getenv("BLOCKING_THREADS", "64"))
+
 # Cognito authentication (password login + access-token verification). The
 # pool id alone enables token verification; the client id enables the
 # /api/auth/login password flow and so the "아이디 · 비밀번호" option on the

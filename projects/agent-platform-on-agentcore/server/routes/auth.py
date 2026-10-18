@@ -19,12 +19,14 @@ Cognito configuration: COGNITO_USER_POOL_CLIENT_ID, COGNITO_REGION, and
 COGNITO_CLIENT_SECRET (optional; when set, SECRET_HASH is computed).
 """
 import base64
+import functools
 import hashlib
 import hmac
 import logging
 import os
 
 import boto3
+from botocore.config import Config as BotoConfig
 from fastapi import APIRouter, Depends, Request
 
 from core import config
@@ -42,6 +44,20 @@ def _get_cognito_config():
     region = config.COGNITO_REGION
     client_secret = os.getenv("COGNITO_CLIENT_SECRET")
     return client_id, region, client_secret
+
+
+@functools.lru_cache(maxsize=None)
+def _cognito(region: str):
+    """One Cognito client per region for the process.
+
+    Building a client per request cost ~100ms of credential and endpoint loading,
+    and both password routes did it on the event loop: 200 people signing in at
+    once got 3 logins/s and 42% 504s (bst load test, 2026-10-18). The pool is
+    sized for the threadpool the sync handlers below run on.
+    """
+    return boto3.client(
+        "cognito-idp", region_name=region, config=BotoConfig(max_pool_connections=64)
+    )
 
 
 def _user_repo():
@@ -147,8 +163,11 @@ def _map_cognito_error(exc: Exception) -> str:
     return f"인증에 실패했습니다: {error_msg}"
 
 
+# Both password routes are plain `def`: the Cognito call is blocking boto3, so
+# FastAPI must run it on its threadpool. As `async def` it ran on the event loop
+# and every other request in the process waited behind each sign-in.
 @router.post("/login", response_model=AuthResponse)
-async def login(request: LoginRequest):
+def login(request: LoginRequest):
     """Authenticate an end-user with Cognito USER_PASSWORD_AUTH."""
     client_id, region, client_secret = _get_cognito_config()
 
@@ -159,7 +178,7 @@ async def login(request: LoginRequest):
         )
 
     try:
-        client = boto3.client("cognito-idp", region_name=region)
+        client = _cognito(region)
 
         auth_params = {
             "USERNAME": request.username,
@@ -190,7 +209,7 @@ async def login(request: LoginRequest):
 
 
 @router.post("/refresh", response_model=AuthResponse)
-async def refresh(request: RefreshRequest):
+def refresh(request: RefreshRequest):
     """Refresh tokens with Cognito REFRESH_TOKEN_AUTH.
 
     Cognito does not return a new refresh_token here; the client keeps the
@@ -205,7 +224,7 @@ async def refresh(request: RefreshRequest):
         )
 
     try:
-        client = boto3.client("cognito-idp", region_name=region)
+        client = _cognito(region)
 
         auth_params = {"REFRESH_TOKEN": request.refresh_token}
         # For a client with a secret, REFRESH_TOKEN_AUTH still needs SECRET_HASH,
