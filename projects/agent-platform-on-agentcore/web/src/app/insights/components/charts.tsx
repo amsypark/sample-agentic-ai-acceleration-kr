@@ -914,12 +914,18 @@ export function ScatterPlot({
   yName,
   colorIndex = 0,
   empty = "표시할 값이 없습니다.",
+  emphasisId,
+  onSelect,
 }: {
   entries: ScatterEntry[];
   xName: string;
   yName: string;
   colorIndex?: number;
   empty?: string;
+  /** The selected entity's dot keeps the hue; the rest go grey, as in `RankedBars`. */
+  emphasisId?: string | null;
+  /** A dot click, with the entry's `id`. */
+  onSelect?: (id: string) => void;
 }) {
   if (entries.length === 0) return <EmptyPlot label={empty} />;
   return (
@@ -974,7 +980,24 @@ export function ScatterPlot({
             stroke="hsl(var(--card))"
             strokeWidth={2}
             isAnimationActive={false}
-          />
+            cursor={onSelect ? "pointer" : undefined}
+            onClick={
+              onSelect
+                ? (point) => {
+                    const id = (point as { payload?: ScatterEntry }).payload?.id;
+                    if (id) onSelect(id);
+                  }
+                : undefined
+            }
+          >
+            {emphasisId &&
+              entries.map((entry) => (
+                <Cell
+                  key={entry.id ?? entry.name}
+                  fill={entry.id === emphasisId ? SERIES_COLORS[colorIndex] : MUTED_MARK}
+                />
+              ))}
+          </Scatter>
         </ScatterChart>
       </ResponsiveContainer>
     </div>
@@ -990,10 +1013,13 @@ export function ScatterPlot({
  */
 export function CostColumns({
   data,
+  name = "청구액",
 }: {
   data: Array<{ label: string; date: string; cost: number }>;
+  /** The series' name in the tooltip; the default is the bill's. */
+  name?: string;
 }) {
-  if (data.length === 0) return <EmptyPlot label="일별 청구액이 아직 없습니다." />;
+  if (data.length === 0) return <EmptyPlot label={`일별 ${name}이 아직 없습니다.`} />;
 
   return (
     <div className="h-52 w-full">
@@ -1013,13 +1039,13 @@ export function CostColumns({
             itemStyle={TOOLTIP_ITEM}
             formatter={(value) => [
               typeof value === "number" ? `$${value.toFixed(4)}` : String(value),
-              "청구액",
+              name,
             ]}
             labelFormatter={(_, payload) => tooltipDate(payload)}
           />
           <Bar
             dataKey="cost"
-            name="청구액"
+            name={name}
             fill={COST_COLOR}
             maxBarSize={BAR_MAX_SIZE}
             radius={[4, 4, 0, 0]}

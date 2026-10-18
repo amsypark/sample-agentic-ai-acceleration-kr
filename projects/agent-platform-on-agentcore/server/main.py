@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Import routers
 from routes import health, threads, mcp_apps, mcp, auth, registry, harness, artifacts, knowledge, insights, config, settings, org
 from core.config import COLLECTOR_ENABLED, COLLECTOR_INTERVAL_SECONDS
-from core.dependencies import collector_service, streaming_service
+from core.dependencies import collector_service, streaming_service, verify_tables
 
 
 @asynccontextmanager
@@ -33,7 +33,12 @@ async def lifespan(app: FastAPI):
     blocking boto3 calls never stall request handling.
 
     Also drains in-flight chat runs on shutdown; see services/run_broker.py.
+
+    Verifies the DynamoDB tables first. Raising here fails uvicorn's startup, so
+    a misconfigured task exits before it serves — the check that used to happen
+    as a side effect of importing the repositories.
     """
+    await asyncio.to_thread(verify_tables)
     task = None
     if COLLECTOR_ENABLED and collector_service is not None:
         task = asyncio.create_task(collector_service.run_forever(COLLECTOR_INTERVAL_SECONDS))

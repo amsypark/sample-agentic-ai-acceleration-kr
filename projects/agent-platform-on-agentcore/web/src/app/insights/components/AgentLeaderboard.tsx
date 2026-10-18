@@ -294,10 +294,13 @@ export function AgentLeaderboard({
        * second time, so the chart is gone and the column bar stayed: it is the one
        * that survives a re-sort by cost or latency.
        */}
-      <div className="overflow-x-auto rounded-md border border-border">
+      {/* Capped and scrolled with the header pinned: a row per agent made the
+          card as tall as the registry, and the drill-down a click opens below
+          sat a screen or more away from the row that opened it. */}
+      <div className="max-h-[26rem] overflow-auto rounded-md border border-border">
         <table className="w-full text-xs">
-          <thead>
-            <tr className="border-b border-border text-muted-foreground">
+          <thead className="sticky top-0 z-[1] bg-card shadow-[inset_0_-1px_0_hsl(var(--border))]">
+            <tr className="text-muted-foreground">
               {COLUMNS.map((column) => (
                 <th
                   key={column.key as string}

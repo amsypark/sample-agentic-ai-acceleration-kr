@@ -70,8 +70,9 @@ thread_repository = ThreadRepository(
     region_name=AWS_REGION
 )
 
-# The base repository raises when the table is missing, so only construct it once
-# artifact storage is configured. Without it artifacts still stream to the UI,
+# Every repository built here is verified at startup (`verify_tables`), and a
+# missing table stops the server, so only construct it once artifact storage is
+# configured. Without it artifacts still stream to the UI,
 # just unpersisted.
 artifact_repository = (
     ArtifactRepository(table_name=ARTIFACTS_TABLE, region_name=AWS_REGION)
@@ -111,9 +112,9 @@ harness_output_service = HarnessOutputService(
     preview_service=artifact_preview_service,
 )
 
-# Same conditional construction as artifact_repository: the base repository probes
-# its table at import time, so without the table name the container would fail to
-# start instead of reporting the feature as unconfigured.
+# Same conditional construction as artifact_repository: without the table name the
+# startup check would fail the container instead of reporting the feature as
+# unconfigured.
 usage_repository = (
     UsageRepository(table_name=USAGE_TABLE, region_name=AWS_REGION)
     if USAGE_TABLE
@@ -160,9 +161,9 @@ streaming_service = StreamingService(
     run_broker=run_broker,
 )
 
-# Same conditional construction as artifact_repository: the base repository
-# probes its table at import time, so without the table name the container would
-# fail to start instead of reporting the feature as unconfigured.
+# Same conditional construction as artifact_repository: without the table name the
+# startup check would fail the container instead of reporting the feature as
+# unconfigured.
 knowledge_repository = (
     KnowledgeRepository(table_name=KNOWLEDGE_TABLE, region_name=AWS_REGION)
     if KNOWLEDGE_TABLE
@@ -189,9 +190,8 @@ knowledge_service = KnowledgeService(
 )
 
 # Per-user preferences: same conditional construction as artifact_repository.
-# The base repository probes its table at import time, so without the table name
-# the container would fail to start instead of reporting the feature as
-# unconfigured. A degraded layout service operates in unpersisted mode.
+# Without the table name the startup check would fail the container instead of
+# reporting the feature as unconfigured. A degraded layout service operates in unpersisted mode.
 prefs_repository = (
     PrefsRepository(table_name=PREFS_TABLE, region_name=AWS_REGION)
     if PREFS_TABLE
@@ -315,3 +315,23 @@ if collector_service is not None:
         # A harness composed from the UI gets its delivery the moment its companion
         # runtime is READY, rather than on the collector's next pass.
         usage_service.harness.on_runtime_ready = observability_service.ensure_usage_logs
+
+
+def verify_tables() -> None:
+    """Probe every configured table once; raise on the first that is unusable.
+
+    Called from the server's lifespan, not at import: importing this module makes
+    no AWS call, so tests and scripts load it without credentials, while a task
+    with a wrong table name or a missing DescribeTable grant still never comes up.
+    """
+    for repository in (
+        thread_repository,
+        artifact_repository,
+        usage_repository,
+        knowledge_repository,
+        prefs_repository,
+        team_repository,
+        user_repository,
+    ):
+        if repository is not None:
+            repository.verify()

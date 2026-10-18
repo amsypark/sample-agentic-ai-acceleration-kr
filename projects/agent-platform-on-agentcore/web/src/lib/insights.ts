@@ -556,6 +556,14 @@ export interface UserUsageRow {
   agents?: { record_id: string; name: string; turns: number }[];
   /** Days in the window on which this person took at least one turn. */
   active_days?: number;
+  /** This person's days with turns, sparse and oldest first. */
+  daily?: {
+    date: string;
+    turns: number;
+    failed_turns: number;
+    model_cost_micros: number;
+    unpriced_turns: number;
+  }[];
   turns: number;
   input_tokens: number;
   output_tokens: number;

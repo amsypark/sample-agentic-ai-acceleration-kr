@@ -975,3 +975,29 @@ def test_a_broken_directory_leaves_the_rows_unnamed_but_served():
 
     assert body["subjects"] == {}
     assert body["users"][0]["sub"] == "sub-1"
+
+
+def test_user_rows_carry_their_own_days_from_the_same_read():
+    """The row-click drill-down draws a person's daily trend. It comes from the
+    USERS# (day, user) items the leaderboard already reads, so the row carries
+    exactly those days — sparse, and agreeing with `active_days` and the
+    daily-active count built from the same items."""
+    wire(usage_with_one_agent({
+        f"USERS#{_current_month}": [
+            {"sk": f"D#{_today_str}#U#sub-1", "turns": Decimal(3), "failed_turns": Decimal(1),
+             "model_cost_micros": Decimal(1200), "unpriced_turns": Decimal(0)},
+            {"sk": f"D#{_today_str}#U#sub-2", "turns": Decimal(0)},
+        ],
+    }), StubTelemetry())
+
+    body = insights.user_leaderboard(days=7, user=user(is_admin=True))
+
+    rows = {row["sub"]: row for row in body["users"]}
+    assert rows["sub-1"]["daily"] == [{
+        "date": _today_str, "turns": 3, "failed_turns": 1,
+        "model_cost_micros": 1200, "unpriced_turns": 0,
+    }]
+    assert rows["sub-1"]["active_days"] == 1
+    assert rows["sub-2"]["daily"] == []
+    today = next(p for p in body["daily_active_users"] if p["date"] == _today_str)
+    assert today["users"] == 1

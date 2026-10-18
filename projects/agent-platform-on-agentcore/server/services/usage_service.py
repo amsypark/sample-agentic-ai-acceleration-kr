@@ -935,21 +935,30 @@ class UsageService:
                     per_agent[record_id] = per_agent.get(record_id, 0) + turns
         return matrix
 
-    def daily_users(self, start_date: str, end_date: str) -> Dict[str, set]:
-        """day -> the subjects who took at least one turn that day.
+    def user_daily(self, start_date: str, end_date: str) -> Dict[str, Dict[str, Dict[str, int]]]:
+        """sub -> day -> the day's counters, for the (day, user) items with turns.
 
-        One USERS# item per (day, user) is the schema, so a day's active users is
-        the set of items with turns — no summing, and it cannot double count.
+        One USERS# item per (day, user) is the schema, so this is the partition
+        as stored, not a roll-up: a day's active users is the set of subs with an
+        entry, and a person's daily trend is their own entries. The same read
+        answers both, so the per-person drill-down costs no extra query.
+        Days without turns are absent, not zero.
         """
-        by_day: Dict[str, set] = {}
+        out: Dict[str, Dict[str, Dict[str, int]]] = {}
         for item in self._items("USERS#", start_date, end_date):
             sort_key = str(item.get("sk", ""))
             sub = self._suffix(sort_key, "#U#")
             day = sort_key[2:12] if sort_key.startswith("D#") else ""
-            if not sub or not day or int(item.get("turns") or 0) <= 0:
+            turns = int(item.get("turns") or 0)
+            if not sub or not day or turns <= 0:
                 continue
-            by_day.setdefault(day, set()).add(sub)
-        return by_day
+            bucket = out.setdefault(sub, {}).setdefault(
+                day, {"turns": 0, "failed_turns": 0, "model_cost_micros": 0, "unpriced_turns": 0}
+            )
+            bucket["turns"] += turns
+            for key in ("failed_turns", "model_cost_micros", "unpriced_turns"):
+                bucket[key] += int(item.get(key) or 0)
+        return out
 
     def tool_totals(
         self, record_id: str, start_date: str, end_date: str

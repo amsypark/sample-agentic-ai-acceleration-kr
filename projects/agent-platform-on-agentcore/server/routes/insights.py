@@ -1344,11 +1344,11 @@ def user_leaderboard(
     usage.set_record_aliases(records)
     names = _record_names(records)
     matrix = usage.agent_user_matrix([record.record_id for record in records], window["start_date"], window["end_date"])
-    by_day = usage.daily_users(window["start_date"], window["end_date"])
-    active_days: Dict[str, int] = {}
-    for subs in by_day.values():
-        for sub in subs:
-            active_days[sub] = active_days.get(sub, 0) + 1
+    per_day = usage.user_daily(window["start_date"], window["end_date"])
+    by_day: Dict[str, set] = {}
+    for sub, days_map in per_day.items():
+        for day in days_map:
+            by_day.setdefault(day, set()).add(sub)
 
     rows: List[Dict[str, Any]] = []
     for sub, counters in totals.items():
@@ -1362,7 +1362,13 @@ def user_leaderboard(
         rows.append({
             "sub": sub,
             "agents": agents,
-            "active_days": active_days.get(sub, 0),
+            "active_days": len(per_day.get(sub, {})),
+            # The person's own days, sparse and oldest first, for the drill-down
+            # a row click opens. Read with `by_day` above, so it is free.
+            "daily": [
+                {"date": day, **counters}
+                for day, counters in sorted(per_day.get(sub, {}).items())
+            ],
             "turns": counters.get("turns", 0),
             "input_tokens": counters.get("input_tokens", 0),
             "output_tokens": counters.get("output_tokens", 0),
