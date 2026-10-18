@@ -58,6 +58,7 @@ page degraded to a dash or a collapsed card. It now reports
 `rate_scope` for the same reason — a qualifier that does not reach the tile the
 reader looks at is not a qualifier.
 """
+import hashlib
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
@@ -2115,20 +2116,31 @@ def record_insights(
     )
     if not user.is_admin:
         # Computed once for everyone, as an admin sees it. A record's counters
-        # are public; whose turn each was, and which thread it ran in, is not —
-        # a non-admin keeps the thread only on their own turns.
-        out = {
-            **out,
-            "turns": [
-                {
-                    **turn,
-                    "owner_sub": None,
-                    "thread_id": turn.get("thread_id") if turn.get("owner_sub") == user.sub else None,
-                }
-                for turn in out.get("turns", [])
-            ],
-        }
+        # are public; whose turn each was, and which thread it ran in, is not.
+        out = {**out, "turns": [_public_turn(turn, user.sub) for turn in out.get("turns", [])]}
     return out
+
+
+# What a non-admin may see of one turn on a record. An allow-list, so a field
+# added to the admin view later is not shown to everyone by default.
+_PUBLIC_TURN_FIELDS = (
+    "ended_at", "status", "model_id", "input_tokens", "output_tokens",
+    "cache_read_tokens", "cache_write_tokens", "model_cost_micros", "measured", "source",
+)
+
+
+def _public_turn(turn: Dict[str, Any], viewer_sub: str) -> Dict[str, Any]:
+    """A turn as a non-admin sees it: their own in full, anyone else's without
+    the thread. `turn_id` is `<thread_id>:<message_id>`, so for someone else's
+    turn it is replaced by an opaque stand-in — still unique and stable, which
+    the chart's x-axis and the rows' keys need."""
+    own = bool(viewer_sub) and turn.get("owner_sub") == viewer_sub
+    public = {field: turn.get(field) for field in _PUBLIC_TURN_FIELDS}
+    raw_id = str(turn.get("turn_id") or "")
+    public["turn_id"] = raw_id if own else "t-" + hashlib.sha256(raw_id.encode()).hexdigest()[:16]
+    public["thread_id"] = turn.get("thread_id") if own else None
+    public["owner_sub"] = None
+    return public
 
 
 def _compute_record_insights(

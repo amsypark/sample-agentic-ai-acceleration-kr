@@ -148,6 +148,12 @@ def test_a_non_admin_sees_threads_only_on_their_own_turns(stub_compute):
     counters are the public part of a record."""
     turns = insights.record_insights(record_id="rec-1", days=7, user=_user(False))["turns"]
     assert [t["thread_id"] for t in turns] == [None, "th-mine"]
+    # turn_id is "<thread>:<message>" in the ledger: someone else's is replaced,
+    # stays unique and stable, and gives nothing of the original away.
+    assert turns[1]["turn_id"] == "t2"
+    assert turns[0]["turn_id"].startswith("t-") and "th-alice" not in turns[0]["turn_id"]
+    again = insights.record_insights(record_id="rec-1", days=7, user=_user(False))["turns"]
+    assert again[0]["turn_id"] == turns[0]["turn_id"]
     admin_turns = insights.record_insights(record_id="rec-1", days=7, user=_user(True))["turns"]
     assert [t["thread_id"] for t in admin_turns] == ["th-alice", "th-mine"]
 
