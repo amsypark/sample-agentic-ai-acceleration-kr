@@ -5,7 +5,7 @@ COPY package.json yarn.lock ./
 RUN corepack enable && yarn install --frozen-lockfile
 
 COPY . .
-RUN yarn build
+RUN yarn next build --webpack
 
 FROM node:20-slim AS runner
 WORKDIR /app
