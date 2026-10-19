@@ -195,6 +195,9 @@ knowledge_provisioner = KnowledgeProvisioner(
     gateway_role_arn=KB_GATEWAY_ROLE_ARN,
 )
 
+if knowledge_repository is not None:
+    usage_service.knowledge_bases = knowledge_repository.all_records
+
 knowledge_service = KnowledgeService(
     repository=knowledge_repository,
     provisioner=knowledge_provisioner,

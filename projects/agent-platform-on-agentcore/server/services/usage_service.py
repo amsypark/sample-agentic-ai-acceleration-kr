@@ -26,7 +26,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from boto3.dynamodb.conditions import Attr
 
@@ -171,6 +171,11 @@ class UsageService:
         # as KnowledgeService's `_harness`.
         self._registry = registry
         self._harness = harness
+        # Knowledge bases for the composition rollup: a callable returning
+        # records with `kb_key`, `name` and `gateway_arn`. Set after
+        # construction (core.dependencies), because the knowledge repository is
+        # built after this service.
+        self.knowledge_bases: Optional[Callable[[], List[Any]]] = None
         self._cache_seconds = cache_seconds
         self._model_cache: Optional[Dict[str, str]] = None
         self._model_cache_at = 0.0
@@ -1797,6 +1802,23 @@ class UsageService:
             for name, endpoint in endpoints.items():
                 fronting.setdefault(endpoint, set()).add(name)
 
+        knowledge = []
+        if self.knowledge_bases is not None:
+            try:
+                knowledge = [kb for kb in self.knowledge_bases() if getattr(kb, "gateway_arn", None)]
+            except Exception:
+                logger.warning("Could not list knowledge bases", exc_info=True)
+        kb_gateways = {kb.gateway_arn for kb in knowledge}
+        for kb in knowledge:
+            hit = reach.get(kb.gateway_arn) or {"turns": 0, "agents": 0}
+            sections["knowledge_bases"].append({
+                "record_id": kb.kb_key,
+                "name": kb.name,
+                "turns": hit["turns"],
+                "agents": hit["agents"],
+                "metric": "traffic",
+            })
+
         for section in ("mcp", "skills"):
             for summary, content in details[section]:
                 matched = {"turns": 0, "agents": 0}
@@ -1812,15 +1834,16 @@ class UsageService:
                     )
                     matched["turns"] += sum(turns for _, turns in callers)
                     matched["agents"] += len(callers)
-                # A knowledge base is an MCP record whose descriptor names a
-                # gateway; a plain MCP server names a URL. Splitting them here
-                # keeps the UI from calling a knowledge base a tool server.
-                target = (
-                    "knowledge_bases"
-                    if section == "mcp" and gateway_arn_of(content)
-                    else section
-                )
-                sections[target].append({
+                # A gateway-backed MCP record is a tool gateway, not a knowledge
+                # base: knowledge bases are never published as records
+                # (agent_sync_service skips their gateways), so reading every
+                # gateway record as one listed the platform tool gateway under
+                # Knowledge and no actual knowledge base at all (bst, 2026-10-19).
+                # A record that does front a knowledge base's gateway is left to
+                # the knowledge section below, which names it.
+                if section == "mcp" and gateway_arn_of(content) in kb_gateways:
+                    continue
+                sections[section].append({
                     "record_id": summary.record_id,
                     "name": summary.name,
                     "turns": matched["turns"],
