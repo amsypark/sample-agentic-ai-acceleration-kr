@@ -174,6 +174,11 @@ aws xray update-indexing-rule --name Default --region $REGION \
 
 ### 4. 설정값 입력 → terraform.tfvars
 
+처음 만드는 환경에서는 Advanced 탭의 `bucket_suffix` 가 2번 단계의 계정 ID(`-<account-id>`)로,
+`activate_cost_allocation_tags` 가 `false` 로 미리 채워져 있습니다. S3 버킷 이름은 전 세계에서
+유일해서 기본 이름은 먼저 배포한 계정이 차지하고 있고, Cost Explorer 를 열어 본 적 없는 계정은
+비용 할당 태그 활성화가 거부되기 때문입니다. 두 값은 그대로 두고 저장하면 됩니다.
+
 이 단계에서 `Enter` 를 누르거나 아무 화면에서 `s` 를 누르면 설정 화면이 열립니다. 입력 폼은
 `infra/envs/standalone/variables.tf` 를 읽어 자동으로 구성되므로, 변수가 추가되면 폼에도 그대로
 나타납니다.

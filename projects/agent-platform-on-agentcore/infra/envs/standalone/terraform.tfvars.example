@@ -59,8 +59,18 @@ web_search_backend = "agentcore"
 # runs with AGENT_REGISTRY_ID empty (auto-registration off).
 # enable_agent_registry = true
 
-# S3 bucket names are global; add a suffix if <project>-<purpose>-<region> is taken.
+# S3 bucket names are global. The bare <project>-<purpose>-<region> names are
+# taken by whoever deployed with the defaults first, so a new account gets
+# BucketAlreadyExists on all four buckets. Set this before the first apply; the
+# installer fills it with the account id. Do not change it on a deployed stack
+# (Terraform would replace the buckets).
 # bucket_suffix = "-<account_id>"
+
+# Off for the first apply into a fresh account. An account that has never opened
+# Cost Explorer rejects the call ("User not enabled for cost explorer access"),
+# and one that has still rejects a tag Billing has not seen on usage yet (up to
+# 24 hours). Turn it on later and apply again; see DEPLOYMENT.md.
+activate_cost_allocation_tags = false
 
 # Also list AgentCore runtimes deployed in these regions when registering an agent,
 # so an agent living elsewhere can be chatted from here without moving it.

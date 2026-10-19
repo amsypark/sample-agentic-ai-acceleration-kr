@@ -161,6 +161,7 @@ module "mcp_gateway" {
   policy_engine_arn     = var.enable_gateway_policy ? module.policy_engine[0].engine_arn : ""
   policy_mode           = var.policy_mode
   demo_tools            = var.demo_tools
+  python_bin            = var.registry_python_bin
 }
 
 module "s3_skills" {

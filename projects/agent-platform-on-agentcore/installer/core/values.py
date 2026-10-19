@@ -50,9 +50,47 @@ def _unquote(literal: str) -> str:
     return literal
 
 
+def _backend_path(env: Env) -> Path:
+    return env.tf_dir / "backend.hcl"
+
+
+def _account_from_backend(env: Env) -> str | None:
+    """Account id from the state bucket name step 2 wrote (<project>-tfstate-<account>)."""
+    path = _backend_path(env)
+    if not path.is_file():
+        return None
+    match = re.search(r"tfstate-(\d{12})", path.read_text())
+    return match.group(1) if match else None
+
+
+def fresh_defaults(env: Env) -> dict[str, str]:
+    """Literals a first-time environment starts from instead of the Terraform defaults.
+
+    The Terraform defaults stay as they are so an existing stack is not changed
+    on its next apply (a new bucket suffix would replace every bucket; turning
+    cost allocation tags off would deactivate them). A fresh account needs
+    different values, and these were the two the first-apply rehearsal in an
+    untouched account tripped over:
+
+    - bucket_suffix: S3 bucket names are global, so `<project>-skills-<region>`
+      and the other three are taken by whoever deployed with the defaults first
+      and every later account gets BucketAlreadyExists. The account id makes
+      them unique.
+    - activate_cost_allocation_tags: an account that has never opened Cost
+      Explorer rejects the call with "User not enabled for cost explorer
+      access", and one that has still rejects a tag Billing has not yet seen on
+      usage (up to 24 hours). Start off; DEPLOYMENT.md says when to turn it on.
+    """
+    out = {"activate_cost_allocation_tags": "false"}
+    account = _account_from_backend(env)
+    if account:
+        out["bucket_suffix"] = f'"-{account}"'
+    return out
+
+
 def load_fields(env: Env) -> tuple[Field, ...]:
     path = _tfvars_path(env)
-    current = hcl.read_values(path.read_text()) if path.is_file() else {}
+    current = hcl.read_values(path.read_text()) if path.is_file() else fresh_defaults(env)
     out = []
     for variable in hcl.read_variables(env.variables_path):
         literal = current.get(variable.name, variable.default_literal or "")

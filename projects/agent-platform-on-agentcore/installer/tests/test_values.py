@@ -171,3 +171,35 @@ def test_reset_after_destroy_does_not_add_allow_destroy(tmp_path, monkeypatch):
     path = _tfvars(tmp_path, monkeypatch, 'project = "bap"\n')
     assert values.reset_after_destroy(ENV) is None
     assert path.read_text() == 'project = "bap"\n'
+
+
+def test_fresh_environment_starts_from_safe_defaults(tmp_path, monkeypatch):
+    """No tfvars yet: cost tags off and the bucket suffix from the state bucket's account."""
+    monkeypatch.setattr(values, "_tfvars_path", lambda env: tmp_path / "terraform.tfvars")
+    backend = tmp_path / "backend.hcl"
+    backend.write_text('bucket         = "bap-tfstate-123456789012"\ndynamodb_table = "bap-tflock"\n')
+    monkeypatch.setattr(values, "_backend_path", lambda env: backend)
+    by_name = {f.variable.name: f for f in values.load_fields(ENV)}
+    assert by_name["activate_cost_allocation_tags"].value == "false"
+    assert by_name["bucket_suffix"].value == "-123456789012"
+    # Terraform's own defaults are untouched: an existing stack must not change on apply.
+    assert VARS["activate_cost_allocation_tags"].default_literal == "true"
+    assert VARS["bucket_suffix"].default_literal == '""'
+
+
+def test_fresh_environment_without_backend_leaves_bucket_suffix_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(values, "_tfvars_path", lambda env: tmp_path / "terraform.tfvars")
+    monkeypatch.setattr(values, "_backend_path", lambda env: tmp_path / "backend.hcl")
+    by_name = {f.variable.name: f for f in values.load_fields(ENV)}
+    assert by_name["activate_cost_allocation_tags"].value == "false"
+    assert by_name["bucket_suffix"].value == ""
+
+
+def test_existing_tfvars_wins_over_fresh_defaults(tmp_path, monkeypatch):
+    tfvars = tmp_path / "terraform.tfvars"
+    tfvars.write_text('activate_cost_allocation_tags = true\nbucket_suffix = "-keep"\n')
+    monkeypatch.setattr(values, "_tfvars_path", lambda env: tfvars)
+    monkeypatch.setattr(values, "_backend_path", lambda env: tmp_path / "backend.hcl")
+    by_name = {f.variable.name: f for f in values.load_fields(ENV)}
+    assert by_name["activate_cost_allocation_tags"].value == "true"
+    assert by_name["bucket_suffix"].value == "-keep"

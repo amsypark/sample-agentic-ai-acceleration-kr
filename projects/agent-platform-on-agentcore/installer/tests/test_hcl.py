@@ -202,6 +202,11 @@ def test_every_real_default_round_trips_as_its_own_type(tmp_path, monkeypatch):
     from installer.core.env import get
 
     monkeypatch.setattr(values, "_tfvars_path", lambda e: tmp_path / "none.tfvars")
+    # A first-time environment deliberately starts from other literals (cost
+    # tags off, account-id bucket suffix; see values.fresh_defaults). This test
+    # is about the Terraform defaults round-tripping as their own type, so take
+    # those out of the way.
+    monkeypatch.setattr(values, "fresh_defaults", lambda e: {})
     for field in values.load_fields(get("standalone")):
         v = field.variable
         if not v.has_default or v.default_literal is None:

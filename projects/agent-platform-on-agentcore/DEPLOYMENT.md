@@ -181,7 +181,7 @@ user_password  = "<choose-a-password>"
 | `alb_ingress_cidrs` | 전체 공개 | ALB 접근을 사내 대역 등으로 제한 |
 | `certificate_arn` + `public_host` | `""` | ALB 에서 TLS 종료. 비우면 HTTP 전용 |
 | `alert_email` | `""` | CloudWatch 알람 SNS 구독 주소 |
-| `bucket_suffix` | `""` | S3 버킷 이름이 이미 쓰이고 있으면 `-<account-id>` 등을 덧붙임 |
+| `bucket_suffix` | `""` | S3 버킷 이름은 전 세계에서 유일합니다. 기본 이름 `<project>-skills-<region>` 등 4개는 먼저 배포한 계정이 차지하므로 **새 계정은 첫 apply 전에 `-<account-id>` 를 넣습니다**(인스톨러는 자동으로 채움). 배포된 스택에서는 바꾸지 않습니다(버킷이 교체됨) |
 | `enable_agent_registry` | `true` | 조직 SCP 가 Registry API 를 막는 경우 `false` |
 
 > **HTTPS 를 권장합니다.** `certificate_arn` 없이 올리면 ALB 는 평문 HTTP 입니다. 대부분의
@@ -197,10 +197,12 @@ ECR 리포지토리를 이 apply 가 만들기 때문에 아직 올릴 이미지
 terraform apply -var desired_count=0
 ```
 
-> **빈 계정에서는 `cost_allocation_tags` 모듈이 실패할 수 있습니다.** Billing 은 태그
-> 키가 청구된 사용량에서 관측된 뒤(최대 24시간)에야 활성화를 받아 줍니다. 이 경우
-> `-var activate_cost_allocation_tags=false` 를 붙여 진행하고, 플랫폼을 하루 정도 쓴 뒤
-> 기본값으로 다시 apply 합니다. 이 태그가 없는 동안에는 Insights 의 에이전트별 청구
+> **새 계정에서는 `cost_allocation_tags` 모듈이 실패합니다.** 두 가지 메시지가 있습니다.
+> Cost Explorer 를 한 번도 열지 않은 계정은 `AccessDeniedException: User not enabled for cost
+> explorer access` 로, 열어 둔 계정이라도 Billing 이 태그 키를 청구된 사용량에서 관측하기
+> 전(최대 24시간)에는 태그 활성화 거부로 실패합니다. 첫 apply 는 `activate_cost_allocation_tags
+> = false` 로 진행하고(인스톨러는 새 환경에서 이 값을 기본으로 채움), 플랫폼을 하루 정도 쓴 뒤
+> `true` 로 바꿔 다시 apply 합니다. 이 태그가 없는 동안에는 Insights 의 에이전트별 청구
 > 비용만 `집계 중` 으로 남습니다.
 
 ---

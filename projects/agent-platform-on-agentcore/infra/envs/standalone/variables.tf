@@ -245,7 +245,7 @@ variable "registry_tool_on_gateway" {
 }
 
 variable "registry_python_bin" {
-  description = "Python interpreter for the agent_registry module's registry.py (needs botocore >= 1.43 with the agent-registry-control model). Defaults to system python3; override with a venv python where that is too old."
+  description = "Python interpreter for the local-exec scripts of the agent_registry (registry.py) and mcp_gateway (gateway_target.py) modules. Both need botocore >= 1.43.89 (agent-registry-control model, Web Search connector target); with an older system python3 the first apply fails on exactly those two resources. Defaults to system python3; override with a venv python where that is too old. Decide it before the first apply: the interpreter is part of the local-exec command frozen in each null_resource's triggers, so changing it on a deployed stack replaces the gateway targets and the registry resources (the registry replacement runs the delete provisioner, which removes the Registry and its records)."
   type        = string
   default     = "python3"
 }

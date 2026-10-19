@@ -71,3 +71,9 @@ variable "demo_tools" {
   description = "Keep the workshop mock tools (approve_expense, lookup_salary) on the Lambda target. They return canned results, so they are dropped by default."
   default     = false
 }
+
+variable "python_bin" {
+  type        = string
+  description = "Python interpreter used to run gateway_target.py (local-exec). Needs a boto3 that knows the AgentCore Web Search connector target (botocore >= 1.43.89); with an older system python3 the web-search target fails with 'Unknown parameter in targetConfiguration.mcp: connector'. Point at a venv/uv python where the host's python3 is too old. Part of the null_resource triggers, so changing it on a deployed stack replaces the gateway targets."
+  default     = "python3"
+}
