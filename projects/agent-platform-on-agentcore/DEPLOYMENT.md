@@ -584,6 +584,12 @@ python scripts/backfill_thread_index.py --table <project>-threads --region <regi
 역할(`AmazonBedrockAgentCoreSDKRuntime-*`)로 도는 런타임이 있다면, 먼저 `deploy.sh` 로 다시 배포해(빈 `EXECUTION_ROLE`
 은 Terraform output 으로 채워집니다) 역할을 옮긴 뒤 apply 합니다.
 
+**Guardrail 강도.** 필터 강도는 신뢰도 임계값입니다(HIGH 는 LOW 신뢰도까지 막습니다). 기본값은 Standard 등급에서
+강도별로 보정한 값으로, 입력 필터 MEDIUM·출력 필터 LOW·PROMPT_ATTACK LOW 입니다. 실제 채팅 턴에서 공격 20건 중 19건,
+명백한 유해 요청 15건 전부를 막고 평범한 지시 40건 중 2건을 막았습니다. 출력을 HIGH 로 올리면 역사·뉴스·문학 답이,
+PROMPT_ATTACK 을 MEDIUM 으로 올리면 "앞의 질문은 무시하고…" 같은 평범한 지시가 더 막힙니다. 바꾸려면
+`modules/bedrock_guardrail` 의 `content_input_strength`·`content_output_strength`·`prompt_attack_strength` 를 씁니다.
+
 **규모별 크기.** 기본 태스크 크기는 시범 운영용입니다. 사용자 1,000명 규모(쓰레드 8.8만, 원장 90일)에서
 서버 태스크(1 vCPU) 하나의 상한은 약 70 req/s 였고, 2개로 늘리면 약 138 req/s 와 동시 채팅 300 의 첫 토큰
 p50 8.8초(1개일 때 15.9초)였습니다. 서버는 프로세스 하나라 태스크당 `server_cpu = 1024` 까지가 쓸모 있는

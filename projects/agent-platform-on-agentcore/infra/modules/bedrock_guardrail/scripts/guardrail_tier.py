@@ -13,7 +13,8 @@ English, French and Spanish only. On this Korean-language platform it let all
 three Korean prompt attacks of a ten-attack sample through, and at HIGH strength
 it blocked 8 of 12 ordinary English instructions ("Respond only with JSON",
 "Reply in the chat (no artifact)…") as prompt attacks. The Standard tier caught
-10 of 10 attacks at HIGH confidence and rated 11 of 12 benign instructions NONE.
+10 of 10 attacks at HIGH confidence. The strengths it runs at are calibrated in
+../variables.tf.
 
 Usage:
   guardrail_tier.py apply --guardrail-id ID --region R --tier STANDARD --profile us.guardrail.v1:0

@@ -35,7 +35,8 @@ from services.registry_service import (
     owner_identity,
 )
 from services.team_access import can_see, filter_visible, team_of, visibility_known
-from services.default_agent import is_default_record, mark_default
+from core.aws_errors import client_error_http
+from services.default_agent import default_record, is_default_record, mark_default
 from services.agent_defaults import AgentDefaults, resolve_agent_defaults
 from services.skill_bundle_service import (
     DiscoveredSkill,
@@ -116,26 +117,7 @@ def _fail(exc: Exception) -> None:
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, ClientError):
-        error = exc.response.get("Error", {})
-        code = error.get("Code", "Unknown")
-        detail = f"AWS error ({code}): {error.get('Message', str(exc))}"
-        # The caller's request conflicts with the record's state, names nothing,
-        # or is malformed: theirs to fix, so not a 502 (which the web reads as
-        # "the server is broken"). A duplicate name and an edit while the record
-        # is still CREATING/UPDATING were 502 (bst T1 smoke, 2026-10-18); the
-        # Registry settles a write within seconds, so a 409 says "retry shortly".
-        if code == "ConflictException":
-            message = str(error.get("Message", ""))
-            if "CREATING" in message or "UPDATING" in message:
-                detail = "레코드가 아직 저장되는 중입니다. 잠시 후 다시 시도하세요. " + detail
-            raise HTTPException(status_code=409, detail=detail)
-        if code == "ResourceNotFoundException":
-            raise HTTPException(status_code=404, detail=detail)
-        if code == "ValidationException":
-            raise HTTPException(status_code=400, detail=detail)
-        if code in ("ThrottlingException", "TooManyRequestsException", "ServiceQuotaExceededException"):
-            raise HTTPException(status_code=503, detail=detail, headers={"Retry-After": "2"})
-        raise HTTPException(status_code=502, detail=detail)
+        raise client_error_http(exc)
     logger.error("Registry route error: %s", exc)
     logger.error(traceback.format_exc())
     raise HTTPException(status_code=500, detail=str(exc))
@@ -551,7 +533,9 @@ def get_record_defaults(record_id: str, user: AuthUser = Depends(current_user)):
 def get_record(record_id: str, user: AuthUser = Depends(current_user)):
     """The list filters by the approved revision's team; this detail by the latest's."""
     detail = _record_detail(record_id, user)
-    detail.is_default = is_default_record(detail)
+    # The same one record the list flags, not "points at the default runtime".
+    chosen = default_record(_registry()) if is_default_record(detail) else None
+    detail.is_default = bool(chosen and chosen.record_id == detail.record_id)
     return detail
 
 

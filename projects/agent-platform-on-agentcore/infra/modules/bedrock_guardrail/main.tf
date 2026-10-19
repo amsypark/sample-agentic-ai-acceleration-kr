@@ -37,8 +37,8 @@ resource "aws_bedrock_guardrail" "this" {
       for_each = ["HATE", "INSULTS", "SEXUAL", "VIOLENCE", "MISCONDUCT"]
       content {
         type            = filters_config.value
-        input_strength  = var.content_filter_strength
-        output_strength = var.content_filter_strength
+        input_strength  = var.content_input_strength
+        output_strength = var.content_output_strength
       }
     }
   }
@@ -70,14 +70,15 @@ locals {
 
 resource "null_resource" "tier" {
   triggers = {
-    guardrail_id     = aws_bedrock_guardrail.this.guardrail_id
-    tier             = var.tier
-    profile          = local.guardrail_profile
-    script_sha       = filesha256(local.tier_script)
-    content_strength = var.content_filter_strength
-    prompt_strength  = var.prompt_attack_strength
-    blocked_input    = aws_bedrock_guardrail.this.blocked_input_messaging
-    blocked_output   = aws_bedrock_guardrail.this.blocked_outputs_messaging
+    guardrail_id    = aws_bedrock_guardrail.this.guardrail_id
+    tier            = var.tier
+    profile         = local.guardrail_profile
+    script_sha      = filesha256(local.tier_script)
+    content_input   = var.content_input_strength
+    content_output  = var.content_output_strength
+    prompt_strength = var.prompt_attack_strength
+    blocked_input   = aws_bedrock_guardrail.this.blocked_input_messaging
+    blocked_output  = aws_bedrock_guardrail.this.blocked_outputs_messaging
   }
 
   provisioner "local-exec" {

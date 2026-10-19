@@ -365,9 +365,28 @@ class OrgDirectoryService:
         return user, temp
 
     def _fresh(self, user: OrgUser) -> OrgUser:
-        """The caller's object may predate an earlier write (or a console edit);
-        diff against what the pool says now, falling back to the object given."""
-        return self.get_user(user.sub) or user
+        """The user's role and teams as the pool holds them now.
+
+        Writes diff against this, so it must not come from the snapshot: on a
+        task whose snapshot had not seen an add, a team removal computed
+        "nothing to remove", made no call and answered 204, and the team delete
+        that followed found the member still there (bst smoke, 2026-10-18).
+        AdminListGroupsForUser is one call and reads the group table directly.
+        """
+        groups: List[str] = []
+        token: Optional[str] = None
+        with self._user_gone():
+            while True:
+                kwargs: Dict[str, Any] = {"UserPoolId": self._pool, "Username": user.username, "Limit": PAGE_SIZE}
+                if token:
+                    kwargs["NextToken"] = token
+                resp = self._cognito.admin_list_groups_for_user(**kwargs)
+                groups.extend(str(g.get("GroupName")) for g in resp.get("Groups") or [])
+                token = resp.get("NextToken")
+                if not token:
+                    break
+        teams = sorted(g[len(TEAM_PREFIX):] for g in groups if g.startswith(TEAM_PREFIX))
+        return user.model_copy(update={"role": "admin" if ADMIN_GROUP in groups else "user", "teams": teams})
 
     def set_role(self, user: OrgUser, role: str) -> None:
         self._cognito_only(user)
@@ -390,13 +409,20 @@ class OrgDirectoryService:
                 self._cognito.admin_add_user_to_group(UserPoolId=self._pool, Username=user.username, GroupName=f"{TEAM_PREFIX}{t}")
         self.invalidate()
 
+    # One team in or out needs no diff: both calls are idempotent in Cognito
+    # (adding a member or removing a non-member succeeds), so they go straight
+    # to the group whatever anyone's snapshot says.
     def add_to_team(self, user: OrgUser, team: str) -> None:
         self._cognito_only(user)
-        self.set_teams(user, sorted(set(self._fresh(user).teams) | {team}))
+        with self._user_gone():
+            self._cognito.admin_add_user_to_group(UserPoolId=self._pool, Username=user.username, GroupName=f"{TEAM_PREFIX}{team}")
+        self.invalidate()
 
     def remove_from_team(self, user: OrgUser, team: str) -> None:
         self._cognito_only(user)
-        self.set_teams(user, sorted(set(self._fresh(user).teams) - {team}))
+        with self._user_gone():
+            self._cognito.admin_remove_user_from_group(UserPoolId=self._pool, Username=user.username, GroupName=f"{TEAM_PREFIX}{team}")
+        self.invalidate()
 
     def set_enabled(self, user: OrgUser, enabled: bool) -> None:
         self._cognito_only(user)

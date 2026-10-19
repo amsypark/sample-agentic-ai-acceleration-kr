@@ -23,6 +23,7 @@ from fastapi import (
 from starlette.background import BackgroundTasks
 
 from core.auth import AuthUser, current_user
+from core.aws_errors import client_error_http
 from core.dependencies import knowledge_service
 from models.knowledge import (
     CreateKnowledgeBaseRequest,
@@ -66,11 +67,7 @@ def _fail(exc: Exception) -> None:
             raise HTTPException(status_code=409, detail=message)
         raise HTTPException(status_code=400, detail=message)
     if isinstance(exc, ClientError):
-        error = exc.response.get("Error", {})
-        raise HTTPException(
-            status_code=502,
-            detail=f"AWS error ({error.get('Code', 'Unknown')}): {error.get('Message', str(exc))}",
-        )
+        raise client_error_http(exc)
     logger.error("Knowledge route error: %s", exc)
     logger.error(traceback.format_exc())
     raise HTTPException(status_code=500, detail=str(exc))

@@ -10,7 +10,6 @@ not editable. Everything an admin does lands in the audit ledger.
 """
 import logging
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -352,15 +351,6 @@ def delete_team(name: str, user: AuthUser = Depends(require_admin)) -> None:
     except Exception:
         logger.warning("Member check failed for team %s", name, exc_info=True)
         raise HTTPException(status_code=503, detail="구성원을 확인하지 못해 지울 수 없습니다. 잠시 후 다시 시도하세요.")
-    if member_subs:
-        # ListUsersInGroup lags a removal by a moment: the smoke run removed the
-        # last member and got this 409, then 204 seconds later (2026-10-18). One
-        # re-read after a short wait tells that lag from a member who is there.
-        time.sleep(1.5)
-        try:
-            member_subs = _directory().member_subs(name)
-        except Exception:
-            logger.warning("Member re-check failed for team %s", name, exc_info=True)
     if member_subs:
         raise HTTPException(status_code=409, detail=f"구성원 {len(member_subs)}명이 남아 있습니다. 먼저 팀에서 빼세요.")
     try:
