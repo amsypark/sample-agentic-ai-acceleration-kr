@@ -779,6 +779,8 @@ export interface TreemapEntry {
   id?: string;
   /** Grey instead of the hue: a remainder that is no one entity (e.g. unattributed). */
   muted?: boolean;
+  /** A SERIES_COLORS slot, when each tile is a different entity that must separate. */
+  colorIndex?: number;
 }
 
 /**
@@ -805,32 +807,62 @@ export function TreemapShare({
   const total = data.reduce((sum, entry) => sum + entry.value, 0);
 
   return (
-    <div className="h-64 w-full">
-      <ResponsiveContainer width="100%" height="100%" minWidth={0}>
-        <Treemap
-          data={data}
-          dataKey="value"
-          nameKey="name"
-          aspectRatio={4 / 3}
-          isAnimationActive={false}
-          content={(props: TreemapTileProps) => (
-            <TreemapTile {...props} color={color} total={total} />
-          )}
-        >
-          <Tooltip
-            contentStyle={TOOLTIP_CONTENT}
-            labelStyle={TOOLTIP_LABEL}
-            itemStyle={TOOLTIP_ITEM}
-            formatter={(_value, _name, item) => {
-              const entry = item?.payload as TreemapEntry | undefined;
-              return [
-                `${entry?.display ?? ""} · ${shareLabel(shareOf(entry?.value ?? 0, total))}`,
-                entry?.name ?? "",
-              ];
-            }}
-          />
-        </Treemap>
-      </ResponsiveContainer>
+    <div className="space-y-2">
+      <div className="h-64 w-full">
+        <ResponsiveContainer width="100%" height="100%" minWidth={0}>
+          <Treemap
+            data={data}
+            dataKey="value"
+            nameKey="name"
+            aspectRatio={4 / 3}
+            isAnimationActive={false}
+            content={(props: TreemapTileProps) => (
+              <TreemapTile {...props} color={color} total={total} />
+            )}
+          >
+            <Tooltip
+              contentStyle={TOOLTIP_CONTENT}
+              labelStyle={TOOLTIP_LABEL}
+              itemStyle={TOOLTIP_ITEM}
+              formatter={(_value, _name, item) => {
+                const entry = item?.payload as TreemapEntry | undefined;
+                return [
+                  `${entry?.display ?? ""} · ${shareLabel(shareOf(entry?.value ?? 0, total))}`,
+                  entry?.name ?? "",
+                ];
+              }}
+            />
+          </Treemap>
+        </ResponsiveContainer>
+      </div>
+      {/* Tiles too small for a label are still named here, in the tile's own
+          hue — the same legend the component donut beside it carries. Only when
+          tiles are categorical: a single-hue map has nothing to key. */}
+      {data.some((entry) => entry.colorIndex != null) && (
+        <ul className="grid grid-cols-1 gap-x-4 gap-y-1 @md:grid-cols-2">
+          {data.map((entry) => (
+            <li key={entry.id ?? entry.name} className="flex min-w-0 items-center gap-1.5 text-xs">
+              <span
+                className="size-2 shrink-0 rounded-sm"
+                style={{
+                  backgroundColor: entry.muted
+                    ? MUTED_MARK
+                    : entry.colorIndex != null
+                      ? SERIES_COLORS[entry.colorIndex]
+                      : color,
+                }}
+              />
+              <span className="min-w-0 truncate text-muted-foreground" title={entry.name}>
+                {entry.name}
+              </span>
+              <span className="ml-auto shrink-0 tabular-nums">{entry.display}</span>
+              <span className="w-9 shrink-0 text-right text-xxs tabular-nums text-muted-foreground">
+                {shareLabel(shareOf(entry.value, total))}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -845,6 +877,7 @@ interface TreemapTileProps {
   value?: number;
   display?: string;
   muted?: boolean;
+  colorIndex?: number;
 }
 
 function TreemapTile({
@@ -857,6 +890,7 @@ function TreemapTile({
   value = 0,
   display,
   muted,
+  colorIndex,
   color,
   total,
 }: TreemapTileProps & { color: string; total: number }) {
@@ -871,11 +905,12 @@ function TreemapTile({
         width={width}
         height={height}
         rx={4}
-        fill={muted ? MUTED_MARK : color}
+        fill={muted ? MUTED_MARK : colorIndex != null ? SERIES_COLORS[colorIndex] : color}
         // A tint, so the label inside can wear text ink in both themes rather
         // than white on a hue that is light in dark mode. One opacity for all:
-        // bigger tiles a step darker would restate the area.
-        fillOpacity={0.3}
+        // bigger tiles a step darker would restate the area. Categorical tiles
+        // sit a step stronger: at 0.3 neighbouring hues blur into one another.
+        fillOpacity={colorIndex != null && !muted ? 0.45 : 0.3}
         stroke="hsl(var(--card))"
         strokeWidth={BAR_GAP}
       />

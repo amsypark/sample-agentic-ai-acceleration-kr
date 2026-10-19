@@ -496,3 +496,29 @@ def test_first_summary_after_start_folds_deployed_arn_ledger_keys_into_their_rec
     rows = {row["name"]: row for row in insights.summary(days=7, user=admin())["agents"]}
     assert "web_harness" in rows and rows["web_harness"]["turns"] == 1
     assert not any(name.startswith("deployed:") for name in rows)
+
+
+def test_a_runtime_shared_by_several_records_is_allocated_by_turns():
+    """Every row keeps the shared runtime whole in runtime_cost_micros, but the
+    allocated figures split it so they sum to the runtime total. On bst 90
+    records on one runtime made the per-agent cost 8x the window's."""
+    repo = repo_with_everything()
+    repo.items[(f"AGENTS#{MONTH}", f"D#{TODAY}#A#rec-3")] = {
+        "pk": f"AGENTS#{MONTH}", "sk": f"D#{TODAY}#A#rec-3", "turns": D(1), "measured_turns": D(1),
+        "model_cost_micros": D(100_000), "priced_turns": D(1),
+    }
+    usage = wire(repo)
+    usage.registry._records.append(Record("rec-3", "copy_of_default", runtime_arn=RUNTIME))
+    rows = {row["name"]: row for row in insights.summary(days=7, user=admin())["agents"]}
+    runtime_total = 590_628 + 197_950
+    assert rows["bap_default"]["runtime_cost_micros"] == runtime_total
+    assert rows["copy_of_default"]["runtime_cost_micros"] == runtime_total
+    # 3 turns to 1.
+    assert rows["bap_default"]["allocated_runtime_micros"] == runtime_total * 3 // 4
+    assert rows["copy_of_default"]["allocated_runtime_micros"] == runtime_total // 4
+    assert rows["copy_of_default"]["allocated_cost_micros"] == 100_000 + runtime_total // 4
+    allocated = sum(row["allocated_runtime_micros"] or 0 for row in rows.values())
+    assert runtime_total - 2 <= allocated <= runtime_total
+    # No runtime cost collected: absent, like the whole figure.
+    assert rows["content_creator"]["allocated_runtime_micros"] is None
+    assert rows["content_creator"]["allocated_cost_micros"] is None

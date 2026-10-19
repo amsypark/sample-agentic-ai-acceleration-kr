@@ -597,6 +597,37 @@ def _sum_days(days: Dict[str, Dict[str, Any]], field: str) -> Optional[int]:
     return sum(values) if values else None
 
 
+def _allocate_shared_runtime(rows: List[Dict[str, Any]], resources: Dict[str, Dict[str, Any]]) -> None:
+    """Split each runtime's cost across the records that share it, by turns.
+
+    `runtime_cost_micros` deliberately shows a shared runtime whole on every row
+    that uses it — that is what the record costs to keep running. Summed, it is
+    not where the money went: on bst (2026-10-19) 90 records on one runtime and
+    111 on one harness put the per-agent cost at $3,931 against a $501 window.
+    The allocated figures add up to the runtime total, so a part-to-whole chart
+    can use them. A runtime whose claimers had no turns is split evenly.
+    """
+    claimers: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        for arn in row["_runtimes"]:
+            claimers.setdefault(arn, []).append(row)
+    for row in rows:
+        share: Optional[int] = None
+        for arn in row["_runtimes"]:
+            cost = _sum_days(resources.get(arn, {}), "runtime_cost_micros")
+            if cost is None:
+                continue
+            group = claimers[arn]
+            turns = sum(other["turns"] or 0 for other in group)
+            part = cost * (row["turns"] or 0) // turns if turns else cost // len(group)
+            share = (share or 0) + part
+        model = row["model_cost_micros"]
+        row["allocated_runtime_micros"] = share
+        row["allocated_cost_micros"] = (
+            model + share if model is not None and share is not None else None
+        )
+
+
 def _days_between(start_date: str, end_date: str) -> List[str]:
     """Every `YYYY-MM-DD` from start to end inclusive."""
     try:
@@ -1008,6 +1039,7 @@ def _compute_summary(
             "_runtimes": frozenset(arns),
         })
     rows.sort(key=lambda row: -row["turns"])
+    _allocate_shared_runtime(rows, collected["resources"])
     for row in rows:
         claimed_runtimes |= row.pop("_runtimes")
     # Runtime cost no leaderboard row claims. The Runtime tile totals every

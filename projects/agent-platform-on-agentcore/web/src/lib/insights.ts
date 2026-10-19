@@ -85,6 +85,13 @@ export interface AgentUsageRow {
   model_cost_micros: number | null;
   runtime_cost_micros: number | null;
   total_cost_micros: number | null;
+  /**
+   * The runtime cost split across the records sharing that runtime, by turns, and
+   * model + that share. `runtime_cost_micros` keeps a shared runtime whole on every
+   * row; these sum to the window total, so part-to-whole charts use them.
+   */
+  allocated_runtime_micros?: number | null;
+  allocated_cost_micros?: number | null;
   /** Runtime invocations the collector counted (includes keep-warm pings). */
   invocations: number | null;
   sessions: number | null;
