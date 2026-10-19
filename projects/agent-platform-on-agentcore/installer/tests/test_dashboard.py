@@ -365,3 +365,123 @@ async def test_escape_on_a_running_log_screen_keeps_the_step_running():
         await pilot.press("escape")
         await asyncio.sleep(0.2)
         assert not isinstance(app.screen, LogScreen), "Escape works once it has ended"
+
+
+async def _run_destroy(app, pilot):
+    import asyncio
+
+    from installer.screens.confirm import ConfirmScreen
+
+    await pilot.pause()
+    await pilot.press("o")
+    await pilot.pause()
+    await pilot.press("down", "down", "down", "down", "enter")   # destroy
+    for _ in range(20):
+        await pilot.pause(0.1)
+        if isinstance(app.screen, ConfirmScreen):
+            break
+    app.screen.query_one("#typed").value = app.screen.expected
+    await pilot.press("enter")
+    await asyncio.sleep(0.3)
+
+
+@pytest.mark.parametrize("exit_code, resets", [(0, True), (1, False)])
+@pytest.mark.asyncio
+async def test_only_a_successful_destroy_resets_tfvars(monkeypatch, exit_code, resets):
+    """A failed destroy is retried, and still needs allow_destroy = true."""
+    from installer.core import values
+    from installer.core.runner import Result
+
+    class PlanShell:
+        async def capture(self, cmd):
+            return 0, "Plan: 0 to add, 0 to change, 7 to destroy."
+
+    class DestroyRunner:
+        async def run(self, cmd, step_id, on_line):
+            return Result(exit_code=exit_code, cancelled=False, log_path=None, tail=())
+
+        async def cancel(self):
+            pass
+
+    calls = []
+    monkeypatch.setattr(values, "reset_after_destroy", lambda env: calls.append(env))
+    app = _app({})
+    app.dry_run = False
+    app.shell = PlanShell()
+    app.runner = DestroyRunner()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _run_destroy(app, pilot)
+    assert bool(calls) is resets
+
+
+@pytest.mark.parametrize("exit_code, reset_refused", [(0, False), (1, False), (0, True)])
+@pytest.mark.asyncio
+async def test_settings_save_does_not_undo_destroy_reset(
+    tmp_path, monkeypatch, exit_code, reset_refused
+):
+    from installer.core import files, hcl, values
+    from installer.core.runner import Result
+
+    path = tmp_path / "terraform.tfvars"
+    path.write_text(
+        'admin_email = "admin@example.com"\n'
+        'admin_password = "ExamplePass1!"\n'
+        'user_email = "user@example.com"\n'
+        'user_password = "ExamplePass1!"\n'
+        'server_image = "old-server:v1"\n'
+        'web_image = "old-web:v1"\n'
+        'allow_destroy = true\n'
+    )
+    monkeypatch.setattr(values, "_tfvars_path", lambda env: path)
+    monkeypatch.setattr(files, "is_git_ignored", lambda path: True)
+
+    if reset_refused:
+        def refuse(env):
+            raise files.WriteRefused("test: cannot write tfvars")
+        monkeypatch.setattr(values, "reset_after_destroy", refuse)
+    reset_succeeded = exit_code == 0 and not reset_refused
+
+    class PlanShell:
+        async def capture(self, cmd):
+            return 0, "Plan: 0 to add, 0 to change, 7 to destroy."
+
+    class DestroyRunner:
+        async def run(self, cmd, step_id, on_line):
+            return Result(exit_code=exit_code, cancelled=False, log_path=None, tail=())
+
+    app = _app({})
+    app.dry_run = False
+    app.shell = PlanShell()
+    app.runner = DestroyRunner()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("s")
+        await pilot.pause()
+        # An unrelated unsaved edit must survive the destroy's targeted reset.
+        app.screen.query_one("#in-alert_email").value = "pending@example.com"
+        await pilot.press("escape")
+        await _run_destroy(app, pilot)
+        after_destroy = hcl.read_values(path.read_text())
+        assert ("server_image" not in after_destroy) == reset_succeeded
+        await pilot.press("escape", "s")
+        await pilot.pause()
+        expected = {
+            "server_image": "old-server:v1",
+            "web_image": "old-web:v1",
+            "allow_destroy": "true",
+        }
+        if reset_succeeded:
+            expected = {
+                field.variable.name: field.value
+                for field in values.load_fields(app.env)
+                if field.variable.name in expected
+            }
+        for name, value in expected.items():
+            assert app.screen.query_one(f"#in-{name}").value == value
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        saved = hcl.read_values(path.read_text())
+        assert saved["allow_destroy"] == ("false" if reset_succeeded else "true")
+        assert saved["alert_email"] == '"pending@example.com"'
+        for name in ("server_image", "web_image"):
+            assert saved[name] == hcl.render_value(expected[name], "string")
