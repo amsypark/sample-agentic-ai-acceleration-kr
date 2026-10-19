@@ -615,7 +615,19 @@ def _merge_descriptor_content(
         if req.name is not None:
             # The descriptor is indexed too; a stale name would keep matching
             # the old one.
-            base["name"] = name
+            if current.descriptor_type == DESCRIPTOR_MCP and "/" not in name:
+                # server.json requires "namespace/name". The create path adds the
+                # namespace; without it here every MCP rename was a schema
+                # ValidationException. Keep the record's own namespace.
+                previous = base.get("name")
+                namespace = (
+                    previous.split("/", 1)[0]
+                    if isinstance(previous, str) and "/" in previous
+                    else _MCP_NAMESPACE
+                )
+                base["name"] = f"{namespace}/{name}"
+            else:
+                base["name"] = name
 
     existing_content = current.descriptor_content
     markdown = req.skill_markdown

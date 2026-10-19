@@ -179,7 +179,7 @@ function Policy({ data, agents }: { data: TeamInsights; agents: AgentUsageRow[] 
             {matrix.tools.length === 0 ? (
               <EmptyPlot label="이 기간 대화에서 확인된 정책 거부가 없습니다." />
             ) : (
-              <div className="overflow-auto">
+              <div className="max-h-[26rem] overflow-auto">
                 <table className="text-xs">
                   <thead>
                     <tr className="text-muted-foreground">

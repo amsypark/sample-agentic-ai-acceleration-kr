@@ -527,6 +527,11 @@ export interface RankedEntry {
  * encodes magnitude, and shading each bar darker-where-bigger would spend the
  * only free channel restating it. With `emphasisId` the selected entity takes the
  * accent and the rest go grey, which is the honest form of "this one".
+ *
+ * The list scrolls past about twelve rows. Several of these grow with the
+ * deployment rather than with a top-N cut (every agent or person a guardrail
+ * ever flagged, every team), and unbounded they stretched their grid row — and
+ * the cell beside it — to thousands of pixels.
  */
 export function RankedBars({
   entries,
@@ -549,7 +554,7 @@ export function RankedBars({
   const max = Math.max(...entries.map((entry) => entry.value), 0);
 
   return (
-    <ul className="space-y-1.5">
+    <ul className="max-h-80 space-y-1.5 overflow-y-auto pr-1">
       {entries.map((entry) => {
         const share = shareOf(entry.value, max);
         const emphasised = !emphasisId || entry.id === emphasisId;

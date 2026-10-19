@@ -231,9 +231,9 @@ function TeamUsage({ data }: { data: TeamInsights }) {
       </PlotCell>
 
       <FoldBand title="팀별 상세" summary={`${data.teams.length}개 팀`} defaultOpen={false}>
-        <div className="overflow-auto">
+        <div className="max-h-[26rem] overflow-auto">
           <table className="w-full text-xs">
-            <thead>
+            <thead className="sticky top-0 z-[1] bg-card">
               <tr className="border-b border-border text-left text-muted-foreground">
                 <th className="py-1 font-medium">팀</th>
                 <th className="font-medium">구성원</th>
